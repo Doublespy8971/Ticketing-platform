@@ -1,0 +1,10 @@
+spring:
+  application:
+    name: inventory-service
+server:
+  port: 8081
+management:
+  endpoints:
+    web:
+      exposure:
+        include: health
