@@ -19,3 +19,7 @@ bin/
 # OS
 .DS_Store
 Thumbs.db
+
+# Environment & Tooling
+.junie/
+.env
