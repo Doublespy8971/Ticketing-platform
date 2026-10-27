@@ -1,7 +1,7 @@
 # Copilot Instructions
 
-- Always read `docs/ARCHITECTURE.md` before writing code.
-- Never invent topic names, event fields, table names, or endpoints that are not in it.
-- If something is missing or contradictory, stop and state the question instead of guessing.
+- Read `docs/ARCHITECTURE.md` index first, then read only the `docs/arch` files relevant to the task.
+- Never invent names that are not in those files.
+- Ask instead of guessing when something is missing.
 - Write tests for every new class.
 - Keep changes scoped to the service named in the prompt.
