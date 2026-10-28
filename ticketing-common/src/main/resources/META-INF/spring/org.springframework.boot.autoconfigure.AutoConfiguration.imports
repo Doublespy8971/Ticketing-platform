@@ -1,0 +1,2 @@
+com.ticketing.common.autoconfigure.CommonWebAutoConfiguration
+com.ticketing.common.autoconfigure.CommonKafkaAutoConfiguration

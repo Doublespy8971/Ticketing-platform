@@ -20,6 +20,7 @@
     <description>Flash-sale ticketing platform</description>
 
     <modules>
+        <module>ticketing-common</module>
         <module>gateway-service</module>
         <module>inventory-service</module>
         <module>order-service</module>
