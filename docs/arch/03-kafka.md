@@ -47,18 +47,18 @@ Every stateful Java consumer group (`inventory-service`, `order-service`, `payme
 
 #### Complete Retry & Dead-Letter Topics Table
 
-| Topic Name | Backoff Delay | Partitions (Compose / K8s) | Replication Factor (Compose / K8s) | Partition Key | Retention (`retention.ms`) | Producer / Forwarder | Consumer Group |
-| :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- |
-| `inventory.events-order-service-inventory-cg-retry-0` | `2000 ms` (2s) | `12` / `24` | `1` / `3` | `reservationId` | `604800000` (7d) | `order-service` | `order-service-inventory-cg-retry-0` |
-| `inventory.events-order-service-inventory-cg-retry-1` | `10000 ms` (10s) | `12` / `24` | `1` / `3` | `reservationId` | `604800000` (7d) | `order-service` | `order-service-inventory-cg-retry-1` |
-| `inventory.events-order-service-inventory-cg-dlt` | None (Terminal) | `3` / `6` | `1` / `3` | `reservationId` | `2592000000` (30d) | `order-service` | `order-service-inventory-cg-dlt` |
-| `order.events-payment-service-order-cg-retry-0` | `2000 ms` (2s) | `12` / `24` | `1` / `3` | `orderId` | `604800000` (7d) | `payment-service` | `payment-service-order-cg-retry-0` |
-| `order.events-payment-service-order-cg-retry-1` | `10000 ms` (10s) | `12` / `24` | `1` / `3` | `orderId` | `604800000` (7d) | `payment-service` | `payment-service-order-cg-retry-1` |
-| `order.events-payment-service-order-cg-dlt` | None (Terminal) | `3` / `6` | `1` / `3` | `orderId` | `2592000000` (30d) | `payment-service` | `payment-service-order-cg-dlt` |
-| `payment.events-inventory-service-payment-cg-retry-0` | `2000 ms` (2s) | `12` / `24` | `1` / `3` | `orderId` | `604800000` (7d) | `inventory-service` | `inventory-service-payment-cg-retry-0` |
-| `payment.events-inventory-service-payment-cg-retry-1` | `10000 ms` (10s) | `12` / `24` | `1` / `3` | `orderId` | `604800000` (7d) | `inventory-service` | `inventory-service-payment-cg-retry-1` |
-| `payment.events-inventory-service-payment-cg-dlt` | None (Terminal) | `3` / `6` | `1` / `3` | `orderId` | `2592000000` (30d) | `inventory-service` | `inventory-service-payment-cg-dlt` |
-| `payment.events-order-service-payment-cg-retry-0` | `2000 ms` (2s) | `12` / `24` | `1` / `3` | `orderId` | `604800000` (7d) | `order-service` | `order-service-payment-cg-retry-0` |
-| `payment.events-order-service-payment-cg-retry-1` | `10000 ms` (10s) | `12` / `24` | `1` / `3` | `orderId` | `604800000` (7d) | `order-service` | `order-service-payment-cg-retry-1` |
-| `payment.events-order-service-payment-cg-dlt` | None (Terminal) | `3` / `6` | `1` / `3` | `orderId` | `2592000000` (30d) | `order-service` | `order-service-payment-cg-dlt` |
+| Topic Name | Backoff Delay | Partitions (Compose / K8s) | Replication Factor (Compose / K8s) | `min.insync.replicas` (Compose / K8s) | Partition Key | Retention (`retention.ms`) | Producer / Forwarder | Consumer Group |
+| :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- |
+| `inventory.events-order-service-inventory-cg-retry-0` | `2000 ms` (2s) | `12` / `24` | `1` / `3` | `1` / `2` | `reservationId` | `604800000` (7d) | `order-service` | `order-service-inventory-cg-retry-0` |
+| `inventory.events-order-service-inventory-cg-retry-1` | `10000 ms` (10s) | `12` / `24` | `1` / `3` | `1` / `2` | `reservationId` | `604800000` (7d) | `order-service` | `order-service-inventory-cg-retry-1` |
+| `inventory.events-order-service-inventory-cg-dlt` | None (Terminal) | `3` / `6` | `1` / `3` | `1` / `2` | `reservationId` | `2592000000` (30d) | `order-service` | `order-service-inventory-cg-dlt` |
+| `order.events-payment-service-order-cg-retry-0` | `2000 ms` (2s) | `12` / `24` | `1` / `3` | `1` / `2` | `orderId` | `604800000` (7d) | `payment-service` | `payment-service-order-cg-retry-0` |
+| `order.events-payment-service-order-cg-retry-1` | `10000 ms` (10s) | `12` / `24` | `1` / `3` | `1` / `2` | `orderId` | `604800000` (7d) | `payment-service` | `payment-service-order-cg-retry-1` |
+| `order.events-payment-service-order-cg-dlt` | None (Terminal) | `3` / `6` | `1` / `3` | `1` / `2` | `orderId` | `2592000000` (30d) | `payment-service` | `payment-service-order-cg-dlt` |
+| `payment.events-inventory-service-payment-cg-retry-0` | `2000 ms` (2s) | `12` / `24` | `1` / `3` | `1` / `2` | `orderId` | `604800000` (7d) | `inventory-service` | `inventory-service-payment-cg-retry-0` |
+| `payment.events-inventory-service-payment-cg-retry-1` | `10000 ms` (10s) | `12` / `24` | `1` / `3` | `1` / `2` | `orderId` | `604800000` (7d) | `inventory-service` | `inventory-service-payment-cg-retry-1` |
+| `payment.events-inventory-service-payment-cg-dlt` | None (Terminal) | `3` / `6` | `1` / `3` | `1` / `2` | `orderId` | `2592000000` (30d) | `inventory-service` | `inventory-service-payment-cg-dlt` |
+| `payment.events-order-service-payment-cg-retry-0` | `2000 ms` (2s) | `12` / `24` | `1` / `3` | `1` / `2` | `orderId` | `604800000` (7d) | `order-service` | `order-service-payment-cg-retry-0` |
+| `payment.events-order-service-payment-cg-retry-1` | `10000 ms` (10s) | `12` / `24` | `1` / `3` | `1` / `2` | `orderId` | `604800000` (7d) | `order-service` | `order-service-payment-cg-retry-1` |
+| `payment.events-order-service-payment-cg-dlt` | None (Terminal) | `3` / `6` | `1` / `3` | `1` / `2` | `orderId` | `2592000000` (30d) | `order-service` | `order-service-payment-cg-dlt` |
 

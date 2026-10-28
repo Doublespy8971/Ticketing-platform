@@ -123,8 +123,8 @@ All custom metrics use the `ticketing_` prefix, lowercase `snake_case`, and base
 | `JWT_SECRET` | `gateway-service` | `dev-only-hs256-secret-key-minimum-32-bytes-long!` | 256-bit secret key used to sign and verify HS256 JWT tokens. |
 | `REDIS_HOST` | `gateway-service`, `inventory-service`, `notification-service` | `localhost` | Redis 7 hostname. |
 | `REDIS_PORT` | `gateway-service`, `inventory-service`, `notification-service` | `6379` | Redis 7 port. |
-| `KAFKA_BOOTSTRAP_SERVERS` | `inventory-service`, `order-service`, `payment-service`, `notification-service` | `localhost:9092` | Apache Kafka KRaft bootstrap servers list. |
-| `POSTGRES_URL` | `inventory-service`, `order-service`, `payment-service` | `jdbc:postgresql://localhost:5432/<service>_db` | JDBC connection URL for `inventory_db`, `order_db`, or `payment_db`. |
+| `KAFKA_BOOTSTRAP_SERVERS` | `inventory-service`, `order-service`, `payment-service`, `notification-service` | `localhost:29092` | Apache Kafka KRaft bootstrap servers list. Host default for running services outside Docker (Compose host listener); containers use `kafka:9092`. |
+| `POSTGRES_URL` | `inventory-service`, `order-service`, `payment-service` | `jdbc:postgresql://localhost:5433/inventory_db` (`inventory-service`), `jdbc:postgresql://localhost:5434/order_db` (`order-service`), `jdbc:postgresql://localhost:5435/payment_db` (`payment-service`) | JDBC connection URL for `inventory_db`, `order_db`, or `payment_db`. These are host defaults for running services outside Docker. |
 | `POSTGRES_USER` | `inventory-service`, `order-service`, `payment-service` | `ticketing` | PostgreSQL username. |
 | `POSTGRES_PASSWORD` | `inventory-service`, `order-service`, `payment-service` | `ticketing_secret` | PostgreSQL password. |
 | `OUTBOX_POLL_INTERVAL_MS` | `inventory-service`, `order-service`, `payment-service` | `200` | Fixed delay in milliseconds between single-leader (`pg_try_advisory_lock`) outbox polling runs. |
