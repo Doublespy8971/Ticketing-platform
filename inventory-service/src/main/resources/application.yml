@@ -1,10 +1,29 @@
 spring:
   application:
     name: inventory-service
+  datasource:
+    url: ${POSTGRES_URL:jdbc:postgresql://localhost:5433/inventory_db}
+    username: ${POSTGRES_USER:ticketing}
+    password: ${POSTGRES_PASSWORD:ticketing_secret}
+    driver-class-name: org.postgresql.Driver
+    hikari:
+      pool-name: inventory-service-hikari
+      maximum-pool-size: 10
+      minimum-idle: 2
+  flyway:
+    enabled: true
+    locations: classpath:db/migration
+
 server:
   port: 8081
+
+ticketing:
+  outbox:
+    enabled: false
+    advisory-lock-id: 71001
+
 management:
   endpoints:
     web:
       exposure:
-        include: health
+        include: health,info,prometheus
