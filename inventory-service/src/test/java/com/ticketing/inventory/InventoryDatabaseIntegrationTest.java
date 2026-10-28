@@ -7,21 +7,24 @@ import com.ticketing.inventory.domain.ReservationRecord;
 import com.ticketing.inventory.domain.ReservationRepository;
 import com.ticketing.inventory.domain.SeatRecord;
 import com.ticketing.inventory.domain.SeatRepository;
-import com.zaxxer.hikari.HikariConfig;
-import com.zaxxer.hikari.HikariDataSource;
 import org.flywaydb.core.Flyway;
 import org.flywaydb.core.api.output.MigrateResult;
-import org.junit.jupiter.api.AfterAll;
-import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
+import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.boot.test.context.SpringBootTest;
 import org.springframework.dao.DataIntegrityViolationException;
 import org.springframework.jdbc.core.JdbcTemplate;
+import org.springframework.test.context.DynamicPropertyRegistry;
+import org.springframework.test.context.DynamicPropertySource;
+import org.springframework.transaction.IllegalTransactionStateException;
+import org.springframework.transaction.support.TransactionTemplate;
 import org.testcontainers.containers.PostgreSQLContainer;
 import org.testcontainers.junit.jupiter.Container;
 import org.testcontainers.junit.jupiter.Testcontainers;
 import org.testcontainers.utility.DockerImageName;
 
+import javax.sql.DataSource;
 import java.sql.Types;
 import java.time.Instant;
 import java.time.OffsetDateTime;
@@ -34,6 +37,7 @@ import java.util.UUID;
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
+@SpringBootTest
 @Testcontainers
 class InventoryDatabaseIntegrationTest {
 
@@ -50,33 +54,30 @@ class InventoryDatabaseIntegrationTest {
                     .withUsername("ticketing")
                     .withPassword("ticketing_secret");
 
-    private static HikariDataSource dataSource;
-    private static JdbcTemplate jdbcTemplate;
-    private static EventRepository eventRepository;
-    private static SeatRepository seatRepository;
-    private static ReservationRepository reservationRepository;
-
-    @BeforeAll
-    static void setUp() {
-        HikariConfig config = new HikariConfig();
-        config.setJdbcUrl(POSTGRES.getJdbcUrl());
-        config.setUsername(POSTGRES.getUsername());
-        config.setPassword(POSTGRES.getPassword());
-        config.setMaximumPoolSize(5);
-        dataSource = new HikariDataSource(config);
-        jdbcTemplate = new JdbcTemplate(dataSource);
-
-        eventRepository = new EventRepository(jdbcTemplate);
-        seatRepository = new SeatRepository(jdbcTemplate);
-        reservationRepository = new ReservationRepository(jdbcTemplate);
+    @DynamicPropertySource
+    static void configureProperties(DynamicPropertyRegistry registry) {
+        registry.add("spring.datasource.url", POSTGRES::getJdbcUrl);
+        registry.add("spring.datasource.username", POSTGRES::getUsername);
+        registry.add("spring.datasource.password", POSTGRES::getPassword);
     }
 
-    @AfterAll
-    static void tearDown() {
-        if (dataSource != null) {
-            dataSource.close();
-        }
-    }
+    @Autowired
+    private DataSource dataSource;
+
+    @Autowired
+    private JdbcTemplate jdbcTemplate;
+
+    @Autowired
+    private TransactionTemplate transactionTemplate;
+
+    @Autowired
+    private EventRepository eventRepository;
+
+    @Autowired
+    private SeatRepository seatRepository;
+
+    @Autowired
+    private ReservationRepository reservationRepository;
 
     @BeforeEach
     void cleanTables() {
@@ -120,14 +121,38 @@ class InventoryDatabaseIntegrationTest {
     }
 
     @Test
+    void mandatoryPropagationRejectsWritesWithoutActiveTransaction() {
+        UUID eventId = UUID.randomUUID();
+        Instant now = Instant.now().truncatedTo(ChronoUnit.MICROS);
+        EventRecord event = new EventRecord(
+                eventId, "Concert", "Arena", now.plus(7, ChronoUnit.DAYS), now.plus(1, ChronoUnit.DAYS), "SCHEDULED", now, now
+        );
+
+        assertThatThrownBy(() -> eventRepository.insert(event))
+                .isInstanceOf(IllegalTransactionStateException.class);
+
+        SeatRecord seat = new SeatRecord(
+                UUID.randomUUID(), eventId, "SEC-A", "1", "101", 1000L, "USD", "AVAILABLE", 0L, null, null
+        );
+        assertThatThrownBy(() -> seatRepository.bulkInsert(List.of(seat)))
+                .isInstanceOf(IllegalTransactionStateException.class);
+
+        ReservationRecord res = new ReservationRecord(
+                UUID.randomUUID(), eventId, UUID.randomUUID(), "HELD", 1000L, "USD", now, now.plus(10, ChronoUnit.MINUTES), null, null, null, now
+        );
+        assertThatThrownBy(() -> reservationRepository.insert(res, List.of()))
+                .isInstanceOf(IllegalTransactionStateException.class);
+    }
+
+    @Test
     void secondHoldForSameSeatRejectedByPartialUniqueIndexWhileReleasedOrExpiredAllowed() {
         UUID eventId = UUID.randomUUID();
         createEvent(eventId);
 
         UUID seatId = UUID.randomUUID();
-        seatRepository.bulkInsert(List.of(new SeatRecord(
+        transactionTemplate.executeWithoutResult(status -> seatRepository.bulkInsert(List.of(new SeatRecord(
                 seatId, eventId, "SEC-A", "1", "101", 15000L, "USD", "AVAILABLE", 0L, null, null
-        )));
+        ))));
 
         UUID res1Id = UUID.randomUUID();
         UUID item1Id = UUID.randomUUID();
@@ -138,7 +163,7 @@ class InventoryDatabaseIntegrationTest {
         ReservationItemRecord item1 = new ReservationItemRecord(
                 item1Id, res1Id, eventId, seatId, "SEC-A", "1", "101", 15000L, "HELD", now, now
         );
-        reservationRepository.insert(res1, List.of(item1));
+        transactionTemplate.executeWithoutResult(status -> reservationRepository.insert(res1, List.of(item1)));
 
         // Second hold for the same seat in HELD status must fail
         UUID res2Id = UUID.randomUUID();
@@ -150,7 +175,7 @@ class InventoryDatabaseIntegrationTest {
                 item2Id, res2Id, eventId, seatId, "SEC-A", "1", "101", 15000L, "HELD", now, now
         );
 
-        assertThatThrownBy(() -> reservationRepository.insert(res2, List.of(item2)))
+        assertThatThrownBy(() -> transactionTemplate.executeWithoutResult(status -> reservationRepository.insert(res2, List.of(item2))))
                 .isInstanceOf(DataIntegrityViolationException.class)
                 .hasMessageContaining("idx_reservation_items_active_seat");
 
@@ -158,7 +183,7 @@ class InventoryDatabaseIntegrationTest {
         jdbcTemplate.update("UPDATE reservation_items SET status = 'RELEASED' WHERE reservation_item_id = ?", item1Id);
 
         // Now inserting res2 with HELD status on the same seat succeeds
-        reservationRepository.insert(res2, List.of(item2));
+        transactionTemplate.executeWithoutResult(status -> reservationRepository.insert(res2, List.of(item2)));
 
         // An EXPIRED or RELEASED item for the same seat is also allowed alongside HELD
         UUID res3Id = UUID.randomUUID();
@@ -169,7 +194,7 @@ class InventoryDatabaseIntegrationTest {
         ReservationItemRecord item3 = new ReservationItemRecord(
                 item3Id, res3Id, eventId, seatId, "SEC-A", "1", "101", 15000L, "EXPIRED", now, now
         );
-        reservationRepository.insert(res3, List.of(item3));
+        transactionTemplate.executeWithoutResult(status -> reservationRepository.insert(res3, List.of(item3)));
 
         List<String> statuses = jdbcTemplate.queryForList(
                 "SELECT status FROM reservation_items WHERE seat_id = ? ORDER BY status",
@@ -219,9 +244,9 @@ class InventoryDatabaseIntegrationTest {
                 .isInstanceOf(DataIntegrityViolationException.class)
                 .hasMessageContaining("chk_seats_price_positive");
 
-        seatRepository.bulkInsert(List.of(new SeatRecord(
+        transactionTemplate.executeWithoutResult(status -> seatRepository.bulkInsert(List.of(new SeatRecord(
                 seatId, eventId, "SEC-A", "1", "101", 1000L, "USD", "AVAILABLE", 0L, null, null
-        )));
+        ))));
 
         // reservations status check constraint
         UUID resId = UUID.randomUUID();
@@ -280,9 +305,9 @@ class InventoryDatabaseIntegrationTest {
                 .isInstanceOf(DataIntegrityViolationException.class);
 
         // reservation_items -> reservations, events, seats FKs
-        seatRepository.bulkInsert(List.of(new SeatRecord(
+        transactionTemplate.executeWithoutResult(status -> seatRepository.bulkInsert(List.of(new SeatRecord(
                 seatId, eventId, "SEC-A", "1", "101", 1000L, "USD", "AVAILABLE", 0L, null, null
-        )));
+        ))));
         jdbcTemplate.update(
                 "INSERT INTO reservations (reservation_id, event_id, user_id, status, total_amount_cents, expires_at) VALUES (?, ?, ?, 'HELD', 1000, ?)",
                 new Object[]{resId, eventId, UUID.randomUUID(), toOdt(now.plus(10, ChronoUnit.MINUTES))},
@@ -316,7 +341,7 @@ class InventoryDatabaseIntegrationTest {
         EventRecord event = new EventRecord(
                 eventId, "Rock Concert", "Grand Arena", eventTime, dropTime, "SCHEDULED", null, null
         );
-        eventRepository.insert(event);
+        transactionTemplate.executeWithoutResult(status -> eventRepository.insert(event));
 
         Optional<EventRecord> loadedEvent = eventRepository.findById(eventId);
         assertThat(loadedEvent).isPresent();
@@ -326,10 +351,10 @@ class InventoryDatabaseIntegrationTest {
 
         UUID seat1 = UUID.randomUUID();
         UUID seat2 = UUID.randomUUID();
-        seatRepository.bulkInsert(List.of(
+        transactionTemplate.executeWithoutResult(status -> seatRepository.bulkInsert(List.of(
                 new SeatRecord(seat1, eventId, "VIP", "A", "1", 25000L, "USD", "AVAILABLE", 0L, null, null),
                 new SeatRecord(seat2, eventId, "VIP", "A", "2", 25000L, "USD", "AVAILABLE", 0L, null, null)
-        ));
+        )));
 
         Optional<SeatRecord> loadedSeat1 = seatRepository.findById(seat1);
         assertThat(loadedSeat1).isPresent();
@@ -347,7 +372,7 @@ class InventoryDatabaseIntegrationTest {
                 new ReservationItemRecord(UUID.randomUUID(), resId, eventId, seat2, "VIP", "A", "2", 25000L, "HELD", now, now)
         );
 
-        reservationRepository.insert(reservation, items);
+        transactionTemplate.executeWithoutResult(status -> reservationRepository.insert(reservation, items));
 
         Optional<ReservationRecord> loadedRes = reservationRepository.findById(resId);
         assertThat(loadedRes).isPresent();
@@ -361,12 +386,13 @@ class InventoryDatabaseIntegrationTest {
 
     private void createEvent(UUID eventId) {
         Instant now = Instant.now().truncatedTo(ChronoUnit.MICROS);
-        eventRepository.insert(new EventRecord(
+        transactionTemplate.executeWithoutResult(status -> eventRepository.insert(new EventRecord(
                 eventId, "Summer Fest", "Stadium", now.plus(7, ChronoUnit.DAYS), now.plus(1, ChronoUnit.DAYS), "SCHEDULED", now, now
-        ));
+        )));
     }
 
     private static OffsetDateTime toOdt(Instant instant) {
         return instant == null ? null : OffsetDateTime.ofInstant(instant, ZoneOffset.UTC);
     }
 }
+

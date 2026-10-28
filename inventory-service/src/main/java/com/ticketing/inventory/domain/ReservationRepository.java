@@ -3,10 +3,9 @@ package com.ticketing.inventory.domain;
 import org.springframework.jdbc.core.BatchPreparedStatementSetter;
 import org.springframework.jdbc.core.JdbcTemplate;
 import org.springframework.jdbc.core.RowMapper;
-import org.springframework.jdbc.datasource.DataSourceTransactionManager;
 import org.springframework.stereotype.Repository;
+import org.springframework.transaction.annotation.Propagation;
 import org.springframework.transaction.annotation.Transactional;
-import org.springframework.transaction.support.TransactionTemplate;
 
 import java.sql.PreparedStatement;
 import java.sql.SQLException;
@@ -80,13 +79,9 @@ public class ReservationRepository {
     );
 
     private final JdbcTemplate jdbcTemplate;
-    private final TransactionTemplate transactionTemplate;
 
     public ReservationRepository(JdbcTemplate jdbcTemplate) {
         this.jdbcTemplate = Objects.requireNonNull(jdbcTemplate, "jdbcTemplate must not be null");
-        this.transactionTemplate = jdbcTemplate.getDataSource() != null
-                ? new TransactionTemplate(new DataSourceTransactionManager(jdbcTemplate.getDataSource()))
-                : null;
     }
 
     public Optional<ReservationRecord> findById(UUID reservationId) {
@@ -101,16 +96,8 @@ public class ReservationRepository {
         return jdbcTemplate.query(SELECT_ITEMS_BY_RESERVATION_ID_SQL, ITEM_ROW_MAPPER, reservationId);
     }
 
-    @Transactional
+    @Transactional(propagation = Propagation.MANDATORY)
     public void insert(ReservationRecord reservation, List<ReservationItemRecord> items) {
-        if (transactionTemplate != null) {
-            transactionTemplate.executeWithoutResult(status -> doInsert(reservation, items));
-        } else {
-            doInsert(reservation, items);
-        }
-    }
-
-    private void doInsert(ReservationRecord reservation, List<ReservationItemRecord> items) {
         Objects.requireNonNull(reservation, "reservation must not be null");
         Objects.requireNonNull(items, "items must not be null");
 

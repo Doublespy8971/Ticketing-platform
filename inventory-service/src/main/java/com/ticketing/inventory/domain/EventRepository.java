@@ -3,6 +3,8 @@ package com.ticketing.inventory.domain;
 import org.springframework.jdbc.core.JdbcTemplate;
 import org.springframework.jdbc.core.RowMapper;
 import org.springframework.stereotype.Repository;
+import org.springframework.transaction.annotation.Propagation;
+import org.springframework.transaction.annotation.Transactional;
 
 import java.sql.Types;
 import java.time.Instant;
@@ -44,6 +46,7 @@ public class EventRepository {
         this.jdbcTemplate = Objects.requireNonNull(jdbcTemplate, "jdbcTemplate must not be null");
     }
 
+    @Transactional(propagation = Propagation.MANDATORY)
     public void insert(EventRecord event) {
         Objects.requireNonNull(event, "event must not be null");
         Instant now = Instant.now();

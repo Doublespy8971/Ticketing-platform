@@ -4,6 +4,8 @@ import org.springframework.jdbc.core.BatchPreparedStatementSetter;
 import org.springframework.jdbc.core.JdbcTemplate;
 import org.springframework.jdbc.core.RowMapper;
 import org.springframework.stereotype.Repository;
+import org.springframework.transaction.annotation.Propagation;
+import org.springframework.transaction.annotation.Transactional;
 
 import java.sql.PreparedStatement;
 import java.sql.SQLException;
@@ -53,6 +55,7 @@ public class SeatRepository {
         this.jdbcTemplate = Objects.requireNonNull(jdbcTemplate, "jdbcTemplate must not be null");
     }
 
+    @Transactional(propagation = Propagation.MANDATORY)
     public void bulkInsert(List<SeatRecord> seats) {
         Objects.requireNonNull(seats, "seats must not be null");
         if (seats.isEmpty()) {
