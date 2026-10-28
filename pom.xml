@@ -21,6 +21,7 @@
 
     <modules>
         <module>ticketing-common</module>
+        <module>ticketing-outbox</module>
         <module>gateway-service</module>
         <module>inventory-service</module>
         <module>order-service</module>
