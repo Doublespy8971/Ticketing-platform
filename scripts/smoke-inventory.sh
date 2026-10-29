@@ -102,14 +102,19 @@ EVENT_ID=$(echo "${RES_BODY}" | jq -r '.eventId // empty')
 EVENT_STATUS=$(echo "${RES_BODY}" | jq -r '.status // empty')
 
 if [ "${HTTP_STATUS}" = "201" ] && [ -n "${EVENT_ID}" ] && [ "${EVENT_STATUS}" = "SCHEDULED" ]; then
-    echo "WARNING: No API endpoint exists to update event status to ON_SALE; updating directly in PostgreSQL via docker exec"
-    run_psql "UPDATE events SET status = 'ON_SALE', updated_at = NOW() WHERE event_id = '${EVENT_ID}'::uuid;"
+    UPDATE_STATUS_RAW=$(curl -s -w "\n%{http_code}" -X PATCH "${INVENTORY_URL}/api/v1/admin/events/${EVENT_ID}/status" \
+        -H "Content-Type: application/json" \
+        -H "X-User-Roles: ADMIN" \
+        -d '{"status":"ON_SALE"}')
 
-    DB_EVENT_STATUS=$(run_psql "SELECT status FROM events WHERE event_id = '${EVENT_ID}'::uuid;")
-    if [ "${DB_EVENT_STATUS}" = "ON_SALE" ]; then
+    UPDATE_HTTP_STATUS=$(echo "${UPDATE_STATUS_RAW}" | tail -n1)
+    UPDATE_RES_BODY=$(echo "${UPDATE_STATUS_RAW}" | sed '$d')
+    NEW_EVENT_STATUS=$(echo "${UPDATE_RES_BODY}" | jq -r '.status // empty')
+
+    if [ "${UPDATE_HTTP_STATUS}" = "200" ] && [ "${NEW_EVENT_STATUS}" = "ON_SALE" ]; then
         record_pass "${CHECK_NAME} (eventId=${EVENT_ID}, status=ON_SALE)"
     else
-        record_fail "${CHECK_NAME}" "Failed to update event status in PostgreSQL; got '${DB_EVENT_STATUS}'"
+        record_fail "${CHECK_NAME}" "Expected HTTP 200 with status 'ON_SALE', got HTTP '${UPDATE_HTTP_STATUS}'. Body: ${UPDATE_RES_BODY}"
     fi
 else
     record_fail "${CHECK_NAME}" "Expected HTTP 201 with status 'SCHEDULED', got HTTP '${HTTP_STATUS}'. Body: ${RES_BODY}"

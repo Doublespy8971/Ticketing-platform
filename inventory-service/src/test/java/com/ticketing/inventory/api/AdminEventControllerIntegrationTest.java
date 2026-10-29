@@ -5,20 +5,26 @@ import com.ticketing.common.correlation.CorrelationConstants;
 import com.ticketing.inventory.api.dto.BulkCreateSeatsRequest;
 import com.ticketing.inventory.api.dto.CreateEventRequest;
 import com.ticketing.inventory.api.dto.CreateSeatItemRequest;
+import com.ticketing.inventory.api.dto.UpdateEventStatusRequest;
 import com.ticketing.inventory.domain.EventRecord;
 import com.ticketing.inventory.domain.EventRepository;
+import com.ticketing.inventory.redis.RedisKeys;
+import com.ticketing.inventory.service.InventoryAdminService;
 import org.flywaydb.core.Flyway;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.boot.test.autoconfigure.web.servlet.AutoConfigureMockMvc;
 import org.springframework.boot.test.context.SpringBootTest;
+import org.springframework.data.redis.core.StringRedisTemplate;
 import org.springframework.http.MediaType;
 import org.springframework.jdbc.core.JdbcTemplate;
 import org.springframework.test.context.DynamicPropertyRegistry;
 import org.springframework.test.context.DynamicPropertySource;
 import org.springframework.test.web.servlet.MockMvc;
+import org.springframework.test.web.servlet.ResultActions;
 import org.springframework.transaction.support.TransactionTemplate;
+import org.testcontainers.containers.GenericContainer;
 import org.testcontainers.containers.PostgreSQLContainer;
 import org.testcontainers.junit.jupiter.Container;
 import org.testcontainers.junit.jupiter.Testcontainers;
@@ -33,6 +39,7 @@ import java.util.UUID;
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.hamcrest.Matchers.hasSize;
 import static org.hamcrest.Matchers.is;
+import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.patch;
 import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.post;
 import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.header;
 import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.jsonPath;
@@ -56,11 +63,19 @@ class AdminEventControllerIntegrationTest {
                     .withUsername("ticketing")
                     .withPassword("ticketing_secret");
 
+    @Container
+    @SuppressWarnings("resource")
+    static final GenericContainer<?> REDIS =
+            new GenericContainer<>(DockerImageName.parse("redis:7.4.1-alpine"))
+                    .withExposedPorts(6379);
+
     @DynamicPropertySource
     static void configureProperties(DynamicPropertyRegistry registry) {
         registry.add("spring.datasource.url", POSTGRES::getJdbcUrl);
         registry.add("spring.datasource.username", POSTGRES::getUsername);
         registry.add("spring.datasource.password", POSTGRES::getPassword);
+        registry.add("spring.data.redis.host", REDIS::getHost);
+        registry.add("spring.data.redis.port", () -> REDIS.getMappedPort(6379));
     }
 
     @Autowired
@@ -79,6 +94,12 @@ class AdminEventControllerIntegrationTest {
     private EventRepository eventRepository;
 
     @Autowired
+    private InventoryAdminService adminService;
+
+    @Autowired
+    private StringRedisTemplate stringRedisTemplate;
+
+    @Autowired
     private TransactionTemplate transactionTemplate;
 
     @BeforeEach
@@ -90,6 +111,10 @@ class AdminEventControllerIntegrationTest {
         flyway.migrate();
 
         jdbcTemplate.execute("TRUNCATE TABLE reservation_items, reservations, seats, events CASCADE");
+        try {
+            stringRedisTemplate.getConnectionFactory().getConnection().serverCommands().flushDb();
+        } catch (Exception ignored) {
+        }
     }
 
     @Test
@@ -348,19 +373,220 @@ class AdminEventControllerIntegrationTest {
     }
 
     private UUID createTestEvent() {
+        return createTestEventWithStatus("SCHEDULED");
+    }
+
+    private UUID createTestEventWithStatus(String status) {
         UUID eventId = UUID.randomUUID();
         Instant now = Instant.now().truncatedTo(ChronoUnit.MICROS);
-        transactionTemplate.executeWithoutResult(status -> eventRepository.insert(new EventRecord(
+        transactionTemplate.executeWithoutResult(s -> eventRepository.insert(new EventRecord(
                 eventId,
-                "Festival",
+                "Festival " + status,
                 "Park",
                 now.plus(14, ChronoUnit.DAYS),
                 now.plus(2, ChronoUnit.DAYS),
-                "SCHEDULED",
+                status,
                 now,
                 now
         )));
         return eventId;
+    }
+
+    private ResultActions patchStatus(UUID eventId, String status) throws Exception {
+        return mockMvc.perform(patch("/api/v1/admin/events/{eventId}/status", eventId)
+                .header("X-User-Roles", "ADMIN")
+                .contentType(MediaType.APPLICATION_JSON)
+                .content(objectMapper.writeValueAsString(new UpdateEventStatusRequest(status))));
+    }
+
+    private ResultActions patchStatusRaw(UUID eventId, String rawJson) throws Exception {
+        return mockMvc.perform(patch("/api/v1/admin/events/{eventId}/status", eventId)
+                .header("X-User-Roles", "ADMIN")
+                .contentType(MediaType.APPLICATION_JSON)
+                .content(rawJson));
+    }
+
+    private String getEventStatus(UUID eventId) {
+        return jdbcTemplate.queryForObject("SELECT status FROM events WHERE event_id = ?", String.class, eventId);
+    }
+
+    @Test
+    void updateEventStatus_allAllowedTransitionsWork() throws Exception {
+        // 1. SCHEDULED -> ON_SALE
+        UUID e1 = createTestEventWithStatus("SCHEDULED");
+        patchStatus(e1, "ON_SALE")
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.status", is("ON_SALE")))
+                .andExpect(jsonPath("$.eventId", is(e1.toString())));
+        assertThat(getEventStatus(e1)).isEqualTo("ON_SALE");
+
+        // 2. SCHEDULED -> CANCELLED
+        UUID e2 = createTestEventWithStatus("SCHEDULED");
+        patchStatus(e2, "CANCELLED")
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.status", is("CANCELLED")));
+        assertThat(getEventStatus(e2)).isEqualTo("CANCELLED");
+
+        // 3. ON_SALE -> SOLD_OUT
+        UUID e3 = createTestEventWithStatus("ON_SALE");
+        patchStatus(e3, "SOLD_OUT")
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.status", is("SOLD_OUT")));
+        assertThat(getEventStatus(e3)).isEqualTo("SOLD_OUT");
+
+        // 4. ON_SALE -> CANCELLED
+        UUID e4 = createTestEventWithStatus("ON_SALE");
+        patchStatus(e4, "CANCELLED")
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.status", is("CANCELLED")));
+        assertThat(getEventStatus(e4)).isEqualTo("CANCELLED");
+
+        // 5. ON_SALE -> COMPLETED
+        UUID e5 = createTestEventWithStatus("ON_SALE");
+        patchStatus(e5, "COMPLETED")
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.status", is("COMPLETED")));
+        assertThat(getEventStatus(e5)).isEqualTo("COMPLETED");
+
+        // 6. SOLD_OUT -> ON_SALE
+        UUID e6 = createTestEventWithStatus("SOLD_OUT");
+        patchStatus(e6, "ON_SALE")
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.status", is("ON_SALE")));
+        assertThat(getEventStatus(e6)).isEqualTo("ON_SALE");
+
+        // 7. SOLD_OUT -> COMPLETED
+        UUID e7 = createTestEventWithStatus("SOLD_OUT");
+        patchStatus(e7, "COMPLETED")
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.status", is("COMPLETED")));
+        assertThat(getEventStatus(e7)).isEqualTo("COMPLETED");
+
+        // 8. SOLD_OUT -> CANCELLED
+        UUID e8 = createTestEventWithStatus("SOLD_OUT");
+        patchStatus(e8, "CANCELLED")
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.status", is("CANCELLED")));
+        assertThat(getEventStatus(e8)).isEqualTo("CANCELLED");
+    }
+
+    @Test
+    void updateEventStatus_allDisallowedTransitionsReturn409() throws Exception {
+        // Disallowed transitions from SCHEDULED
+        UUID eSched = createTestEventWithStatus("SCHEDULED");
+        patchStatus(eSched, "SCHEDULED").andExpect(status().isConflict())
+                .andExpect(jsonPath("$.errorCode", is("INVALID_STATE_TRANSITION")));
+        patchStatus(eSched, "SOLD_OUT").andExpect(status().isConflict())
+                .andExpect(jsonPath("$.errorCode", is("INVALID_STATE_TRANSITION")));
+        patchStatus(eSched, "COMPLETED").andExpect(status().isConflict())
+                .andExpect(jsonPath("$.errorCode", is("INVALID_STATE_TRANSITION")));
+
+        // Disallowed transitions from ON_SALE
+        UUID eSale = createTestEventWithStatus("ON_SALE");
+        patchStatus(eSale, "ON_SALE").andExpect(status().isConflict())
+                .andExpect(jsonPath("$.errorCode", is("INVALID_STATE_TRANSITION")));
+        patchStatus(eSale, "SCHEDULED").andExpect(status().isConflict())
+                .andExpect(jsonPath("$.errorCode", is("INVALID_STATE_TRANSITION")));
+
+        // Disallowed transitions from SOLD_OUT
+        UUID eSold = createTestEventWithStatus("SOLD_OUT");
+        patchStatus(eSold, "SOLD_OUT").andExpect(status().isConflict())
+                .andExpect(jsonPath("$.errorCode", is("INVALID_STATE_TRANSITION")));
+        patchStatus(eSold, "SCHEDULED").andExpect(status().isConflict())
+                .andExpect(jsonPath("$.errorCode", is("INVALID_STATE_TRANSITION")));
+
+        // Disallowed transitions from terminal states CANCELLED and COMPLETED
+        UUID eCancelled = createTestEventWithStatus("CANCELLED");
+        for (String target : List.of("SCHEDULED", "ON_SALE", "SOLD_OUT", "COMPLETED", "CANCELLED")) {
+            patchStatus(eCancelled, target).andExpect(status().isConflict())
+                    .andExpect(jsonPath("$.errorCode", is("INVALID_STATE_TRANSITION")));
+        }
+
+        UUID eCompleted = createTestEventWithStatus("COMPLETED");
+        for (String target : List.of("SCHEDULED", "ON_SALE", "SOLD_OUT", "COMPLETED", "CANCELLED")) {
+            patchStatus(eCompleted, target).andExpect(status().isConflict())
+                    .andExpect(jsonPath("$.errorCode", is("INVALID_STATE_TRANSITION")));
+        }
+    }
+
+    @Test
+    void updateEventStatus_unknownEventReturns404() throws Exception {
+        UUID unknownId = UUID.randomUUID();
+        patchStatus(unknownId, "ON_SALE")
+                .andExpect(status().isNotFound())
+                .andExpect(jsonPath("$.status", is(404)))
+                .andExpect(jsonPath("$.errorCode", is("RESOURCE_NOT_FOUND")));
+    }
+
+    @Test
+    void updateEventStatus_invalidStatusValueReturns400() throws Exception {
+        UUID eventId = createTestEvent();
+        patchStatusRaw(eventId, "{\"status\":\"UNKNOWN_STATUS\"}")
+                .andExpect(status().isBadRequest())
+                .andExpect(jsonPath("$.status", is(400)))
+                .andExpect(jsonPath("$.errorCode", is("VALIDATION_ERROR")));
+
+        patchStatusRaw(eventId, "{\"status\":\"\"}")
+                .andExpect(status().isBadRequest())
+                .andExpect(jsonPath("$.status", is(400)))
+                .andExpect(jsonPath("$.errorCode", is("VALIDATION_ERROR")));
+    }
+
+    @Test
+    void updateEventStatus_nonAdminReturns403() throws Exception {
+        UUID eventId = createTestEvent();
+        mockMvc.perform(patch("/api/v1/admin/events/{eventId}/status", eventId)
+                        .header("X-User-Roles", "USER")
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content("{\"status\":\"ON_SALE\"}"))
+                .andExpect(status().isForbidden())
+                .andExpect(jsonPath("$.status", is(403)))
+                .andExpect(jsonPath("$.errorCode", is("FORBIDDEN")));
+
+        mockMvc.perform(patch("/api/v1/admin/events/{eventId}/status", eventId)
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content("{\"status\":\"ON_SALE\"}"))
+                .andExpect(status().isUnauthorized())
+                .andExpect(jsonPath("$.status", is(401)))
+                .andExpect(jsonPath("$.errorCode", is("UNAUTHORIZED")));
+    }
+
+    @Test
+    void updateEventStatus_goingOnSaleMakesRedisDropKeyAppearAndCancelledRemovesIt() throws Exception {
+        UUID eventId = createTestEventWithStatus("SCHEDULED");
+        String redisKey = RedisKeys.eventDropTsKey(eventId);
+
+        stringRedisTemplate.delete(redisKey);
+        assertThat(stringRedisTemplate.hasKey(redisKey)).isFalse();
+
+        // 1. Transition SCHEDULED -> ON_SALE brings up the key
+        patchStatus(eventId, "ON_SALE").andExpect(status().isOk());
+        assertThat(stringRedisTemplate.hasKey(redisKey)).isTrue();
+        String dropTs = stringRedisTemplate.opsForValue().get(redisKey);
+        assertThat(dropTs).isNotNull();
+
+        // 2. Transition ON_SALE -> CANCELLED deletes the key
+        patchStatus(eventId, "CANCELLED").andExpect(status().isOk());
+        assertThat(stringRedisTemplate.hasKey(redisKey)).isFalse();
+    }
+
+    @Test
+    void updateEventStatus_redisFailureAfterCommitStillReturns200() throws Exception {
+        UUID eventId = createTestEventWithStatus("SCHEDULED");
+
+        try {
+            adminService.setRedisSyncHook(() -> {
+                throw new RuntimeException("Simulated Redis network disconnection after commit");
+            });
+
+            patchStatus(eventId, "ON_SALE")
+                    .andExpect(status().isOk())
+                    .andExpect(jsonPath("$.status", is("ON_SALE")));
+
+            assertThat(getEventStatus(eventId)).isEqualTo("ON_SALE");
+        } finally {
+            adminService.setRedisSyncHook(null);
+        }
     }
 }
 

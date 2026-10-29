@@ -83,6 +83,7 @@ All `4xx` and `5xx` responses across `gateway-service`, `inventory-service`, and
 | `RESERVATION_EXPIRED` | `409` | `order-service` | Order is expired or has fewer than 15 seconds remaining until `expires_at`. |
 | `INVALID_ORDER_STATE` | `409` | `order-service` | Order is already in `PAYMENT_PENDING`, `CONFIRMED`, or a `CANCELLED_*` state. |
 | `IDEMPOTENCY_REQUEST_IN_PROGRESS` | `409` | `inventory-service`, `order-service` | Concurrent request with the same `Idempotency-Key` is currently executing (`Retry-After: 1`). |
+| `INVALID_STATE_TRANSITION` | `409` | `inventory-service` | Attempted invalid or duplicate event state transition. |
 | `IDEMPOTENCY_KEY_PAYLOAD_MISMATCH` | `422` | `inventory-service`, `order-service` | Same `Idempotency-Key` reused with a different request payload. |
 | `RATE_LIMIT_EXCEEDED` | `429` | `gateway-service` | Token-bucket rate limit exceeded (`Retry-After: 1`). |
 | `INTERNAL_SERVER_ERROR` | `500` | All | Unexpected server error. |
@@ -173,6 +174,47 @@ All `4xx` and `5xx` responses across `gateway-service`, `inventory-service`, and
 }
 ```
 - **Status Codes**: `201 Created`, `400 Bad Request`, `401 Unauthorized`, `403 Forbidden`, `404 Not Found` (`eventId` does not exist).
+
+---
+
+#### 7.3.3 Update Event Status (`ADMIN` Role Only)
+- **Method & Path**: `PATCH /api/v1/admin/events/{eventId}/status`
+- **Required Headers**: `Authorization: Bearer <admin-jwt>` (or `X-User-Roles: ADMIN`), `Content-Type: application/json`
+- **Request Body**:
+```json
+{
+  "status": "ON_SALE"
+}
+```
+- **Allowed Transitions**:
+  - `SCHEDULED` -> `ON_SALE`, `CANCELLED`
+  - `ON_SALE` -> `SOLD_OUT`, `CANCELLED`, `COMPLETED`
+  - `SOLD_OUT` -> `ON_SALE`, `COMPLETED`, `CANCELLED`
+  - Every other transition (including a transition to the same status) is rejected with `409 Conflict` (`INVALID_STATE_TRANSITION`).
+- **Side Effects**:
+  - Updates `events.status` and `events.updated_at` inside a transaction using `SELECT ... FOR UPDATE`.
+  - After commit, if new status is `ON_SALE`, calls Redis rewarm for the event so `event:{eventId}:drop_ts` (and any existing seat locks) are populated in Redis.
+  - After commit, if new status is `CANCELLED` or `COMPLETED`, deletes `event:{eventId}:drop_ts` from Redis. Cancelling an event does not touch existing holds, which simply expire.
+  - A Redis failure after commit does not fail the request (logged with the event ID).
+- **Response `200 OK` Body**:
+```json
+{
+  "eventId": "f0e1d2c3-b4a5-4968-8796-a5b4c3d2e1f0",
+  "name": "Taylor Swift — The Eras Tour Finale",
+  "venueName": "MetLife Stadium",
+  "eventTime": "2026-12-15T20:00:00Z",
+  "dropTime": "2026-11-01T16:00:00Z",
+  "status": "ON_SALE",
+  "createdAt": "2026-10-27T22:00:00Z"
+}
+```
+- **Status Codes**:
+  - `200 OK`: Event status updated.
+  - `400 Bad Request`: `VALIDATION_ERROR` for an unknown status value.
+  - `401 Unauthorized`: Missing or invalid authentication.
+  - `403 Forbidden`: Caller lacks required `ADMIN` role.
+  - `404 Not Found`: `RESOURCE_NOT_FOUND` if the event does not exist.
+  - `409 Conflict`: `INVALID_STATE_TRANSITION` for an invalid transition or same status.
 
 ---
 

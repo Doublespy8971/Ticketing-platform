@@ -4,10 +4,12 @@ import com.ticketing.inventory.api.dto.BulkCreateSeatsRequest;
 import com.ticketing.inventory.api.dto.BulkCreateSeatsResponse;
 import com.ticketing.inventory.api.dto.CreateEventRequest;
 import com.ticketing.inventory.api.dto.EventResponse;
+import com.ticketing.inventory.api.dto.UpdateEventStatusRequest;
 import com.ticketing.inventory.service.InventoryAdminService;
 import jakarta.validation.Valid;
 import org.springframework.http.HttpStatus;
 import org.springframework.http.MediaType;
+import org.springframework.web.bind.annotation.PatchMapping;
 import org.springframework.web.bind.annotation.PathVariable;
 import org.springframework.web.bind.annotation.PostMapping;
 import org.springframework.web.bind.annotation.RequestBody;
@@ -40,6 +42,13 @@ public class AdminEventController {
             @PathVariable("eventId") UUID eventId,
             @Valid @RequestBody BulkCreateSeatsRequest request) {
         return adminService.bulkCreateSeats(eventId, request);
+    }
+
+    @PatchMapping(path = "/events/{eventId}/status", consumes = MediaType.APPLICATION_JSON_VALUE)
+    public EventResponse updateEventStatus(
+            @PathVariable("eventId") UUID eventId,
+            @Valid @RequestBody UpdateEventStatusRequest request) {
+        return adminService.updateEventStatus(eventId, request);
     }
 }
 

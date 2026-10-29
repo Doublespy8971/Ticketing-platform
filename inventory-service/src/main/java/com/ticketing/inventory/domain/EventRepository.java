@@ -30,6 +30,19 @@ public class EventRepository {
             WHERE event_id = ?
             """;
 
+    private static final String SELECT_BY_ID_FOR_UPDATE_SQL = """
+            SELECT event_id, name, venue_name, event_time, drop_time, status, created_at, updated_at
+            FROM events
+            WHERE event_id = ?
+            FOR UPDATE
+            """;
+
+    private static final String UPDATE_STATUS_SQL = """
+            UPDATE events
+            SET status = ?, updated_at = ?
+            WHERE event_id = ?
+            """;
+
     private static final String SELECT_ALL_SQL = """
             SELECT event_id, name, venue_name, event_time, drop_time, status, created_at, updated_at
             FROM events
@@ -97,6 +110,25 @@ public class EventRepository {
         return jdbcTemplate.query(SELECT_BY_ID_SQL, ROW_MAPPER, eventId)
                 .stream()
                 .findFirst();
+    }
+
+    public Optional<EventRecord> findByIdForUpdate(UUID eventId) {
+        Objects.requireNonNull(eventId, "eventId must not be null");
+        return jdbcTemplate.query(SELECT_BY_ID_FOR_UPDATE_SQL, ROW_MAPPER, eventId)
+                .stream()
+                .findFirst();
+    }
+
+    @Transactional(propagation = Propagation.MANDATORY)
+    public int updateStatus(UUID eventId, String status, Instant updatedAt) {
+        Objects.requireNonNull(eventId, "eventId must not be null");
+        Objects.requireNonNull(status, "status must not be null");
+        Objects.requireNonNull(updatedAt, "updatedAt must not be null");
+        return jdbcTemplate.update(
+                UPDATE_STATUS_SQL,
+                new Object[]{status, toOffsetDateTime(updatedAt), eventId},
+                new int[]{Types.VARCHAR, Types.TIMESTAMP_WITH_TIMEZONE, Types.OTHER}
+        );
     }
 
     public List<EventRecord> findAll() {
