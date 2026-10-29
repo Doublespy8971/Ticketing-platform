@@ -8,9 +8,13 @@ public enum HoldOutcome {
 
     public static HoldOutcome fromRaw(String raw) {
         if (raw == null) {
-            throw new IllegalArgumentException("Null hold_inventory.lua outcome");
+            throw new RedisUnavailableException("hold_inventory.lua returned null reply");
         }
-        return HoldOutcome.valueOf(raw);
+        try {
+            return HoldOutcome.valueOf(raw);
+        } catch (IllegalArgumentException ex) {
+            throw new RedisUnavailableException("hold_inventory.lua returned unrecognized outcome: " + raw, ex);
+        }
     }
 }
 

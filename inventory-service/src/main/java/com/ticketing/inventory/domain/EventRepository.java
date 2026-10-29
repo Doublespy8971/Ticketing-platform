@@ -35,6 +35,13 @@ public class EventRepository {
             FROM events
             """;
 
+    private static final String SELECT_REWARM_ELIGIBLE_SQL = """
+            SELECT event_id, name, venue_name, event_time, drop_time, status, created_at, updated_at
+            FROM events
+            WHERE status IN ('SCHEDULED', 'ON_SALE', 'SOLD_OUT')
+            ORDER BY created_at ASC
+            """;
+
     private static final RowMapper<EventRecord> ROW_MAPPER = (rs, rowNum) -> new EventRecord(
             rs.getObject("event_id", UUID.class),
             rs.getString("name"),
@@ -94,6 +101,10 @@ public class EventRepository {
 
     public List<EventRecord> findAll() {
         return jdbcTemplate.query(SELECT_ALL_SQL, ROW_MAPPER);
+    }
+
+    public List<EventRecord> findRewarmEligibleEvents() {
+        return jdbcTemplate.query(SELECT_REWARM_ELIGIBLE_SQL, ROW_MAPPER);
     }
 
     private static OffsetDateTime toOffsetDateTime(Instant instant) {

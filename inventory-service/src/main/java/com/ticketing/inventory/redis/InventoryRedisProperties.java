@@ -12,6 +12,7 @@ public class InventoryRedisProperties {
     private long holdTtlSafetyMarginSeconds = RedisKeys.HOLD_TTL_SAFETY_MARGIN_SECONDS;
     private boolean rewarmOnStartup = false;
     private int pipelineBatchSize = 500;
+    private int soldSeatsPageSize = 1000;
     private Duration commandTimeout = Duration.ofMillis(500);
 
     public long getSeatHoldTtlSeconds() {
@@ -52,6 +53,14 @@ public class InventoryRedisProperties {
 
     public void setPipelineBatchSize(int pipelineBatchSize) {
         this.pipelineBatchSize = pipelineBatchSize;
+    }
+
+    public int getSoldSeatsPageSize() {
+        return soldSeatsPageSize;
+    }
+
+    public void setSoldSeatsPageSize(int soldSeatsPageSize) {
+        this.soldSeatsPageSize = soldSeatsPageSize;
     }
 
     public Duration getCommandTimeout() {

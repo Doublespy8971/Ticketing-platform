@@ -104,7 +104,10 @@ public class RedisSeatGate {
                     keys,
                     reservationId.toString()
             );
-            long count = released != null ? released : 0L;
+            if (released == null) {
+                throw new RedisUnavailableException("release_inventory.lua returned null reply");
+            }
+            long count = released;
             resultStr = count > 0 ? "RELEASED" : "NOOP";
             return count;
         } catch (DataAccessException | RedisException ex) {

@@ -35,11 +35,34 @@ public class SeatRepository {
             WHERE seat_id = ?
             """;
 
+    public record SoldSeat(UUID eventId, UUID seatId) {}
+
     private static final String SELECT_SOLD_SEAT_IDS_BY_EVENT_SQL = """
             SELECT seat_id
             FROM seats
             WHERE event_id = ? AND status = 'SOLD'
             """;
+
+    private static final String SELECT_SOLD_SEATS_PAGE_FIRST_SQL = """
+            SELECT event_id, seat_id
+            FROM seats
+            WHERE event_id = ? AND status = 'SOLD'
+            ORDER BY seat_id ASC
+            LIMIT ?
+            """;
+
+    private static final String SELECT_SOLD_SEATS_PAGE_NEXT_SQL = """
+            SELECT event_id, seat_id
+            FROM seats
+            WHERE event_id = ? AND status = 'SOLD' AND seat_id > ?
+            ORDER BY seat_id ASC
+            LIMIT ?
+            """;
+
+    private static final RowMapper<SoldSeat> SOLD_SEAT_ROW_MAPPER = (rs, rowNum) -> new SoldSeat(
+            rs.getObject("event_id", UUID.class),
+            rs.getObject("seat_id", UUID.class)
+    );
 
     private static final String SELECT_ALL_SOLD_SEATS_SQL = """
             SELECT seat_id, event_id, section_code, row_label, seat_number,
@@ -118,6 +141,29 @@ public class SeatRepository {
                 (rs, rowNum) -> rs.getObject("seat_id", UUID.class),
                 eventId
         );
+    }
+
+    public List<SoldSeat> findSoldSeatsByEventIdKeyset(UUID eventId, UUID afterSeatId, int limit) {
+        Objects.requireNonNull(eventId, "eventId must not be null");
+        if (limit <= 0) {
+            throw new IllegalArgumentException("limit must be positive");
+        }
+        if (afterSeatId == null) {
+            return jdbcTemplate.query(
+                    SELECT_SOLD_SEATS_PAGE_FIRST_SQL,
+                    SOLD_SEAT_ROW_MAPPER,
+                    eventId,
+                    limit
+            );
+        } else {
+            return jdbcTemplate.query(
+                    SELECT_SOLD_SEATS_PAGE_NEXT_SQL,
+                    SOLD_SEAT_ROW_MAPPER,
+                    eventId,
+                    afterSeatId,
+                    limit
+            );
+        }
     }
 
     public List<SeatRecord> findAllSoldSeats() {

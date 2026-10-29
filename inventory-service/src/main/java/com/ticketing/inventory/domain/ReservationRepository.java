@@ -123,6 +123,14 @@ public class ReservationRepository {
                 .findFirst();
     }
 
+    public Optional<String> findStatusById(UUID reservationId) {
+        Objects.requireNonNull(reservationId, "reservationId must not be null");
+        String sql = "SELECT status FROM reservations WHERE reservation_id = ?";
+        return jdbcTemplate.query(sql, (rs, rowNum) -> rs.getString("status"), reservationId)
+                .stream()
+                .findFirst();
+    }
+
     public List<ReservationItemRecord> findItemsByReservationId(UUID reservationId) {
         Objects.requireNonNull(reservationId, "reservationId must not be null");
         return jdbcTemplate.query(SELECT_ITEMS_BY_RESERVATION_ID_SQL, ITEM_ROW_MAPPER, reservationId);
@@ -208,6 +216,23 @@ public class ReservationRepository {
                 }
             });
         }
+    }
+
+    @Transactional(propagation = Propagation.MANDATORY)
+    public boolean updateStatus(UUID reservationId, String newStatus) {
+        Objects.requireNonNull(reservationId, "reservationId must not be null");
+        Objects.requireNonNull(newStatus, "newStatus must not be null");
+        String sql = """
+                UPDATE reservations
+                SET status = ?, updated_at = ?
+                WHERE reservation_id = ?
+                """;
+        int updated = jdbcTemplate.update(
+                sql,
+                new Object[]{newStatus, toOffsetDateTime(Instant.now()), reservationId},
+                new int[]{Types.VARCHAR, Types.TIMESTAMP_WITH_TIMEZONE, Types.OTHER}
+        );
+        return updated > 0;
     }
 
     private static OffsetDateTime toOffsetDateTime(Instant instant) {
