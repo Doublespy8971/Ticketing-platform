@@ -7,12 +7,14 @@ import org.springframework.stereotype.Repository;
 import org.springframework.transaction.annotation.Propagation;
 import org.springframework.transaction.annotation.Transactional;
 
+import java.sql.Array;
 import java.sql.PreparedStatement;
 import java.sql.SQLException;
 import java.sql.Types;
 import java.time.Instant;
 import java.time.OffsetDateTime;
 import java.time.ZoneOffset;
+import java.util.Collection;
 import java.util.List;
 import java.util.Objects;
 import java.util.Optional;
@@ -33,6 +35,30 @@ public class SeatRepository {
                    price_cents, currency, status, version, created_at, updated_at
             FROM seats
             WHERE seat_id = ?
+            """;
+
+    private static final String SELECT_BY_EVENT_AND_IDS_SQL = """
+            SELECT seat_id, event_id, section_code, row_label, seat_number,
+                   price_cents, currency, status, version, created_at, updated_at
+            FROM seats
+            WHERE event_id = ? AND seat_id = ANY(?)
+            ORDER BY seat_id ASC
+            """;
+
+    private static final String HOLD_AVAILABLE_SEATS_SQL = """
+            UPDATE seats
+            SET status = 'HELD',
+                version = version + 1,
+                updated_at = NOW()
+            WHERE seat_id IN (
+                SELECT seat_id
+                FROM seats
+                WHERE event_id = ?
+                  AND seat_id = ANY(?)
+                  AND status = 'AVAILABLE'
+                ORDER BY seat_id ASC
+                FOR UPDATE
+            )
             """;
 
     public record SoldSeat(UUID eventId, UUID seatId) {}
@@ -132,6 +158,39 @@ public class SeatRepository {
         return jdbcTemplate.query(SELECT_BY_ID_SQL, ROW_MAPPER, seatId)
                 .stream()
                 .findFirst();
+    }
+
+    public List<SeatRecord> findByEventIdAndSeatIds(UUID eventId, Collection<UUID> seatIds) {
+        Objects.requireNonNull(eventId, "eventId must not be null");
+        Objects.requireNonNull(seatIds, "seatIds must not be null");
+        if (seatIds.isEmpty()) {
+            return List.of();
+        }
+        UUID[] idArray = seatIds.toArray(new UUID[0]);
+        return jdbcTemplate.query(con -> {
+            PreparedStatement ps = con.prepareStatement(SELECT_BY_EVENT_AND_IDS_SQL);
+            ps.setObject(1, eventId, Types.OTHER);
+            Array sqlArray = con.createArrayOf("uuid", idArray);
+            ps.setArray(2, sqlArray);
+            return ps;
+        }, ROW_MAPPER);
+    }
+
+    @Transactional(propagation = Propagation.MANDATORY)
+    public int holdAvailableSeats(UUID eventId, Collection<UUID> seatIds) {
+        Objects.requireNonNull(eventId, "eventId must not be null");
+        Objects.requireNonNull(seatIds, "seatIds must not be null");
+        if (seatIds.isEmpty()) {
+            return 0;
+        }
+        UUID[] idArray = seatIds.toArray(new UUID[0]);
+        return jdbcTemplate.update(con -> {
+            PreparedStatement ps = con.prepareStatement(HOLD_AVAILABLE_SEATS_SQL);
+            ps.setObject(1, eventId, Types.OTHER);
+            Array sqlArray = con.createArrayOf("uuid", idArray);
+            ps.setArray(2, sqlArray);
+            return ps;
+        });
     }
 
     public List<UUID> findSoldSeatIdsByEventId(UUID eventId) {

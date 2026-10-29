@@ -74,6 +74,24 @@ public class ReservationRepository {
 
     public record HeldSeatLock(UUID eventId, UUID seatId, UUID reservationId, long remainingSeconds) {}
 
+    public record ReservationTimestamps(Instant createdAt, Instant expiresAt) {}
+
+    private static final String INSERT_HELD_WITH_DB_CLOCK_SQL = """
+            WITH ts AS (
+                SELECT date_trunc('microseconds', clock_timestamp()) AS now_ts
+            )
+            INSERT INTO reservations (
+                reservation_id, event_id, user_id, status, total_amount_cents, currency,
+                created_at, expires_at, updated_at
+            )
+            SELECT ?, ?, ?, 'HELD', ?, ?,
+                   ts.now_ts,
+                   ts.now_ts + (? * INTERVAL '1 second'),
+                   ts.now_ts
+            FROM ts
+            RETURNING created_at, expires_at
+            """;
+
     private static final RowMapper<HeldSeatLock> HELD_SEAT_LOCK_ROW_MAPPER = (rs, rowNum) -> new HeldSeatLock(
             rs.getObject("event_id", UUID.class),
             rs.getObject("seat_id", UUID.class),
@@ -189,33 +207,68 @@ public class ReservationRepository {
         );
 
         if (!items.isEmpty()) {
-            jdbcTemplate.batchUpdate(INSERT_ITEM_SQL, new BatchPreparedStatementSetter() {
-                @Override
-                public void setValues(PreparedStatement ps, int i) throws SQLException {
-                    ReservationItemRecord item = items.get(i);
-                    Instant itemCreatedAt = item.createdAt() != null ? item.createdAt() : now;
-                    Instant itemUpdatedAt = item.updatedAt() != null ? item.updatedAt() : now;
-                    String itemStatus = item.status() != null ? item.status() : "HELD";
-
-                    ps.setObject(1, item.reservationItemId(), Types.OTHER);
-                    ps.setObject(2, item.reservationId(), Types.OTHER);
-                    ps.setObject(3, item.eventId(), Types.OTHER);
-                    ps.setObject(4, item.seatId(), Types.OTHER);
-                    ps.setString(5, item.sectionCode());
-                    ps.setString(6, item.rowLabel());
-                    ps.setString(7, item.seatNumber());
-                    ps.setLong(8, item.priceCents());
-                    ps.setString(9, itemStatus);
-                    ps.setObject(10, toOffsetDateTime(itemCreatedAt), Types.TIMESTAMP_WITH_TIMEZONE);
-                    ps.setObject(11, toOffsetDateTime(itemUpdatedAt), Types.TIMESTAMP_WITH_TIMEZONE);
-                }
-
-                @Override
-                public int getBatchSize() {
-                    return items.size();
-                }
-            });
+            insertItems(items, now);
         }
+    }
+
+    @Transactional(propagation = Propagation.MANDATORY)
+    public ReservationTimestamps insertHeldReservationWithDbClock(
+            UUID reservationId,
+            UUID eventId,
+            UUID userId,
+            long totalAmountCents,
+            String currency,
+            long holdTtlSeconds) {
+        Objects.requireNonNull(reservationId, "reservationId must not be null");
+        Objects.requireNonNull(eventId, "eventId must not be null");
+        Objects.requireNonNull(userId, "userId must not be null");
+        String curr = currency != null ? currency : "USD";
+
+        ReservationTimestamps timestamps = jdbcTemplate.queryForObject(
+                INSERT_HELD_WITH_DB_CLOCK_SQL,
+                new Object[]{reservationId, eventId, userId, totalAmountCents, curr, holdTtlSeconds},
+                new int[]{Types.OTHER, Types.OTHER, Types.OTHER, Types.BIGINT, Types.CHAR, Types.BIGINT},
+                (rs, rowNum) -> new ReservationTimestamps(
+                        toInstant(rs.getObject("created_at", OffsetDateTime.class)),
+                        toInstant(rs.getObject("expires_at", OffsetDateTime.class))
+                )
+        );
+        return Objects.requireNonNull(timestamps, "timestamps must not be null");
+    }
+
+    @Transactional(propagation = Propagation.MANDATORY)
+    public void insertItems(List<ReservationItemRecord> items, Instant defaultTimestamp) {
+        Objects.requireNonNull(items, "items must not be null");
+        if (items.isEmpty()) {
+            return;
+        }
+        Instant now = defaultTimestamp != null ? defaultTimestamp : Instant.now();
+        jdbcTemplate.batchUpdate(INSERT_ITEM_SQL, new BatchPreparedStatementSetter() {
+            @Override
+            public void setValues(PreparedStatement ps, int i) throws SQLException {
+                ReservationItemRecord item = items.get(i);
+                Instant itemCreatedAt = item.createdAt() != null ? item.createdAt() : now;
+                Instant itemUpdatedAt = item.updatedAt() != null ? item.updatedAt() : now;
+                String itemStatus = item.status() != null ? item.status() : "HELD";
+
+                ps.setObject(1, item.reservationItemId(), Types.OTHER);
+                ps.setObject(2, item.reservationId(), Types.OTHER);
+                ps.setObject(3, item.eventId(), Types.OTHER);
+                ps.setObject(4, item.seatId(), Types.OTHER);
+                ps.setString(5, item.sectionCode());
+                ps.setString(6, item.rowLabel());
+                ps.setString(7, item.seatNumber());
+                ps.setLong(8, item.priceCents());
+                ps.setString(9, itemStatus);
+                ps.setObject(10, toOffsetDateTime(itemCreatedAt), Types.TIMESTAMP_WITH_TIMEZONE);
+                ps.setObject(11, toOffsetDateTime(itemUpdatedAt), Types.TIMESTAMP_WITH_TIMEZONE);
+            }
+
+            @Override
+            public int getBatchSize() {
+                return items.size();
+            }
+        });
     }
 
     @Transactional(propagation = Propagation.MANDATORY)
