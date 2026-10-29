@@ -103,9 +103,9 @@ EVENT_STATUS=$(echo "${RES_BODY}" | jq -r '.status // empty')
 
 if [ "${HTTP_STATUS}" = "201" ] && [ -n "${EVENT_ID}" ] && [ "${EVENT_STATUS}" = "SCHEDULED" ]; then
     echo "WARNING: No API endpoint exists to update event status to ON_SALE; updating directly in PostgreSQL via docker exec"
-    run_psql "UPDATE events SET status = 'ON_SALE', updated_at = NOW() WHERE event_id = '${EVENT_ID}';"
+    run_psql "UPDATE events SET status = 'ON_SALE', updated_at = NOW() WHERE event_id = '${EVENT_ID}'::uuid;"
 
-    DB_EVENT_STATUS=$(run_psql "SELECT status FROM events WHERE event_id = '${EVENT_ID}';")
+    DB_EVENT_STATUS=$(run_psql "SELECT status FROM events WHERE event_id = '${EVENT_ID}'::uuid;")
     if [ "${DB_EVENT_STATUS}" = "ON_SALE" ]; then
         record_pass "${CHECK_NAME} (eventId=${EVENT_ID}, status=ON_SALE)"
     else
@@ -339,11 +339,11 @@ CHECK_NAME="7. PostgreSQL state verification"
 
 if [ -n "${EVENT_ID}" ] && [ -n "${SEAT1_ID}" ] && [ -n "${SEAT2_ID}" ]; then
     # Total successful holds = 2 (user 1 on seat 1, parallel winner on seat 2)
-    ACTIVE_ITEMS=$(run_psql "SELECT count(*) FROM reservation_items WHERE event_id = '${EVENT_ID}' AND status IN ('HELD', 'CONFIRMED');")
-    DUPLICATE_ITEMS=$(run_psql "SELECT count(*) FROM (SELECT seat_id FROM reservation_items WHERE event_id = '${EVENT_ID}' AND status IN ('HELD', 'CONFIRMED') GROUP BY seat_id HAVING count(*) > 1) d;")
-    OUTBOX_ROWS=$(run_psql "SELECT count(*) FROM outbox_events WHERE event_type = 'inventory.seat.reserved' AND aggregate_id IN (SELECT reservation_id::text FROM reservations WHERE event_id = '${EVENT_ID}');")
-    HELD_SEATS=$(run_psql "SELECT count(*) FROM seats WHERE event_id = '${EVENT_ID}' AND seat_id IN ('${SEAT1_ID}', '${SEAT2_ID}') AND status = 'HELD';")
-    AVAILABLE_SEATS=$(run_psql "SELECT count(*) FROM seats WHERE event_id = '${EVENT_ID}' AND status = 'AVAILABLE';")
+    ACTIVE_ITEMS=$(run_psql "SELECT count(*) FROM reservation_items WHERE event_id = '${EVENT_ID}'::uuid AND status IN ('HELD', 'CONFIRMED');")
+    DUPLICATE_ITEMS=$(run_psql "SELECT count(*) FROM (SELECT seat_id FROM reservation_items WHERE event_id = '${EVENT_ID}'::uuid AND status IN ('HELD', 'CONFIRMED') GROUP BY seat_id HAVING count(*) > 1) d;")
+    OUTBOX_ROWS=$(run_psql "SELECT count(*) FROM outbox_events WHERE event_type = 'inventory.seat.reserved' AND aggregate_id IN (SELECT reservation_id FROM reservations WHERE event_id = '${EVENT_ID}'::uuid);")
+    HELD_SEATS=$(run_psql "SELECT count(*) FROM seats WHERE event_id = '${EVENT_ID}'::uuid AND seat_id IN ('${SEAT1_ID}'::uuid, '${SEAT2_ID}'::uuid) AND status = 'HELD';")
+    AVAILABLE_SEATS=$(run_psql "SELECT count(*) FROM seats WHERE event_id = '${EVENT_ID}'::uuid AND status = 'AVAILABLE';")
 
     PG_OK=true
     PG_ERRORS=()
