@@ -129,16 +129,19 @@ CREATE INDEX idx_idempotency_keys_expires_at
    - If `status = 'IN_PROGRESS'` (and `created_at > NOW() - INTERVAL '30 seconds'`), return `409 Conflict` (`IDEMPOTENCY_REQUEST_IN_PROGRESS`) with header `Retry-After: 1`.
    - If `status = 'COMPLETED'`, return the stored `response_status` and `response_body` with header `X-Idempotent-Replay: true`.
 4. **Commit Outcome (`1` row inserted)**:
-   - For deterministic business outcomes (`201 Created`, `202 Accepted`, `409 SEAT_ALREADY_TAKEN`, `409 RESERVATION_EXPIRED`, `409 EVENT_NOT_OPEN`), update the `idempotency_keys` row inside the same PostgreSQL transaction:
+   - Only successful `201 Created` (on `POST /api/v1/reservations`) and `202 Accepted` (on `POST /api/v1/orders/{orderId}/checkout`) responses are stored as `COMPLETED` inside the same PostgreSQL transaction (fenced by `status = 'IN_PROGRESS'` and the claim's `created_at` timestamp):
      ```sql
      UPDATE idempotency_keys
      SET status = 'COMPLETED',
          response_status = :httpStatus,
          response_body = :responseJson::jsonb,
          completed_at = NOW()
-     WHERE user_id = :userId AND idempotency_key = :idempotencyKey;
+     WHERE user_id = :userId
+       AND idempotency_key = :idempotencyKey
+       AND status = 'IN_PROGRESS'
+       AND created_at = :claimedAt;
      ```
-   - **Special Rule for Transient `409 ORDER_NOT_READY` and `5xx` Errors**: When `POST /api/v1/orders/{orderId}/checkout` returns `409 ORDER_NOT_READY` (because `inventory.seat.reserved` has not yet been consumed) or encounters an unhandled `5xx` database/infrastructure failure, the transaction rolls back (deleting the `IN_PROGRESS` row) so the client can retry after `Retry-After: 1` using the **same** `Idempotency-Key`.
+   - **Rule for Deterministic Business Rejections and `5xx` Errors**: Deterministic business rejections (`409 SEAT_ALREADY_TAKEN`, `409 EVENT_NOT_OPEN`, `409 RESERVATION_EXPIRED`, `409 ORDER_NOT_READY`) and `4xx`/`5xx` failures delete the `IN_PROGRESS` claim (`WHERE user_id = :userId AND idempotency_key = :idempotencyKey AND status = 'IN_PROGRESS' AND created_at = :claimedAt`) so a later retry with the **same** `Idempotency-Key` re-executes.
 
 ---
 

@@ -87,7 +87,7 @@ All custom metrics use the `ticketing_` prefix, lowercase `snake_case`, and base
 | Metric Name | Meter Type | Labels | Emitting Service | Description |
 | :--- | :--- | :--- | :--- | :--- |
 | `http_server_requests_seconds` | `Timer` (Histogram) | `service`, `method`, `uri`, `status` | All services | Standard HTTP request latency histogram with SLO buckets enabled. |
-| `ticketing_reservations_created_total` | `Counter` | `service`, `event_id` | `inventory-service` | Total seat holds committed to Redis and `inventory_db`. |
+| `ticketing_reservations_created_total` | `Counter` | `service` | `inventory-service` | Total seat holds committed to Redis and `inventory_db`. |
 | `ticketing_reservations_rejected_total` | `Counter` | `service`, `reason` (`EVENT_NOT_OPEN`, `SEAT_ALREADY_TAKEN`) | `inventory-service` | Total seat hold requests rejected by the Redis Lua gate or DB constraint. |
 | `ticketing_reservations_expired_total` | `Counter` | `service`, `trigger` (`postgres_sweeper`) | `inventory-service` | Total held reservations transitioned to `EXPIRED` in `inventory_db` by the `1000 ms` PostgreSQL sweeper. |
 | `ticketing_redis_lua_duration_seconds` | `Timer` | `service`, `script`, `result` | `gateway-service`, `inventory-service` | Execution duration of Redis Lua scripts. |

@@ -221,8 +221,8 @@ public class RedisRewarmService {
                 RedisStringCommands.SetOption.UPSERT
         )));
 
-        // 5. Ghost lock protection: re-read status of exactly those reservations from PostgreSQL
-        // and for any that are no longer HELD call release_inventory.lua for their seats
+        // 5. Ghost lock protection: re-read status of exactly those reservations from PostgreSQL;
+        // if CONFIRMED call confirm_inventory.lua, and if missing, RELEASED or EXPIRED call release_inventory.lua
         if (!heldLocks.isEmpty()) {
             Map<UUID, List<UUID>> seatsByRes = new LinkedHashMap<>();
             for (ReservationRepository.HeldSeatLock held : heldLocks) {
@@ -232,10 +232,21 @@ public class RedisRewarmService {
                 UUID resId = entry.getKey();
                 List<UUID> seats = entry.getValue();
                 Optional<String> statusOpt = reservationRepository.findStatusById(resId);
-                if (statusOpt.isEmpty() || !"HELD".equals(statusOpt.get())) {
-                    log.info("Ghost lock protection: reservation {} is no longer HELD ({}), releasing {} seats",
-                            resId, statusOpt.orElse("NOT_FOUND"), seats.size());
+                if (statusOpt.isEmpty()) {
+                    log.info("Ghost lock protection: reservation {} is missing (NOT_FOUND), releasing {} seats",
+                            resId, seats.size());
                     redisSeatGate.release(eventId, seats, resId);
+                } else {
+                    String status = statusOpt.get();
+                    if ("CONFIRMED".equals(status)) {
+                        log.info("Ghost lock protection: reservation {} is now CONFIRMED, confirming {} seats as SOLD",
+                                resId, seats.size());
+                        redisSeatGate.confirm(eventId, seats, resId);
+                    } else if ("RELEASED".equals(status) || "EXPIRED".equals(status)) {
+                        log.info("Ghost lock protection: reservation {} is no longer HELD ({}), releasing {} seats",
+                                resId, status, seats.size());
+                        redisSeatGate.release(eventId, seats, resId);
+                    }
                 }
             }
         }

@@ -58,8 +58,8 @@ return 'HELD'
 `inventory-service` executes `hold_inventory.lua` via `StringRedisTemplate.execute(DefaultRedisScript<String>, keys, args)` and maps the returned plain string directly:
 - `"HELD"`: Proceeds to the synchronous PostgreSQL transaction in `inventory_db` (`seats`, `reservations`, `reservation_items`, `outbox_events`) and returns `201 Created` on commit (or runs `release_inventory.lua` in `finally` on rollback).
 - `"EVENT_NOT_CACHED"`: Executes the cache rewarm job from `inventory_db` (Section 9.3.3) and retries `hold_inventory.lua` once; if `eventId` does not exist in `inventory_db`, returns `404 Not Found` (`RESOURCE_NOT_FOUND`).
-- `"EVENT_NOT_OPEN"`: Records the completed idempotency key and returns `409 Conflict` with RFC 7807 `errorCode: "EVENT_NOT_OPEN"`.
-- `"SEAT_TAKEN"`: Records the completed idempotency key and returns `409 Conflict` with RFC 7807 `errorCode: "SEAT_ALREADY_TAKEN"`.
+- `"EVENT_NOT_OPEN"`: Deletes the `IN_PROGRESS` idempotency key claim (so a later retry re-executes) and returns `409 Conflict` with RFC 7807 `errorCode: "EVENT_NOT_OPEN"`.
+- `"SEAT_TAKEN"`: Deletes the `IN_PROGRESS` idempotency key claim (so a later retry re-executes) and returns `409 Conflict` with RFC 7807 `errorCode: "SEAT_ALREADY_TAKEN"`.
 
 ---
 

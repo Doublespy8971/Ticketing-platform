@@ -57,6 +57,7 @@ import java.util.HexFormat;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
+import java.util.Optional;
 import java.util.Set;
 import java.util.UUID;
 import java.util.concurrent.TimeUnit;
@@ -77,11 +78,18 @@ public class ReservationService {
     private static final String METRIC_REDIS_COMPENSATIONS = "inventory_redis_compensations_total";
 
     private static final Set<String> OPEN_EVENT_STATUSES = Set.of("SCHEDULED", "ON_SALE");
+    private static final Set<String> ACTIVE_RESERVATION_STATUSES = Set.of("HELD", "CONFIRMED");
 
     public record HoldExecutionResult(
             int httpStatus,
             ReservationResponse response,
             boolean idempotentReplay
+    ) {
+    }
+
+    private record IdempotencyClaimOutcome(
+            Instant claimedAt,
+            IdempotencyKeyRecord completedRecord
     ) {
     }
 
@@ -98,9 +106,13 @@ public class ReservationService {
     private final MeterRegistry meterRegistry;
     private final long holdTtlSeconds;
 
-    // Deterministic test hooks for failure injection
+    // Deterministic test hooks for concurrency and failure injection
+    private volatile Runnable afterIdempotencyClaimHook;
+    private volatile Runnable afterRedisHoldHook;
     private volatile Runnable inTransactionHook;
     private volatile Runnable beforeCommitHook;
+    private volatile Runnable afterCommitHook;
+    private volatile Runnable beforeCompensationStatusReadHook;
 
     public ReservationService(
             EventRepository eventRepository,
@@ -135,6 +147,7 @@ public class ReservationService {
             UUID idempotencyKey,
             CreateReservationRequest request) {
         long startNanos = System.nanoTime();
+        Instant requestInstant = clock.instant();
         String outcomeTag = "ERROR";
 
         try {
@@ -145,26 +158,35 @@ public class ReservationService {
             List<UUID> requestedSeatIds = request.seatIds();
             String correlationId = MDC.get(CorrelationConstants.MDC_KEY);
 
-            // 2. HTTP Idempotency check & claim
+            // 2. HTTP Idempotency check & fenced claim
             String requestHash = computeRequestHash(request);
-            boolean claimed = claimOrCheckIdempotency(userId, idempotencyKey, requestHash);
-            if (!claimed) {
-                IdempotencyKeyRecord existing = idempotencyKeyRepository.findByUserAndKey(userId, idempotencyKey)
-                        .orElseThrow(() -> new IdempotencyRequestInProgressException(
-                                "Concurrent request with Idempotency-Key " + idempotencyKey + " is in progress."));
+            IdempotencyClaimOutcome claimOutcome = claimOrCheckIdempotency(userId, idempotencyKey, requestHash);
+            if (claimOutcome.completedRecord() != null) {
+                IdempotencyKeyRecord existing = claimOutcome.completedRecord();
+                if (existing.responseStatus() == null || existing.responseStatus() != HttpStatus.CREATED.value()) {
+                    throw new IllegalStateException(
+                            "Expected response_status 201 for COMPLETED idempotency key " + idempotencyKey
+                                    + ", but found " + existing.responseStatus());
+                }
                 ReservationResponse storedResponse = deserializeResponse(existing.responseBody());
                 outcomeTag = "REPLAY";
                 log.info("Idempotent replay for userId={}, idempotencyKey={}, reservationId={}, correlationId={}",
                         userId, idempotencyKey, storedResponse.reservationId(), correlationId);
                 return new HoldExecutionResult(
-                        existing.responseStatus() != null ? existing.responseStatus() : HttpStatus.CREATED.value(),
+                        HttpStatus.CREATED.value(),
                         storedResponse,
                         true
                 );
             }
 
+            Instant claimedAt = Objects.requireNonNull(claimOutcome.claimedAt(), "claimedAt must not be null");
             boolean idempotencyCommitted = false;
             try {
+                Runnable claimHook = this.afterIdempotencyClaimHook;
+                if (claimHook != null) {
+                    claimHook.run();
+                }
+
                 // 3. Load event and seats from PostgreSQL and check the event is on sale and drop time has passed
                 EventRecord event = eventRepository.findById(eventId)
                         .orElseThrow(() -> {
@@ -172,7 +194,7 @@ public class ReservationService {
                             return new ResourceNotFoundException("Event not found with ID: " + eventId);
                         });
 
-                checkEventOpenForSale(event, correlationId);
+                checkEventOpenForSale(event, requestInstant, correlationId);
 
                 List<SeatRecord> loadedSeats = seatRepository.findByEventIdAndSeatIds(eventId, requestedSeatIds);
                 if (loadedSeats.size() != requestedSeatIds.size()) {
@@ -206,7 +228,13 @@ public class ReservationService {
                 UUID reservationId = UuidV7.generate();
 
                 // 5. Call RedisSeatGate.hold; on EVENT_NOT_CACHED call rewarmEvent once and retry once
-                HoldOutcome holdOutcome = acquireRedisSeatHold(eventId, requestedSeatIds, reservationId, correlationId);
+                HoldOutcome holdOutcome = acquireRedisSeatHold(
+                        eventId,
+                        requestedSeatIds,
+                        reservationId,
+                        requestInstant.toEpochMilli(),
+                        correlationId
+                );
                 if (holdOutcome == HoldOutcome.EVENT_NOT_OPEN) {
                     outcomeTag = "EVENT_NOT_OPEN";
                     recordRejected("EVENT_NOT_OPEN");
@@ -224,14 +252,20 @@ public class ReservationService {
                             "One or more requested seats are currently HELD or SOLD.");
                 }
 
-                // 6. After a successful Redis hold (HELD), open ONE PostgreSQL transaction and compensate in finally on any failure
-                boolean pgCommitted = false;
+                // 6. After a successful Redis hold (HELD), open ONE PostgreSQL transaction and compensate on failure
+                boolean txReturnedNormally = false;
                 final long finalTotalAmountCents = totalAmountCents;
                 final String finalCurrency = currency;
                 try {
+                    Runnable postHoldHook = this.afterRedisHoldHook;
+                    if (postHoldHook != null) {
+                        postHoldHook.run();
+                    }
+
                     ReservationResponse createdResponse = executeHoldTransaction(
                             userId,
                             idempotencyKey,
+                            claimedAt,
                             eventId,
                             reservationId,
                             seatsInRequestOrder,
@@ -239,10 +273,10 @@ public class ReservationService {
                             finalTotalAmountCents,
                             finalCurrency
                     );
-                    pgCommitted = true;
+                    txReturnedNormally = true;
                     idempotencyCommitted = true;
                     outcomeTag = "CREATED";
-                    recordCreated(eventId);
+                    recordCreated();
                     log.info("Seat hold created in Redis and PostgreSQL: reservationId={}, orderId={}, eventId={}, userId={}, totalAmountCents={}, expiresAt={}, correlationId={}",
                             reservationId, reservationId, eventId, userId, finalTotalAmountCents, createdResponse.expiresAt(), correlationId);
                     return new HoldExecutionResult(HttpStatus.CREATED.value(), createdResponse, false);
@@ -256,13 +290,13 @@ public class ReservationService {
                     }
                     throw conflictEx;
                 } finally {
-                    if (!pgCommitted) {
-                        compensateRedisHold(eventId, requestedSeatIds, reservationId, correlationId);
+                    if (!txReturnedNormally) {
+                        compensateAfterTransactionFailure(eventId, requestedSeatIds, reservationId, correlationId);
                     }
                 }
             } finally {
                 if (!idempotencyCommitted) {
-                    safeDeleteInProgress(userId, idempotencyKey);
+                    safeDeleteInProgress(userId, idempotencyKey, claimedAt);
                 }
             }
         } catch (ResourceNotFoundException ex) {
@@ -297,7 +331,7 @@ public class ReservationService {
         }
     }
 
-    private void checkEventOpenForSale(EventRecord event, String correlationId) {
+    private void checkEventOpenForSale(EventRecord event, Instant requestInstant, String correlationId) {
         String status = event.status();
         if (status == null || !OPEN_EVENT_STATUSES.contains(status)) {
             if ("SOLD_OUT".equals(status)) {
@@ -313,11 +347,10 @@ public class ReservationService {
                     "Event " + event.eventId() + " is not open for reservations (status=" + status + ").");
         }
 
-        Instant now = clock.instant();
-        if (now.isBefore(event.dropTime())) {
+        if (requestInstant.isBefore(event.dropTime())) {
             recordRejected("EVENT_NOT_OPEN");
             log.info("Event drop time has not passed: eventId={}, dropTime={}, now={}, correlationId={}",
-                    event.eventId(), event.dropTime(), now, correlationId);
+                    event.eventId(), event.dropTime(), requestInstant, correlationId);
             throw new ConflictException(ErrorCode.EVENT_NOT_OPEN,
                     "Event " + event.eventId() + " drop time (" + event.dropTime() + ") has not been reached.");
         }
@@ -327,16 +360,25 @@ public class ReservationService {
             UUID eventId,
             List<UUID> seatIds,
             UUID reservationId,
+            long nowEpochMs,
             String correlationId) {
-        HoldOutcome outcome = redisSeatGate.hold(eventId, seatIds, reservationId);
+        HoldOutcome outcome = redisSeatGate.hold(eventId, seatIds, reservationId, nowEpochMs);
         if (outcome == HoldOutcome.EVENT_NOT_CACHED) {
             log.info("Redis returned EVENT_NOT_CACHED for eventId={}, reservationId={}, correlationId={}; rewarming once",
                     eventId, reservationId, correlationId);
             boolean rewarmed = redisRewarmService.rewarmEvent(eventId);
             if (!rewarmed) {
+                Optional<EventRecord> currentEvent = eventRepository.findById(eventId);
+                if (currentEvent.isPresent()) {
+                    recordRejected("EVENT_NOT_OPEN");
+                    log.info("Event {} exists with status={} after rewarm returned false, correlationId={}",
+                            eventId, currentEvent.get().status(), correlationId);
+                    throw new ConflictException(ErrorCode.EVENT_NOT_OPEN,
+                            "Event " + eventId + " is not open for reservations (status=" + currentEvent.get().status() + ").");
+                }
                 throw new ResourceNotFoundException("Event not found with ID: " + eventId);
             }
-            outcome = redisSeatGate.hold(eventId, seatIds, reservationId);
+            outcome = redisSeatGate.hold(eventId, seatIds, reservationId, nowEpochMs);
             if (outcome == HoldOutcome.EVENT_NOT_CACHED) {
                 throw new RedisUnavailableException(
                         "Redis still returned EVENT_NOT_CACHED after rewarming event " + eventId);
@@ -348,6 +390,7 @@ public class ReservationService {
     private ReservationResponse executeHoldTransaction(
             UUID userId,
             UUID idempotencyKey,
+            Instant claimedAt,
             UUID eventId,
             UUID reservationId,
             List<SeatRecord> seatsInRequestOrder,
@@ -355,17 +398,38 @@ public class ReservationService {
             long totalAmountCents,
             String currency) {
         return transactionTemplate.execute(status -> {
-            Runnable commitHook = this.beforeCommitHook;
-            if (commitHook != null && TransactionSynchronizationManager.isSynchronizationActive()) {
+            Runnable preCommit = this.beforeCommitHook;
+            Runnable postCommit = this.afterCommitHook;
+            if ((preCommit != null || postCommit != null) && TransactionSynchronizationManager.isSynchronizationActive()) {
                 TransactionSynchronizationManager.registerSynchronization(new TransactionSynchronization() {
                     @Override
                     public void beforeCommit(boolean readOnly) {
-                        commitHook.run();
+                        if (preCommit != null) {
+                            preCommit.run();
+                        }
+                    }
+
+                    @Override
+                    public void afterCommit() {
+                        if (postCommit != null) {
+                            postCommit.run();
+                        }
                     }
                 });
             }
 
-            // 1. Insert reservation with expires_at computed from DB clock as created_at + 600s
+            // 1. Guarded seat update first (ordered by seat_id ASC, row count must equal requested seat count)
+            List<SeatRecord> sortedForItems = new ArrayList<>(seatsSortedById);
+            sortedForItems.sort(Comparator.comparing(SeatRecord::seatId));
+            List<UUID> sortedSeatIds = sortedForItems.stream().map(SeatRecord::seatId).toList();
+
+            int updatedSeats = seatRepository.holdAvailableSeats(eventId, sortedSeatIds);
+            if (updatedSeats != sortedSeatIds.size()) {
+                throw new ConflictException(ErrorCode.SEAT_ALREADY_TAKEN,
+                        "One or more requested seats are no longer AVAILABLE.");
+            }
+
+            // 2. Insert reservation with expires_at computed from DB clock as created_at + 600s
             ReservationRepository.ReservationTimestamps timestamps =
                     reservationRepository.insertHeldReservationWithDbClock(
                             reservationId,
@@ -376,10 +440,7 @@ public class ReservationService {
                             holdTtlSeconds
                     );
 
-            // 2. Insert reservation_items with seat details and prices (sorted by seat_id for deterministic lock order)
-            List<SeatRecord> sortedForItems = new ArrayList<>(seatsSortedById);
-            sortedForItems.sort(Comparator.comparing(SeatRecord::seatId));
-
+            // 3. Insert reservation_items with seat details and prices (ordered by seat_id ASC)
             List<ReservationItemRecord> itemRecords = new ArrayList<>(sortedForItems.size());
             for (SeatRecord seat : sortedForItems) {
                 itemRecords.add(new ReservationItemRecord(
@@ -402,14 +463,6 @@ public class ReservationService {
             } catch (DataIntegrityViolationException ex) {
                 throw new ConflictException(ErrorCode.SEAT_ALREADY_TAKEN,
                         "One or more requested seats are already held or sold.");
-            }
-
-            // 3. Guarded update setting requested seats to HELD and incrementing version only where status = 'AVAILABLE'
-            List<UUID> sortedSeatIds = sortedForItems.stream().map(SeatRecord::seatId).toList();
-            int updatedSeats = seatRepository.holdAvailableSeats(eventId, sortedSeatIds);
-            if (updatedSeats != sortedSeatIds.size()) {
-                throw new ConflictException(ErrorCode.SEAT_ALREADY_TAKEN,
-                        "One or more requested seats are no longer AVAILABLE.");
             }
 
             Runnable txHook = this.inTransactionHook;
@@ -450,7 +503,7 @@ public class ReservationService {
             );
             outboxWriter.append(reservationId, EventTypes.INVENTORY_SEAT_RESERVED, payload);
 
-            // 5. Build response and store idempotency result atomically
+            // 5. Build response and mark idempotency key COMPLETED (fenced by claimedAt and status = 'IN_PROGRESS')
             ReservationResponse response = new ReservationResponse(
                     reservationId,
                     reservationId,
@@ -464,20 +517,36 @@ public class ReservationService {
                     timestamps.expiresAt()
             );
             String responseJson = serializeResponse(response);
-            idempotencyKeyRepository.markCompleted(userId, idempotencyKey, HttpStatus.CREATED.value(), responseJson);
+            idempotencyKeyRepository.markCompleted(
+                    userId,
+                    idempotencyKey,
+                    claimedAt,
+                    HttpStatus.CREATED.value(),
+                    responseJson
+            );
 
             return response;
         });
     }
 
-    private boolean claimOrCheckIdempotency(UUID userId, UUID idempotencyKey, String requestHash) {
-        if (idempotencyKeyRepository.tryClaim(userId, idempotencyKey, ENDPOINT, requestHash)) {
-            return true;
+    private IdempotencyClaimOutcome claimOrCheckIdempotency(UUID userId, UUID idempotencyKey, String requestHash) {
+        Optional<Instant> claimedAt = idempotencyKeyRepository.tryClaim(userId, idempotencyKey, ENDPOINT, requestHash);
+        if (claimedAt.isPresent()) {
+            return new IdempotencyClaimOutcome(claimedAt.get(), null);
         }
 
-        IdempotencyKeyRecord existing = idempotencyKeyRepository.findByUserAndKey(userId, idempotencyKey)
-                .orElseThrow(() -> new IdempotencyRequestInProgressException(
-                        "Concurrent request with Idempotency-Key " + idempotencyKey + " is currently in progress."));
+        Optional<IdempotencyKeyRecord> existingOpt = idempotencyKeyRepository.findByUserAndKey(userId, idempotencyKey);
+        if (existingOpt.isEmpty()) {
+            // The existing row vanished between tryClaim and findByUserAndKey; retry the claim once
+            Optional<Instant> retriedClaim = idempotencyKeyRepository.tryClaim(userId, idempotencyKey, ENDPOINT, requestHash);
+            if (retriedClaim.isPresent()) {
+                return new IdempotencyClaimOutcome(retriedClaim.get(), null);
+            }
+            existingOpt = idempotencyKeyRepository.findByUserAndKey(userId, idempotencyKey);
+        }
+
+        IdempotencyKeyRecord existing = existingOpt.orElseThrow(() -> new IdempotencyRequestInProgressException(
+                "Concurrent request with Idempotency-Key " + idempotencyKey + " is currently in progress."));
 
         if (!ENDPOINT.equals(existing.endpoint()) || !requestHash.equals(existing.requestHash())) {
             throw new IdempotencyPayloadMismatchException(
@@ -485,34 +554,79 @@ public class ReservationService {
         }
 
         if (IdempotencyKeyRepository.STATUS_IN_PROGRESS.equals(existing.status())) {
-            if (idempotencyKeyRepository.reclaimStaleInProgress(userId, idempotencyKey)) {
-                return true;
+            Optional<Instant> reclaimedAt = idempotencyKeyRepository.reclaimStaleInProgress(userId, idempotencyKey);
+            if (reclaimedAt.isPresent()) {
+                return new IdempotencyClaimOutcome(reclaimedAt.get(), null);
             }
             throw new IdempotencyRequestInProgressException(
                     "Request with Idempotency-Key " + idempotencyKey + " is currently in progress. Retry after 1 second.");
         }
 
-        return false;
+        return new IdempotencyClaimOutcome(null, existing);
+    }
+
+    private void compensateAfterTransactionFailure(
+            UUID eventId,
+            List<UUID> seatIds,
+            UUID reservationId,
+            String correlationId) {
+        boolean interrupted = Thread.interrupted();
+        try {
+            final Optional<String> statusOpt;
+            try {
+                Runnable statusHook = this.beforeCompensationStatusReadHook;
+                if (statusHook != null) {
+                    statusHook.run();
+                }
+                statusOpt = reservationRepository.findStatusById(reservationId);
+            } catch (Throwable statusReadEx) {
+                log.warn("Ambiguous commit: failed to read reservation status for reservationId={}, eventId={}, correlationId={}; not releasing Redis locks (covered by 660s safety-net TTL)",
+                        reservationId, eventId, correlationId, statusReadEx);
+                return;
+            }
+
+            if (statusOpt.isPresent() && ACTIVE_RESERVATION_STATUSES.contains(statusOpt.get())) {
+                log.warn("Ambiguous commit detected: reservationId={} exists in PostgreSQL with status={}, eventId={}, correlationId={}; not releasing Redis seat locks",
+                        reservationId, statusOpt.get(), eventId, correlationId);
+                return;
+            }
+
+            compensateRedisHold(eventId, seatIds, reservationId, correlationId);
+        } finally {
+            if (interrupted) {
+                Thread.currentThread().interrupt();
+            }
+        }
     }
 
     private void compensateRedisHold(UUID eventId, List<UUID> seatIds, UUID reservationId, String correlationId) {
-        recordCompensation();
+        boolean interrupted = Thread.interrupted();
         try {
+            recordCompensation();
             long releasedCount = redisSeatGate.release(eventId, seatIds, reservationId);
             log.info("Compensated Redis seat hold: reservationId={}, eventId={}, releasedCount={}, correlationId={}",
                     reservationId, eventId, releasedCount, correlationId);
         } catch (Throwable releaseEx) {
             log.error("Failed to release Redis seat hold during compensation for reservationId={}, eventId={}, correlationId={}; relying on 660s Redis safety-net TTL",
                     reservationId, eventId, correlationId, releaseEx);
+        } finally {
+            if (interrupted) {
+                Thread.currentThread().interrupt();
+            }
         }
     }
 
-    private void safeDeleteInProgress(UUID userId, UUID idempotencyKey) {
+    private void safeDeleteInProgress(UUID userId, UUID idempotencyKey, Instant claimedAt) {
+        boolean interrupted = Thread.interrupted();
         try {
-            idempotencyKeyRepository.deleteInProgress(userId, idempotencyKey);
+            idempotencyKeyRepository.deleteInProgress(userId, idempotencyKey, claimedAt);
         } catch (Throwable ex) {
             log.warn("Failed to clean up IN_PROGRESS idempotency key for userId={}, idempotencyKey={}",
                     userId, idempotencyKey, ex);
+        } finally {
+            if (interrupted) {
+                Thread.currentThread().interrupt();
+            }
         }
     }
 
@@ -544,11 +658,10 @@ public class ReservationService {
         }
     }
 
-    private void recordCreated(UUID eventId) {
+    private void recordCreated() {
         if (meterRegistry != null) {
             Counter.builder(METRIC_RESERVATIONS_CREATED)
                     .tag("service", SERVICE_NAME)
-                    .tag("event_id", eventId.toString())
                     .register(meterRegistry)
                     .increment();
         }
@@ -589,12 +702,28 @@ public class ReservationService {
         }
     }
 
-    // Test hooks for deterministic failure injection
+    // Test hooks for deterministic concurrency and failure injection
+    public void setAfterIdempotencyClaimHook(Runnable afterIdempotencyClaimHook) {
+        this.afterIdempotencyClaimHook = afterIdempotencyClaimHook;
+    }
+
+    public void setAfterRedisHoldHook(Runnable afterRedisHoldHook) {
+        this.afterRedisHoldHook = afterRedisHoldHook;
+    }
+
     public void setInTransactionHook(Runnable inTransactionHook) {
         this.inTransactionHook = inTransactionHook;
     }
 
     public void setBeforeCommitHook(Runnable beforeCommitHook) {
         this.beforeCommitHook = beforeCommitHook;
+    }
+
+    public void setAfterCommitHook(Runnable afterCommitHook) {
+        this.afterCommitHook = afterCommitHook;
+    }
+
+    public void setBeforeCompensationStatusReadHook(Runnable beforeCompensationStatusReadHook) {
+        this.beforeCompensationStatusReadHook = beforeCompensationStatusReadHook;
     }
 }
