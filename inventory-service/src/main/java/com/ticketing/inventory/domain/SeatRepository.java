@@ -35,6 +35,19 @@ public class SeatRepository {
             WHERE seat_id = ?
             """;
 
+    private static final String SELECT_SOLD_SEAT_IDS_BY_EVENT_SQL = """
+            SELECT seat_id
+            FROM seats
+            WHERE event_id = ? AND status = 'SOLD'
+            """;
+
+    private static final String SELECT_ALL_SOLD_SEATS_SQL = """
+            SELECT seat_id, event_id, section_code, row_label, seat_number,
+                   price_cents, currency, status, version, created_at, updated_at
+            FROM seats
+            WHERE status = 'SOLD'
+            """;
+
     private static final RowMapper<SeatRecord> ROW_MAPPER = (rs, rowNum) -> new SeatRecord(
             rs.getObject("seat_id", UUID.class),
             rs.getObject("event_id", UUID.class),
@@ -96,6 +109,19 @@ public class SeatRepository {
         return jdbcTemplate.query(SELECT_BY_ID_SQL, ROW_MAPPER, seatId)
                 .stream()
                 .findFirst();
+    }
+
+    public List<UUID> findSoldSeatIdsByEventId(UUID eventId) {
+        Objects.requireNonNull(eventId, "eventId must not be null");
+        return jdbcTemplate.query(
+                SELECT_SOLD_SEAT_IDS_BY_EVENT_SQL,
+                (rs, rowNum) -> rs.getObject("seat_id", UUID.class),
+                eventId
+        );
+    }
+
+    public List<SeatRecord> findAllSoldSeats() {
+        return jdbcTemplate.query(SELECT_ALL_SOLD_SEATS_SQL, ROW_MAPPER);
     }
 
     private static OffsetDateTime toOffsetDateTime(Instant instant) {

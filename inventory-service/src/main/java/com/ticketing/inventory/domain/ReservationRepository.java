@@ -49,6 +49,38 @@ public class ReservationRepository {
             WHERE reservation_id = ?
             """;
 
+    private static final String SELECT_ACTIVE_HELD_SEATS_BY_EVENT_SQL = """
+            SELECT ri.event_id,
+                   ri.seat_id,
+                   r.reservation_id,
+                   GREATEST(1, FLOOR(EXTRACT(EPOCH FROM (r.expires_at - NOW()))))::bigint AS remaining_sec
+            FROM reservation_items ri
+            JOIN reservations r ON r.reservation_id = ri.reservation_id
+            WHERE ri.event_id = ?
+              AND r.status = 'HELD'
+              AND r.expires_at > NOW()
+            """;
+
+    private static final String SELECT_ALL_ACTIVE_HELD_SEATS_SQL = """
+            SELECT ri.event_id,
+                   ri.seat_id,
+                   r.reservation_id,
+                   GREATEST(1, FLOOR(EXTRACT(EPOCH FROM (r.expires_at - NOW()))))::bigint AS remaining_sec
+            FROM reservation_items ri
+            JOIN reservations r ON r.reservation_id = ri.reservation_id
+            WHERE r.status = 'HELD'
+              AND r.expires_at > NOW()
+            """;
+
+    public record HeldSeatLock(UUID eventId, UUID seatId, UUID reservationId, long remainingSeconds) {}
+
+    private static final RowMapper<HeldSeatLock> HELD_SEAT_LOCK_ROW_MAPPER = (rs, rowNum) -> new HeldSeatLock(
+            rs.getObject("event_id", UUID.class),
+            rs.getObject("seat_id", UUID.class),
+            rs.getObject("reservation_id", UUID.class),
+            rs.getLong("remaining_sec")
+    );
+
     private static final RowMapper<ReservationRecord> RESERVATION_ROW_MAPPER = (rs, rowNum) -> new ReservationRecord(
             rs.getObject("reservation_id", UUID.class),
             rs.getObject("event_id", UUID.class),
@@ -94,6 +126,15 @@ public class ReservationRepository {
     public List<ReservationItemRecord> findItemsByReservationId(UUID reservationId) {
         Objects.requireNonNull(reservationId, "reservationId must not be null");
         return jdbcTemplate.query(SELECT_ITEMS_BY_RESERVATION_ID_SQL, ITEM_ROW_MAPPER, reservationId);
+    }
+
+    public List<HeldSeatLock> findActiveHeldSeatsByEventId(UUID eventId) {
+        Objects.requireNonNull(eventId, "eventId must not be null");
+        return jdbcTemplate.query(SELECT_ACTIVE_HELD_SEATS_BY_EVENT_SQL, HELD_SEAT_LOCK_ROW_MAPPER, eventId);
+    }
+
+    public List<HeldSeatLock> findAllActiveHeldSeats() {
+        return jdbcTemplate.query(SELECT_ALL_ACTIVE_HELD_SEATS_SQL, HELD_SEAT_LOCK_ROW_MAPPER);
     }
 
     @Transactional(propagation = Propagation.MANDATORY)

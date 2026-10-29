@@ -10,6 +10,7 @@ import java.sql.Types;
 import java.time.Instant;
 import java.time.OffsetDateTime;
 import java.time.ZoneOffset;
+import java.util.List;
 import java.util.Objects;
 import java.util.Optional;
 import java.util.UUID;
@@ -27,6 +28,11 @@ public class EventRepository {
             SELECT event_id, name, venue_name, event_time, drop_time, status, created_at, updated_at
             FROM events
             WHERE event_id = ?
+            """;
+
+    private static final String SELECT_ALL_SQL = """
+            SELECT event_id, name, venue_name, event_time, drop_time, status, created_at, updated_at
+            FROM events
             """;
 
     private static final RowMapper<EventRecord> ROW_MAPPER = (rs, rowNum) -> new EventRecord(
@@ -84,6 +90,10 @@ public class EventRepository {
         return jdbcTemplate.query(SELECT_BY_ID_SQL, ROW_MAPPER, eventId)
                 .stream()
                 .findFirst();
+    }
+
+    public List<EventRecord> findAll() {
+        return jdbcTemplate.query(SELECT_ALL_SQL, ROW_MAPPER);
     }
 
     private static OffsetDateTime toOffsetDateTime(Instant instant) {

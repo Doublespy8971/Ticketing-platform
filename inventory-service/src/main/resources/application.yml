@@ -16,6 +16,11 @@ spring:
   jackson:
     serialization:
       write-dates-as-timestamps: false
+  data:
+    redis:
+      host: ${REDIS_HOST:localhost}
+      port: ${REDIS_PORT:6379}
+      timeout: 500ms
 
 server:
   port: 8081
@@ -24,6 +29,13 @@ ticketing:
   outbox:
     enabled: false
     advisory-lock-id: 71001
+  redis:
+    seat-hold-ttl-seconds: ${REDIS_SEAT_HOLD_TTL_SECONDS:660}
+    event-drop-ts-ttl-seconds: 604800
+    hold-ttl-safety-margin-seconds: 60
+    rewarm-on-startup: ${REDIS_REWARM_ON_STARTUP:false}
+    pipeline-batch-size: 500
+    command-timeout: 500ms
 
 management:
   endpoints:
