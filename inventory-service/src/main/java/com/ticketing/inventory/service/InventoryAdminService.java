@@ -56,7 +56,7 @@ public class InventoryAdminService {
         this.stringRedisTemplate = Objects.requireNonNull(stringRedisTemplate, "stringRedisTemplate must not be null");
     }
 
-    void setRedisSyncHook(Runnable hook) {
+    public void setRedisSyncHook(Runnable hook) {
         this.redisSyncHook = hook;
     }
 

@@ -588,5 +588,17 @@ class AdminEventControllerIntegrationTest {
             adminService.setRedisSyncHook(null);
         }
     }
+
+    @Test
+    void patchEventStatusRouteIsMappedAndDoesNotReturn404() throws Exception {
+        UUID eventId = createTestEvent();
+        mockMvc.perform(patch("/api/v1/admin/events/{eventId}/status", eventId)
+                        .header("X-User-Roles", "ADMIN")
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content(objectMapper.writeValueAsString(new UpdateEventStatusRequest("ON_SALE"))))
+                .andExpect(status().is(org.hamcrest.Matchers.not(404)))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.status", is("ON_SALE")));
+    }
 }
 
