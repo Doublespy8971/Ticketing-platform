@@ -61,6 +61,38 @@ public class SeatRepository {
             )
             """;
 
+    private static final String RELEASE_HELD_SEATS_SQL = """
+            UPDATE seats
+            SET status = 'AVAILABLE',
+                version = version + 1,
+                updated_at = NOW()
+            WHERE seat_id IN (
+                SELECT seat_id
+                FROM seats
+                WHERE event_id = ?
+                  AND seat_id = ANY(?)
+                  AND status = 'HELD'
+                ORDER BY seat_id ASC
+                FOR UPDATE
+            )
+            """;
+
+    private static final String CONFIRM_HELD_SEATS_SQL = """
+            UPDATE seats
+            SET status = 'SOLD',
+                version = version + 1,
+                updated_at = NOW()
+            WHERE seat_id IN (
+                SELECT seat_id
+                FROM seats
+                WHERE event_id = ?
+                  AND seat_id = ANY(?)
+                  AND status = 'HELD'
+                ORDER BY seat_id ASC
+                FOR UPDATE
+            )
+            """;
+
     public record SoldSeat(UUID eventId, UUID seatId) {}
 
     private static final String SELECT_SOLD_SEAT_IDS_BY_EVENT_SQL = """
@@ -186,6 +218,40 @@ public class SeatRepository {
         UUID[] idArray = seatIds.toArray(new UUID[0]);
         return jdbcTemplate.update(con -> {
             PreparedStatement ps = con.prepareStatement(HOLD_AVAILABLE_SEATS_SQL);
+            ps.setObject(1, eventId, Types.OTHER);
+            Array sqlArray = con.createArrayOf("uuid", idArray);
+            ps.setArray(2, sqlArray);
+            return ps;
+        });
+    }
+
+    @Transactional(propagation = Propagation.MANDATORY)
+    public int releaseHeldSeats(UUID eventId, Collection<UUID> seatIds) {
+        Objects.requireNonNull(eventId, "eventId must not be null");
+        Objects.requireNonNull(seatIds, "seatIds must not be null");
+        if (seatIds.isEmpty()) {
+            return 0;
+        }
+        UUID[] idArray = seatIds.toArray(new UUID[0]);
+        return jdbcTemplate.update(con -> {
+            PreparedStatement ps = con.prepareStatement(RELEASE_HELD_SEATS_SQL);
+            ps.setObject(1, eventId, Types.OTHER);
+            Array sqlArray = con.createArrayOf("uuid", idArray);
+            ps.setArray(2, sqlArray);
+            return ps;
+        });
+    }
+
+    @Transactional(propagation = Propagation.MANDATORY)
+    public int confirmHeldSeats(UUID eventId, Collection<UUID> seatIds) {
+        Objects.requireNonNull(eventId, "eventId must not be null");
+        Objects.requireNonNull(seatIds, "seatIds must not be null");
+        if (seatIds.isEmpty()) {
+            return 0;
+        }
+        UUID[] idArray = seatIds.toArray(new UUID[0]);
+        return jdbcTemplate.update(con -> {
+            PreparedStatement ps = con.prepareStatement(CONFIRM_HELD_SEATS_SQL);
             ps.setObject(1, eventId, Types.OTHER);
             Array sqlArray = con.createArrayOf("uuid", idArray);
             ps.setArray(2, sqlArray);

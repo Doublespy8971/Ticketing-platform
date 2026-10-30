@@ -53,6 +53,7 @@ import java.time.temporal.ChronoUnit;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
+import java.util.Objects;
 import java.util.UUID;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.CountDownLatch;
@@ -1160,11 +1161,18 @@ class ReservationControllerIntegrationTest {
                 AtomicBoolean firstInTx = new AtomicBoolean(true);
                 reservationService.setInTransactionHook(() -> {
                         if (firstInTx.compareAndSet(true, false)) {
-                                jdbcTemplate.update(
-                                                "UPDATE idempotency_keys SET created_at = NOW() - INTERVAL '31 seconds' WHERE user_id = ? AND idempotency_key = ?",
-                                                userId, idempotencyKey1);
-                                assertThat(idempotencyKeyRepository.reclaimStaleInProgress(userId, idempotencyKey1))
-                                                .isPresent();
+                                TransactionTemplate requiresNew = new TransactionTemplate(
+                                                Objects.requireNonNull(transactionTemplate.getTransactionManager()));
+                                requiresNew.setPropagationBehavior(
+                                                org.springframework.transaction.TransactionDefinition.PROPAGATION_REQUIRES_NEW);
+                                requiresNew.executeWithoutResult(s -> {
+                                        jdbcTemplate.update(
+                                                        "UPDATE idempotency_keys SET created_at = NOW() - INTERVAL '31 seconds' WHERE user_id = ? AND idempotency_key = ?",
+                                                        userId, idempotencyKey1);
+                                        assertThat(idempotencyKeyRepository.reclaimStaleInProgress(userId,
+                                                        idempotencyKey1))
+                                                        .isPresent();
+                                });
                         }
                 });
 

@@ -29,6 +29,10 @@ ticketing:
   outbox:
     enabled: false
     advisory-lock-id: 71001
+  sweeper:
+    enabled: ${HOLD_EXPIRY_SWEEP_ENABLED:false}
+    interval-ms: ${HOLD_EXPIRY_SWEEP_INTERVAL_MS:1000}
+    batch-size: ${HOLD_EXPIRY_SWEEP_BATCH_SIZE:500}
   redis:
     seat-hold-ttl-seconds: ${REDIS_SEAT_HOLD_TTL_SECONDS:660}
     event-drop-ts-ttl-seconds: 604800
