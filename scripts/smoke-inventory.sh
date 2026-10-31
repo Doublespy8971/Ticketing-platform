@@ -429,7 +429,159 @@ else
 fi
 
 # ------------------------------------------------------------------------------
-# 9) Final summary
+# 9) Expiry check run after existing checks
+# ------------------------------------------------------------------------------
+echo ""
+echo "--- Expiry check ---"
+
+EXP_EVENT_NAME="Expiry Check Event $(date +%s)"
+EXP_DROP_TIME=$(jq -r -n 'now - 3600 | todateiso8601')
+EXP_EVENT_TIME=$(jq -r -n 'now + 86400 * 30 | todateiso8601')
+
+EXP_CREATE_EVENT_BODY=$(jq -n \
+    --arg name "${EXP_EVENT_NAME}" \
+    --arg venueName "${VENUE_NAME}" \
+    --arg eventTime "${EXP_EVENT_TIME}" \
+    --arg dropTime "${EXP_DROP_TIME}" \
+    '{name: $name, venueName: $venueName, eventTime: $eventTime, dropTime: $dropTime}')
+
+EXP_CREATE_EVENT_RAW=$(curl -s -w "\n%{http_code}" -X POST "${INVENTORY_URL}/api/v1/admin/events" \
+    -H "Content-Type: application/json" \
+    -H "X-User-Roles: ADMIN" \
+    -d "${EXP_CREATE_EVENT_BODY}")
+
+EXP_EVENT_HTTP_STATUS=$(echo "${EXP_CREATE_EVENT_RAW}" | tail -n1)
+EXP_EVENT_BODY=$(echo "${EXP_CREATE_EVENT_RAW}" | sed '$d')
+EXP_EVENT_ID=$(echo "${EXP_EVENT_BODY}" | jq -r '.eventId // empty')
+
+if [ "${EXP_EVENT_HTTP_STATUS}" = "201" ] && [ -n "${EXP_EVENT_ID}" ]; then
+    # Make ON_SALE via admin status endpoint
+    EXP_STATUS_RAW=$(curl -s -w "\n%{http_code}" -X PATCH "${INVENTORY_URL}/api/v1/admin/events/${EXP_EVENT_ID}/status" \
+        -H "Content-Type: application/json" \
+        -H "X-User-Roles: ADMIN" \
+        -d '{"status":"ON_SALE"}')
+    EXP_STATUS_CODE=$(echo "${EXP_STATUS_RAW}" | tail -n1)
+
+    # Bulk create 5 seats
+    EXP_SEATS_BODY=$(jq -n '[range(1; 6) | {sectionCode: "SEC-EXP", rowLabel: "1", seatNumber: (. | tostring), priceCents: 10000}] | {seats: .}')
+    EXP_SEATS_RAW=$(curl -s -w "\n%{http_code}" -X POST "${INVENTORY_URL}/api/v1/admin/events/${EXP_EVENT_ID}/seats/bulk" \
+        -H "Content-Type: application/json" \
+        -H "X-User-Roles: ADMIN" \
+        -d "${EXP_SEATS_BODY}")
+    EXP_SEATS_HTTP=$(echo "${EXP_SEATS_RAW}" | tail -n1)
+    EXP_SEATS_RES=$(echo "${EXP_SEATS_RAW}" | sed '$d')
+    EXP_TARGET_SEAT_ID=$(echo "${EXP_SEATS_RES}" | jq -r '.seats[0].seatId // empty')
+
+    # Hold one seat through API
+    EXP_USER1_ID=$(uuid_gen)
+    EXP_IDEMP1=$(uuid_gen)
+    EXP_HOLD_BODY=$(jq -n \
+        --arg eventId "${EXP_EVENT_ID}" \
+        --arg seatId "${EXP_TARGET_SEAT_ID}" \
+        '{eventId: $eventId, seatIds: [$seatId]}')
+
+    EXP_HOLD_RAW=$(curl -s -w "\n%{http_code}" -X POST "${INVENTORY_URL}/api/v1/reservations" \
+        -H "Content-Type: application/json" \
+        -H "X-User-Id: ${EXP_USER1_ID}" \
+        -H "X-User-Roles: USER" \
+        -H "Idempotency-Key: ${EXP_IDEMP1}" \
+        -d "${EXP_HOLD_BODY}")
+
+    EXP_HOLD_HTTP=$(echo "${EXP_HOLD_RAW}" | tail -n1)
+    EXP_HOLD_RES=$(echo "${EXP_HOLD_RAW}" | sed '$d')
+    EXP_RES_ID=$(echo "${EXP_HOLD_RES}" | jq -r '.reservationId // empty')
+
+    if [ "${EXP_HOLD_HTTP}" = "201" ] && [ -n "${EXP_RES_ID}" ]; then
+        # Record seat version before expiry
+        SEAT_VER_BEFORE=$(run_psql "SELECT version FROM seats WHERE seat_id = '${EXP_TARGET_SEAT_ID}'::uuid;")
+
+        # Force expiry: update reservation in PostgreSQL through docker exec
+        # BOTH created_at = NOW() - INTERVAL '1 hour' and expires_at = NOW() - INTERVAL '1 minute'
+        run_psql "UPDATE reservations SET created_at = NOW() - INTERVAL '1 hour', expires_at = NOW() - INTERVAL '1 minute' WHERE reservation_id = '${EXP_RES_ID}'::uuid;"
+
+        # Poll for up to 10 seconds, once per second, until status is EXPIRED
+        POLL_STATUS=""
+        for i in $(seq 1 10); do
+            POLL_STATUS=$(run_psql "SELECT status FROM reservations WHERE reservation_id = '${EXP_RES_ID}'::uuid;")
+            if [ "${POLL_STATUS}" = "EXPIRED" ]; then
+                break
+            fi
+            sleep 1
+        done
+
+        # 1. Assert reservation status EXPIRED with expired_at set
+        RES_CHECK=$(run_psql "SELECT count(*) FROM reservations WHERE reservation_id = '${EXP_RES_ID}'::uuid AND status = 'EXPIRED' AND expired_at IS NOT NULL;")
+        if [ "${RES_CHECK}" -eq 1 ]; then
+            record_pass "Expiry check: reservation status EXPIRED with expired_at set"
+        else
+            record_fail "Expiry check: reservation status EXPIRED with expired_at set" "status=${POLL_STATUS}, res_check=${RES_CHECK}"
+        fi
+
+        # 2. Assert its items EXPIRED
+        ITEMS_CHECK=$(run_psql "SELECT count(*) FROM reservation_items WHERE reservation_id = '${EXP_RES_ID}'::uuid AND status = 'EXPIRED';")
+        ITEMS_TOTAL=$(run_psql "SELECT count(*) FROM reservation_items WHERE reservation_id = '${EXP_RES_ID}'::uuid;")
+        if [ "${ITEMS_CHECK}" -ge 1 ] && [ "${ITEMS_CHECK}" -eq "${ITEMS_TOTAL}" ]; then
+            record_pass "Expiry check: reservation items EXPIRED"
+        else
+            record_fail "Expiry check: reservation items EXPIRED" "expired_items=${ITEMS_CHECK}, total_items=${ITEMS_TOTAL}"
+        fi
+
+        # 3. Assert the seat AVAILABLE in PostgreSQL with version increased
+        SEAT_ROW=$(run_psql "SELECT status || '|' || version FROM seats WHERE seat_id = '${EXP_TARGET_SEAT_ID}'::uuid;")
+        SEAT_STATUS=$(echo "${SEAT_ROW}" | cut -d'|' -f1)
+        SEAT_VER_AFTER=$(echo "${SEAT_ROW}" | cut -d'|' -f2)
+
+        if [ "${SEAT_STATUS}" = "AVAILABLE" ] && [ "${SEAT_VER_AFTER}" -gt "${SEAT_VER_BEFORE}" ]; then
+            record_pass "Expiry check: seat AVAILABLE in PostgreSQL with version increased (${SEAT_VER_BEFORE} -> ${SEAT_VER_AFTER})"
+        else
+            record_fail "Expiry check: seat AVAILABLE in PostgreSQL with version increased" "status=${SEAT_STATUS}, version_before=${SEAT_VER_BEFORE}, version_after=${SEAT_VER_AFTER}"
+        fi
+
+        # 4. Assert exactly one outbox_events row of type inventory.reservation.expired for that reservation
+        OUTBOX_EXPIRED_COUNT=$(run_psql "SELECT count(*) FROM outbox_events WHERE event_type = 'inventory.reservation.expired' AND aggregate_id = '${EXP_RES_ID}'::uuid;")
+        if [ "${OUTBOX_EXPIRED_COUNT}" -eq 1 ]; then
+            record_pass "Expiry check: exactly one outbox_events row of type inventory.reservation.expired"
+        else
+            record_fail "Expiry check: exactly one outbox_events row of type inventory.reservation.expired" "count=${OUTBOX_EXPIRED_COUNT}"
+        fi
+
+        # 5. Assert the Redis key of the seat no longer exists
+        REDIS_SEAT_KEY="seat:${EXP_EVENT_ID}:${EXP_TARGET_SEAT_ID}"
+        REDIS_KEY_EXISTS=$(run_redis exists "${REDIS_SEAT_KEY}")
+        if [ "${REDIS_KEY_EXISTS}" -eq 0 ]; then
+            record_pass "Expiry check: Redis key of the seat no longer exists"
+        else
+            record_fail "Expiry check: Redis key of the seat no longer exists" "exists=${REDIS_KEY_EXISTS}"
+        fi
+
+        # 6. Assert a new hold of the same seat by another user returns 201
+        EXP_USER2_ID=$(uuid_gen)
+        EXP_IDEMP2=$(uuid_gen)
+        NEW_HOLD_RAW=$(curl -s -w "\n%{http_code}" -X POST "${INVENTORY_URL}/api/v1/reservations" \
+            -H "Content-Type: application/json" \
+            -H "X-User-Id: ${EXP_USER2_ID}" \
+            -H "X-User-Roles: USER" \
+            -H "Idempotency-Key: ${EXP_IDEMP2}" \
+            -d "${EXP_HOLD_BODY}")
+
+        NEW_HOLD_HTTP=$(echo "${NEW_HOLD_RAW}" | tail -n1)
+        NEW_HOLD_RES=$(echo "${NEW_HOLD_RAW}" | sed '$d')
+        NEW_RES_STATUS=$(echo "${NEW_HOLD_RES}" | jq -r '.status // empty')
+
+        if [ "${NEW_HOLD_HTTP}" = "201" ] && [ "${NEW_RES_STATUS}" = "HELD" ]; then
+            record_pass "Expiry check: new hold of the same seat by another user returns 201"
+        else
+            record_fail "Expiry check: new hold of the same seat by another user returns 201" "HTTP=${NEW_HOLD_HTTP}, body=${NEW_HOLD_RES}"
+        fi
+    else
+        record_fail "Expiry check: initial hold" "HTTP=${EXP_HOLD_HTTP}, body=${EXP_HOLD_RES}"
+    fi
+else
+    record_fail "Expiry check: event creation" "HTTP=${EXP_EVENT_HTTP_STATUS}, body=${EXP_EVENT_BODY}"
+fi
+
+# ------------------------------------------------------------------------------
+# 10) Final summary
 # ------------------------------------------------------------------------------
 echo ""
 echo "=================================================================="

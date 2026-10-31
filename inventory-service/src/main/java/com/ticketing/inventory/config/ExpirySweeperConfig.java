@@ -25,6 +25,7 @@ public class ExpirySweeperConfig {
         ThreadPoolTaskScheduler scheduler = new ThreadPoolTaskScheduler();
         scheduler.setPoolSize(1);
         scheduler.setThreadNamePrefix("expiry-sweeper-");
+        scheduler.setDaemon(true);
         scheduler.setWaitForTasksToCompleteOnShutdown(true);
         scheduler.setAwaitTerminationSeconds(5);
         return scheduler;

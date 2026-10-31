@@ -30,7 +30,7 @@ ticketing:
     enabled: false
     advisory-lock-id: 71001
   sweeper:
-    enabled: ${HOLD_EXPIRY_SWEEP_ENABLED:false}
+    enabled: ${HOLD_EXPIRY_SWEEP_ENABLED:true}
     interval-ms: ${HOLD_EXPIRY_SWEEP_INTERVAL_MS:1000}
     batch-size: ${HOLD_EXPIRY_SWEEP_BATCH_SIZE:500}
   redis:

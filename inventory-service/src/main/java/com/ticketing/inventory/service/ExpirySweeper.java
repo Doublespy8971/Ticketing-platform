@@ -110,6 +110,9 @@ public class ExpirySweeper {
                     .description("Age in seconds of the oldest overdue HELD reservation")
                     .register(this.meterRegistry);
         }
+
+        log.info("Reservation ExpirySweeper started: enabled={}, intervalMs={}",
+                this.properties.isEnabled(), this.properties.getIntervalMs());
     }
 
     @Scheduled(
