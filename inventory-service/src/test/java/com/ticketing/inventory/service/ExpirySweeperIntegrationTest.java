@@ -106,17 +106,16 @@ class ExpirySweeperIntegrationTest {
     }
 
     @Container
-    static final PostgreSQLContainer<?> POSTGRES =
-            new PostgreSQLContainer<>(DockerImageName.parse("postgres:16.4-alpine"))
-                    .withDatabaseName("inventory_test_db")
-                    .withUsername("ticketing")
-                    .withPassword("ticketing_secret");
+    static final PostgreSQLContainer<?> POSTGRES = new PostgreSQLContainer<>(
+            DockerImageName.parse("postgres:16.4-alpine"))
+            .withDatabaseName("inventory_test_db")
+            .withUsername("ticketing")
+            .withPassword("ticketing_secret");
 
     @Container
     @SuppressWarnings("resource")
-    static final GenericContainer<?> REDIS =
-            new GenericContainer<>(DockerImageName.parse("redis:7.4.1-alpine"))
-                    .withExposedPorts(6379);
+    static final GenericContainer<?> REDIS = new GenericContainer<>(DockerImageName.parse("redis:7.4.1-alpine"))
+            .withExposedPorts(6379);
 
     @DynamicPropertySource
     static void configureProperties(DynamicPropertyRegistry registry) {
@@ -241,7 +240,7 @@ class ExpirySweeperIntegrationTest {
 
     // -------------------------------------------------------------------------
     // 2. Expired HELD reservation becomes EXPIRED, items EXPIRED, seats AVAILABLE
-    //    with version incremented, 1 reservation.expired outbox row, Redis deleted
+    // with version incremented, 1 reservation.expired outbox row, Redis deleted
     // -------------------------------------------------------------------------
 
     @Test
@@ -254,8 +253,7 @@ class ExpirySweeperIntegrationTest {
 
         seedEventAndSeats(eventId, List.of(
                 seatRecord(seat1, eventId, "SEC-A", "1", "101", 15000L, "HELD", 1L),
-                seatRecord(seat2, eventId, "SEC-A", "1", "102", 15000L, "HELD", 1L)
-        ));
+                seatRecord(seat2, eventId, "SEC-A", "1", "102", 15000L, "HELD", 1L)));
         seedReservationInDbAndRedis(reservationId, eventId, userId, List.of(seat1, seat2), "HELD", -30);
 
         expirySweeper.invalidateOverdueHoldGaugeCache();
@@ -270,7 +268,8 @@ class ExpirySweeperIntegrationTest {
         int expiredCount = expirySweeper.sweep();
         assertThat(expiredCount).isEqualTo(1);
 
-        // Sweeper updates gauge at end of sweep; no more overdue holds, so gauge is now 0.0
+        // Sweeper updates gauge at end of sweep; no more overdue holds, so gauge is now
+        // 0.0
         assertThat(overdueGauge.value()).isEqualTo(0.0);
 
         // 1. Reservation row is EXPIRED with expired_at from DB clock
@@ -292,7 +291,8 @@ class ExpirySweeperIntegrationTest {
         assertThat(s2After.status()).isEqualTo("AVAILABLE");
         assertThat(s2After.version()).isEqualTo(2L);
 
-        // 4. Exactly one inventory.reservation.expired outbox row with correct key and payload
+        // 4. Exactly one inventory.reservation.expired outbox row with correct key and
+        // payload
         List<Map<String, Object>> outboxRows = jdbcTemplate.queryForList("SELECT * FROM outbox_events");
         assertThat(outboxRows).hasSize(1);
         Map<String, Object> outboxRow = outboxRows.getFirst();
@@ -326,7 +326,7 @@ class ExpirySweeperIntegrationTest {
 
     // -------------------------------------------------------------------------
     // 3. A reservation that has not yet expired is untouched;
-    //    CONFIRMED and RELEASED reservations are untouched
+    // CONFIRMED and RELEASED reservations are untouched
     // -------------------------------------------------------------------------
 
     @Test
@@ -343,14 +343,14 @@ class ExpirySweeperIntegrationTest {
         seedEventAndSeats(eventId, List.of(
                 seatRecord(activeSeat, eventId, "SEC-A", "1", "1", 10000L, "HELD", 1L),
                 seatRecord(confirmedSeat, eventId, "SEC-A", "1", "2", 10000L, "SOLD", 2L),
-                seatRecord(releasedSeat, eventId, "SEC-A", "1", "3", 10000L, "AVAILABLE", 2L)
-        ));
+                seatRecord(releasedSeat, eventId, "SEC-A", "1", "3", 10000L, "AVAILABLE", 2L)));
 
         // 1. HELD reservation with expires_at in the future (+300s)
         seedReservationInDbAndRedis(activeResId, eventId, UUID.randomUUID(), List.of(activeSeat), "HELD", 300);
 
         // 2. CONFIRMED reservation with expires_at in the past (-60s)
-        seedReservationInDbAndRedis(confirmedResId, eventId, UUID.randomUUID(), List.of(confirmedSeat), "CONFIRMED", -60);
+        seedReservationInDbAndRedis(confirmedResId, eventId, UUID.randomUUID(), List.of(confirmedSeat), "CONFIRMED",
+                -60);
         stringRedisTemplate.opsForValue().set(RedisKeys.seatKey(eventId, confirmedSeat), RedisKeys.SOLD_MARKER);
 
         // 3. RELEASED reservation with expires_at in the past (-60s)
@@ -399,17 +399,16 @@ class ExpirySweeperIntegrationTest {
 
         seedEventAndSeats(eventId, List.of(
                 seatRecord(seat1, eventId, "FLOOR", "1", "10", 20000L, "AVAILABLE", 0L),
-                seatRecord(seat2, eventId, "FLOOR", "1", "11", 20000L, "AVAILABLE", 0L)
-        ));
+                seatRecord(seat2, eventId, "FLOOR", "1", "11", 20000L, "AVAILABLE", 0L)));
 
         CreateReservationRequest holdRequest = new CreateReservationRequest(eventId, List.of(seat1, seat2));
 
         // 1. User 1 holds seat1 and seat2 via POST /api/v1/reservations
         MvcResult firstHoldResult = mockMvc.perform(post("/api/v1/reservations")
-                        .header(CorrelationConstants.USER_ID_HEADER, user1.toString())
-                        .header(ReservationController.IDEMPOTENCY_KEY_HEADER, UUID.randomUUID().toString())
-                        .contentType(MediaType.APPLICATION_JSON)
-                        .content(objectMapper.writeValueAsString(holdRequest)))
+                .header(CorrelationConstants.USER_ID_HEADER, user1.toString())
+                .header(ReservationController.IDEMPOTENCY_KEY_HEADER, UUID.randomUUID().toString())
+                .contentType(MediaType.APPLICATION_JSON)
+                .content(objectMapper.writeValueAsString(holdRequest)))
                 .andExpect(status().isCreated())
                 .andExpect(jsonPath("$.status", is("HELD")))
                 .andReturn();
@@ -420,10 +419,10 @@ class ExpirySweeperIntegrationTest {
 
         // User 2 cannot hold while User 1's hold is active
         mockMvc.perform(post("/api/v1/reservations")
-                        .header(CorrelationConstants.USER_ID_HEADER, user2.toString())
-                        .header(ReservationController.IDEMPOTENCY_KEY_HEADER, UUID.randomUUID().toString())
-                        .contentType(MediaType.APPLICATION_JSON)
-                        .content(objectMapper.writeValueAsString(holdRequest)))
+                .header(CorrelationConstants.USER_ID_HEADER, user2.toString())
+                .header(ReservationController.IDEMPOTENCY_KEY_HEADER, UUID.randomUUID().toString())
+                .contentType(MediaType.APPLICATION_JSON)
+                .content(objectMapper.writeValueAsString(holdRequest)))
                 .andExpect(status().isConflict())
                 .andExpect(jsonPath("$.errorCode", is("SEAT_ALREADY_TAKEN")));
 
@@ -438,12 +437,13 @@ class ExpirySweeperIntegrationTest {
         assertThat(expirySweeper.sweep()).isEqualTo(1);
         assertThat(reservationRepository.findById(firstReservationId).orElseThrow().status()).isEqualTo("EXPIRED");
 
-        // 3. User 2 now holds the exact same seats through POST /api/v1/reservations and gets 201 Created
+        // 3. User 2 now holds the exact same seats through POST /api/v1/reservations
+        // and gets 201 Created
         MvcResult secondHoldResult = mockMvc.perform(post("/api/v1/reservations")
-                        .header(CorrelationConstants.USER_ID_HEADER, user2.toString())
-                        .header(ReservationController.IDEMPOTENCY_KEY_HEADER, UUID.randomUUID().toString())
-                        .contentType(MediaType.APPLICATION_JSON)
-                        .content(objectMapper.writeValueAsString(holdRequest)))
+                .header(CorrelationConstants.USER_ID_HEADER, user2.toString())
+                .header(ReservationController.IDEMPOTENCY_KEY_HEADER, UUID.randomUUID().toString())
+                .contentType(MediaType.APPLICATION_JSON)
+                .content(objectMapper.writeValueAsString(holdRequest)))
                 .andExpect(status().isCreated())
                 .andExpect(jsonPath("$.status", is("HELD")))
                 .andExpect(jsonPath("$.userId", is(user2.toString())))
@@ -465,7 +465,7 @@ class ExpirySweeperIntegrationTest {
 
     // -------------------------------------------------------------------------
     // 5. Two sweeper instances running concurrently over 200 expired reservations
-    //    produce exactly one outbox row per reservation and no failures
+    // produce exactly one outbox row per reservation and no failures
     // -------------------------------------------------------------------------
 
     @Test
@@ -487,7 +487,8 @@ class ExpirySweeperIntegrationTest {
         for (int i = 0; i < totalReservations; i++) {
             UUID resId = UUID.randomUUID();
             reservationIds.add(resId);
-            seedReservationInDbAndRedis(resId, eventId, UUID.randomUUID(), List.of(seatIds.get(i)), "HELD", -(totalReservations - i));
+            seedReservationInDbAndRedis(resId, eventId, UUID.randomUUID(), List.of(seatIds.get(i)), "HELD",
+                    -(totalReservations - i));
         }
 
         ExpirySweeper sweeper1 = new ExpirySweeper(
@@ -579,7 +580,7 @@ class ExpirySweeperIntegrationTest {
 
     // -------------------------------------------------------------------------
     // 6. Concurrent confirm and expire on the same reservation ends with
-    //    exactly one winner and consistent seats, items and outbox rows
+    // exactly one winner and consistent seats, items and outbox rows
     // -------------------------------------------------------------------------
 
     @Test
@@ -620,7 +621,8 @@ class ExpirySweeperIntegrationTest {
                 final int trialIndex = i;
                 CountDownLatch lockAcquiredLatch = new CountDownLatch(1);
                 if (trialIndex == 0) {
-                    // Trial 0: expire acquires the row lock first; confirm starts while expire holds the lock
+                    // Trial 0: expire acquires the row lock first; confirm starts while expire
+                    // holds the lock
                     expirySweeper.setAfterReservationLockHook(lockAcquiredLatch::countDown);
                 } else {
                     expirySweeper.setAfterReservationLockHook(null);
@@ -641,10 +643,10 @@ class ExpirySweeperIntegrationTest {
                     if (trialIndex == 0) {
                         lockAcquiredLatch.await(5, TimeUnit.SECONDS);
                     }
-                    Optional<ReservationRepository.ConfirmedReservation> confirmedOpt =
-                            requiresNewTx.execute(status -> {
-                                Optional<ReservationRepository.ConfirmedReservation> c =
-                                        reservationRepository.confirmIfHeld(resId);
+                    Optional<ReservationRepository.ConfirmedReservation> confirmedOpt = requiresNewTx
+                            .execute(status -> {
+                                Optional<ReservationRepository.ConfirmedReservation> c = reservationRepository
+                                        .confirmIfHeld(resId);
                                 if (trialIndex == 1) {
                                     lockAcquiredLatch.countDown();
                                 }
@@ -659,9 +661,7 @@ class ExpirySweeperIntegrationTest {
                                                     paymentId,
                                                     cr.eventId(),
                                                     cr.seatIds(),
-                                                    cr.confirmedAt()
-                                            )
-                                    );
+                                                    cr.confirmedAt()));
                                 }
                                 return c;
                             });
@@ -727,7 +727,7 @@ class ExpirySweeperIntegrationTest {
 
     // -------------------------------------------------------------------------
     // 7. A Redis outage during release still leaves PostgreSQL expired
-    //    and does not throw out of the sweep
+    // and does not throw out of the sweep
     // -------------------------------------------------------------------------
 
     @Test
@@ -737,11 +737,11 @@ class ExpirySweeperIntegrationTest {
         UUID reservationId = UUID.randomUUID();
 
         seedEventAndSeats(eventId, List.of(
-                seatRecord(seatId, eventId, "SEC-OUTAGE", "1", "1", 10000L, "HELD", 1L)
-        ));
+                seatRecord(seatId, eventId, "SEC-OUTAGE", "1", "1", 10000L, "HELD", 1L)));
         seedReservationInDbAndRedis(reservationId, eventId, UUID.randomUUID(), List.of(seatId), "HELD", -20);
 
-        // Build a RedisSeatGate pointing to an unreachable Redis port to simulate a Redis outage during release
+        // Build a RedisSeatGate pointing to an unreachable Redis port to simulate a
+        // Redis outage during release
         LettuceClientConfiguration clientConfig = LettuceClientConfiguration.builder()
                 .commandTimeout(Duration.ofMillis(100))
                 .build();
@@ -757,8 +757,7 @@ class ExpirySweeperIntegrationTest {
                     confirmInventoryScript,
                     redisProperties,
                     clock,
-                    meterRegistryProvider
-            );
+                    meterRegistryProvider);
 
             ExpirySweeper sweeperWithBrokenRedis = new ExpirySweeper(
                     reservationRepository,
@@ -767,8 +766,7 @@ class ExpirySweeperIntegrationTest {
                     outboxWriter,
                     transactionManager,
                     sweeperProperties,
-                    meterRegistryProvider
-            );
+                    meterRegistryProvider);
 
             double failuresBefore = counterValue(ExpirySweeper.METRIC_SWEEP_FAILURES);
 
@@ -798,7 +796,7 @@ class ExpirySweeperIntegrationTest {
 
     // -------------------------------------------------------------------------
     // 8. One reservation whose seat update count mismatches rolls back only
-    //    itself while the others in the batch succeed
+    // itself while the others in the batch succeed
     // -------------------------------------------------------------------------
 
     @Test
@@ -813,13 +811,13 @@ class ExpirySweeperIntegrationTest {
         UUID res2Bad = UUID.randomUUID();
         UUID res3 = UUID.randomUUID();
 
-        // seat2b is already AVAILABLE in seats table (mismatch with res2Bad's HELD item for seat2b!)
+        // seat2b is already AVAILABLE in seats table (mismatch with res2Bad's HELD item
+        // for seat2b!)
         seedEventAndSeats(eventId, List.of(
                 seatRecord(seat1, eventId, "SEC-B", "1", "1", 10000L, "HELD", 1L),
                 seatRecord(seat2a, eventId, "SEC-B", "1", "2", 10000L, "HELD", 1L),
                 seatRecord(seat2b, eventId, "SEC-B", "1", "3", 10000L, "AVAILABLE", 5L),
-                seatRecord(seat3, eventId, "SEC-B", "1", "4", 10000L, "HELD", 1L)
-        ));
+                seatRecord(seat3, eventId, "SEC-B", "1", "4", 10000L, "HELD", 1L)));
 
         seedReservationInDbAndRedis(res1, eventId, UUID.randomUUID(), List.of(seat1), "HELD", -30);
         seedReservationInDbAndRedis(res2Bad, eventId, UUID.randomUUID(), List.of(seat2a, seat2b), "HELD", -20);
@@ -841,7 +839,8 @@ class ExpirySweeperIntegrationTest {
         assertThat(stringRedisTemplate.hasKey(RedisKeys.seatKey(eventId, seat1))).isFalse();
         assertThat(stringRedisTemplate.hasKey(RedisKeys.seatKey(eventId, seat3))).isFalse();
 
-        // res2Bad rolled back completely: reservation, items, seat2a, Redis, and outbox are all unchanged
+        // res2Bad rolled back completely: reservation, items, seat2a, Redis, and outbox
+        // are all unchanged
         ReservationRecord badResAfter = reservationRepository.findById(res2Bad).orElseThrow();
         assertThat(badResAfter.status()).isEqualTo("HELD");
         assertThat(badResAfter.expiredAt()).isNull();
@@ -902,7 +901,8 @@ class ExpirySweeperIntegrationTest {
         assertThat(expiredAfterFirst).isEqualTo(500);
         assertThat(heldAfterFirst).isEqualTo(20);
 
-        // Verify the 20 remaining HELD reservations are the ones with the latest expires_at (indices 500..519)
+        // Verify the 20 remaining HELD reservations are the ones with the latest
+        // expires_at (indices 500..519)
         for (int i = 500; i < totalExpired; i++) {
             assertThat(reservationRepository.findById(reservationIds.get(i)).orElseThrow().status())
                     .isEqualTo("HELD");
@@ -929,7 +929,7 @@ class ExpirySweeperIntegrationTest {
 
     // -------------------------------------------------------------------------
     // 10. Sweeping an event with a different reservation holding a seat in Redis
-    //     never releases the other reservation's key
+    // never releases the other reservation's key
     // -------------------------------------------------------------------------
 
     @Test
@@ -942,20 +942,19 @@ class ExpirySweeperIntegrationTest {
 
         seedEventAndSeats(eventId, List.of(
                 seatRecord(seat1, eventId, "SEC-TOKEN", "1", "1", 10000L, "HELD", 1L),
-                seatRecord(seat2, eventId, "SEC-TOKEN", "1", "2", 10000L, "HELD", 1L)
-        ));
+                seatRecord(seat2, eventId, "SEC-TOKEN", "1", "2", 10000L, "HELD", 1L)));
 
         // expiredResId is expired in PostgreSQL on seat1
         seedReservationInDbAndRedis(expiredResId, eventId, UUID.randomUUID(), List.of(seat1), "HELD", -15);
         // otherResId is active in PostgreSQL on seat2
         seedReservationInDbAndRedis(otherResId, eventId, UUID.randomUUID(), List.of(seat2), "HELD", 300);
 
-        // Overwrite seat1's Redis key with otherResId's token to verify compare-and-delete token check
+        // Overwrite seat1's Redis key with otherResId's token to verify
+        // compare-and-delete token check
         stringRedisTemplate.opsForValue().set(
                 RedisKeys.seatKey(eventId, seat1),
                 otherResId.toString(),
-                Duration.ofSeconds(660)
-        );
+                Duration.ofSeconds(660));
 
         int expiredCount = expirySweeper.sweep();
         assertThat(expiredCount).isEqualTo(1);
@@ -965,7 +964,8 @@ class ExpirySweeperIntegrationTest {
         // otherResId is still HELD in PostgreSQL
         assertThat(reservationRepository.findById(otherResId).orElseThrow().status()).isEqualTo("HELD");
 
-        // Neither seat1 (holding otherResId's token) nor seat2 (holding otherResId's token) was deleted in Redis!
+        // Neither seat1 (holding otherResId's token) nor seat2 (holding otherResId's
+        // token) was deleted in Redis!
         assertThat(stringRedisTemplate.opsForValue().get(RedisKeys.seatKey(eventId, seat1)))
                 .isEqualTo(otherResId.toString());
         assertThat(stringRedisTemplate.opsForValue().get(RedisKeys.seatKey(eventId, seat2)))
@@ -990,8 +990,7 @@ class ExpirySweeperIntegrationTest {
         stringRedisTemplate.opsForValue().set(
                 RedisKeys.eventDropTsKey(eventId),
                 String.valueOf(dropTime.toEpochMilli()),
-                Duration.ofSeconds(RedisKeys.EVENT_DROP_TS_TTL_SECONDS)
-        );
+                Duration.ofSeconds(RedisKeys.EVENT_DROP_TS_TTL_SECONDS));
     }
 
     private SeatRecord seatRecord(
@@ -1019,8 +1018,7 @@ class ExpirySweeperIntegrationTest {
             stringRedisTemplate.opsForValue().set(
                     RedisKeys.seatKey(eventId, seatId),
                     reservationId.toString(),
-                    Duration.ofSeconds(660)
-            );
+                    Duration.ofSeconds(660));
         }
     }
 
@@ -1044,7 +1042,7 @@ class ExpirySweeperIntegrationTest {
                         NOW()
                     )
                     """,
-                    new Object[]{
+                    new Object[] {
                             reservationId,
                             eventId,
                             userId,
@@ -1053,7 +1051,7 @@ class ExpirySweeperIntegrationTest {
                             createdOffsetSeconds,
                             expiresOffsetSeconds
                     },
-                    new int[]{
+                    new int[] {
                             Types.OTHER,
                             Types.OTHER,
                             Types.OTHER,
@@ -1061,8 +1059,7 @@ class ExpirySweeperIntegrationTest {
                             Types.BIGINT,
                             Types.BIGINT,
                             Types.BIGINT
-                    }
-            );
+                    });
 
             for (int i = 0; i < seatIds.size(); i++) {
                 jdbcTemplate.update("""
@@ -1072,7 +1069,7 @@ class ExpirySweeperIntegrationTest {
                             created_at, updated_at
                         ) VALUES (?, ?, ?, ?, 'SEC', '1', ?, 10000, ?, NOW(), NOW())
                         """,
-                        new Object[]{
+                        new Object[] {
                                 UUID.randomUUID(),
                                 reservationId,
                                 eventId,
@@ -1080,15 +1077,14 @@ class ExpirySweeperIntegrationTest {
                                 String.valueOf(i + 1),
                                 status
                         },
-                        new int[]{
+                        new int[] {
                                 Types.OTHER,
                                 Types.OTHER,
                                 Types.OTHER,
                                 Types.OTHER,
                                 Types.VARCHAR,
                                 Types.VARCHAR
-                        }
-                );
+                        });
             }
         });
     }
@@ -1102,8 +1098,7 @@ class ExpirySweeperIntegrationTest {
         UUID reservationId = UUID.randomUUID();
 
         seedEventAndSeats(eventId, List.of(
-                seatRecord(seat1, eventId, "SEC-A", "1", "101", 15000L, "HELD", 1L)
-        ));
+                seatRecord(seat1, eventId, "SEC-A", "1", "101", 15000L, "HELD", 1L)));
         seedReservationInDbAndRedis(reservationId, eventId, userId, List.of(seat1), "HELD", -30);
 
         CountDownLatch lockAcquired = new CountDownLatch(1);
@@ -1129,7 +1124,8 @@ class ExpirySweeperIntegrationTest {
 
             assertThat(lockAcquired.await(5, TimeUnit.SECONDS)).isTrue();
 
-            // Thread 2: expireReservation on another thread must return skipped (false) within 2 seconds
+            // Thread 2: expireReservation on another thread must return skipped (false)
+            // within 2 seconds
             long startNanos = System.nanoTime();
             Future<Boolean> expireFuture = sweeperPool.submit(() -> expirySweeper.expireReservation(reservationId));
             Boolean expired = expireFuture.get(2, TimeUnit.SECONDS);
@@ -1153,7 +1149,7 @@ class ExpirySweeperIntegrationTest {
             ReservationRecord expiredRes = reservationRepository.findById(reservationId).orElseThrow();
             assertThat(expiredRes.status()).isEqualTo("EXPIRED");
             assertThat(expiredRes.expiredAt()).isNotNull();
-            assertThat(expiredRes.expiredAt().compareTo(expiredRes.expiresAt())).isGreaterThanOrEqualTo(0);
+            assertThat(expiredRes.expiredAt()).isGreaterThanOrEqualTo(expiredRes.expiresAt());
 
             SeatRecord seatAfter = seatRepository.findById(seat1).orElseThrow();
             assertThat(seatAfter.status()).isEqualTo("AVAILABLE");
@@ -1167,12 +1163,11 @@ class ExpirySweeperIntegrationTest {
 
     @Test
     void scheduledBatchTestDrainsBacklogAndRespectsMaxPagesPerTick() {
-        boolean originalEnabled = sweeperProperties.isEnabled();
         int originalBatchSize = sweeperProperties.getBatchSize();
         int originalMaxPages = sweeperProperties.getMaxPagesPerTick();
-        sweeperProperties.setEnabled(true);
         try {
-            // Part 1: 1200 expired reservations are all expired by a single call of scheduledSweep()
+            // Part 1: 1200 expired reservations are all expired by a single call of
+            // scheduledSweep()
             UUID eventId1 = UUID.randomUUID();
             transactionTemplate.executeWithoutResult(status -> {
                 eventRepository.insert(new EventRecord(
@@ -1211,7 +1206,6 @@ class ExpirySweeperIntegrationTest {
                     Integer.class, eventId2);
             assertThat(heldRemaining).isEqualTo(20);
         } finally {
-            sweeperProperties.setEnabled(originalEnabled);
             sweeperProperties.setBatchSize(originalBatchSize);
             sweeperProperties.setMaxPagesPerTick(originalMaxPages);
         }
@@ -1231,8 +1225,7 @@ class ExpirySweeperIntegrationTest {
         UUID reservationId = UUID.randomUUID();
 
         seedEventAndSeats(eventId, List.of(
-                seatRecord(seatId, eventId, "SEC-M", "1", "1", 10000L, "HELD", 1L)
-        ));
+                seatRecord(seatId, eventId, "SEC-M", "1", "1", 10000L, "HELD", 1L)));
         seedReservationInDbAndRedis(reservationId, eventId, userId, List.of(seatId), "HELD", -10);
 
         int swept = expirySweeper.sweep();
@@ -1240,15 +1233,13 @@ class ExpirySweeperIntegrationTest {
         assertThat(ticketingCounter.count()).isEqualTo(beforeCount + 1.0);
 
         // 2. Mockito spy on repository: verify gauge reads never query repository
-        ReservationRepository rawRepo = new ReservationRepository(jdbcTemplate);
-        ReservationRepository spyRepo = Mockito.spy(rawRepo);
+        ReservationRepository spyRepo = Mockito.spy(reservationRepository);
         SimpleMeterRegistry testRegistry = new SimpleMeterRegistry();
         ExpirySweeperProperties testProps = new ExpirySweeperProperties();
         ExpirySweeper sweeperWithSpy = new ExpirySweeper(
                 spyRepo, seatRepository, redisSeatGate, outboxWriter,
                 transactionManager, testProps,
-                new SimpleObjectProvider<>(testRegistry)
-        );
+                new SimpleObjectProvider<>(testRegistry));
 
         Gauge gauge = testRegistry.find(ExpirySweeper.METRIC_OLDEST_OVERDUE_HOLD).gauge();
         assertThat(gauge).isNotNull();
@@ -1280,8 +1271,7 @@ class ExpirySweeperIntegrationTest {
         UUID reservationId = UUID.randomUUID();
 
         seedEventAndSeats(eventId, List.of(
-                seatRecord(seat1, eventId, "SEC-CLK", "1", "101", 15000L, "HELD", 1L)
-        ));
+                seatRecord(seat1, eventId, "SEC-CLK", "1", "101", 15000L, "HELD", 1L)));
         seedReservationInDbAndRedis(reservationId, eventId, userId, List.of(seat1), "HELD", -10);
 
         int swept = expirySweeper.sweep();
@@ -1291,7 +1281,7 @@ class ExpirySweeperIntegrationTest {
         assertThat(res.status()).isEqualTo("EXPIRED");
         assertThat(res.expiredAt()).isNotNull();
         assertThat(res.expiresAt()).isNotNull();
-        assertThat(res.expiredAt().compareTo(res.expiresAt())).isGreaterThanOrEqualTo(0);
+        assertThat(res.expiredAt()).isGreaterThanOrEqualTo(res.expiresAt());
     }
 
     private List<UUID> bulkSeedExpiredReservations(UUID eventId, int count) {
@@ -1305,71 +1295,89 @@ class ExpirySweeperIntegrationTest {
             UUID resId = UUID.randomUUID();
             seatIds.add(seatId);
             reservationIds.add(resId);
-            seats.add(new SeatRecord(seatId, eventId, "SEC-BLK", "1", String.valueOf(i + 1), 10000L, "USD", "HELD", 1L, now, now));
+            seats.add(new SeatRecord(seatId, eventId, "SEC-BLK", "1", String.valueOf(i + 1), 10000L, "USD", "HELD", 1L,
+                    now, now));
         }
 
-        transactionTemplate.executeWithoutResult(status -> {
-            seatRepository.bulkInsert(seats);
+        seatRepository.bulkInsert(seats);
 
-            jdbcTemplate.batchUpdate("""
-                    INSERT INTO reservations (
-                        reservation_id, event_id, user_id, status, total_amount_cents, currency,
-                        created_at, expires_at, updated_at
-                    ) VALUES (?, ?, ?, 'HELD', 10000, 'USD',
-                              clock_timestamp() - INTERVAL '1 hour',
-                              clock_timestamp() - (? * INTERVAL '1 millisecond' + INTERVAL '10 seconds'),
-                              clock_timestamp())
-                    """,
-                    new BatchPreparedStatementSetter() {
-                        @Override
-                        public void setValues(PreparedStatement ps, int i) throws SQLException {
-                            ps.setObject(1, reservationIds.get(i), Types.OTHER);
-                            ps.setObject(2, eventId, Types.OTHER);
-                            ps.setObject(3, UUID.randomUUID(), Types.OTHER);
-                            ps.setLong(4, (count - i) * 10L);
-                        }
+        jdbcTemplate.batchUpdate("""
+                INSERT INTO reservations (
+                    reservation_id, event_id, user_id, status, total_amount_cents, currency,
+                    created_at, expires_at, updated_at
+                ) VALUES (?, ?, ?, 'HELD', 10000, 'USD',
+                          clock_timestamp() - INTERVAL '1 hour',
+                          clock_timestamp() - (? * INTERVAL '1 millisecond' + INTERVAL '10 seconds'),
+                          clock_timestamp())
+                """,
+                new BatchPreparedStatementSetter() {
+                    @Override
+                    public void setValues(PreparedStatement ps, int i) throws SQLException {
+                        ps.setObject(1, reservationIds.get(i), Types.OTHER);
+                        ps.setObject(2, eventId, Types.OTHER);
+                        ps.setObject(3, UUID.randomUUID(), Types.OTHER);
+                        ps.setLong(4, (count - i) * 10L);
+                    }
 
-                        @Override
-                        public int getBatchSize() {
-                            return count;
-                        }
-                    });
+                    @Override
+                    public int getBatchSize() {
+                        return count;
+                    }
+                });
 
-            jdbcTemplate.batchUpdate("""
-                    INSERT INTO reservation_items (
-                        reservation_item_id, reservation_id, event_id, seat_id, section_code,
-                        row_label, seat_number, price_cents, status, created_at, updated_at
-                    ) VALUES (?, ?, ?, ?, 'SEC-BLK', '1', ?, 10000, 'HELD',
-                              clock_timestamp() - INTERVAL '1 hour',
-                              clock_timestamp())
-                    """,
-                    new BatchPreparedStatementSetter() {
-                        @Override
-                        public void setValues(PreparedStatement ps, int i) throws SQLException {
-                            ps.setObject(1, UUID.randomUUID(), Types.OTHER);
-                            ps.setObject(2, reservationIds.get(i), Types.OTHER);
-                            ps.setObject(3, eventId, Types.OTHER);
-                            ps.setObject(4, seatIds.get(i), Types.OTHER);
-                            ps.setString(5, String.valueOf(i + 1));
-                        }
+        jdbcTemplate.batchUpdate("""
+                INSERT INTO reservation_items (
+                    reservation_item_id, reservation_id, event_id, seat_id, section_code,
+                    row_label, seat_number, price_cents, status, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, 'SEC-BLK', '1', ?, 10000, 'HELD',
+                          clock_timestamp() - INTERVAL '1 hour',
+                          clock_timestamp())
+                """,
+                new BatchPreparedStatementSetter() {
+                    @Override
+                    public void setValues(PreparedStatement ps, int i) throws SQLException {
+                        ps.setObject(1, UUID.randomUUID(), Types.OTHER);
+                        ps.setObject(2, reservationIds.get(i), Types.OTHER);
+                        ps.setObject(3, eventId, Types.OTHER);
+                        ps.setObject(4, seatIds.get(i), Types.OTHER);
+                        ps.setString(5, String.valueOf(i + 1));
+                    }
 
-                        @Override
-                        public int getBatchSize() {
-                            return count;
-                        }
-                    });
-        });
+                    @Override
+                    public int getBatchSize() {
+                        return count;
+                    }
+                });
 
         return reservationIds;
     }
 
     private static class SimpleObjectProvider<T> implements ObjectProvider<T> {
         private final T instance;
-        SimpleObjectProvider(T instance) { this.instance = instance; }
-        @Override public T getObject(Object... args) { return instance; }
-        @Override public T getIfAvailable() { return instance; }
-        @Override public T getIfUnique() { return instance; }
-        @Override public T getObject() { return instance; }
+
+        SimpleObjectProvider(T instance) {
+            this.instance = instance;
+        }
+
+        @Override
+        public T getObject(Object... args) {
+            return instance;
+        }
+
+        @Override
+        public T getIfAvailable() {
+            return instance;
+        }
+
+        @Override
+        public T getIfUnique() {
+            return instance;
+        }
+
+        @Override
+        public T getObject() {
+            return instance;
+        }
     }
 
     private double counterValue(String name) {
@@ -1382,4 +1390,3 @@ class ExpirySweeperIntegrationTest {
         return timer != null ? timer.count() : 0L;
     }
 }
-
