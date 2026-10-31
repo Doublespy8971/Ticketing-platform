@@ -49,7 +49,7 @@ public class SeatRepository {
             UPDATE seats
             SET status = 'HELD',
                 version = version + 1,
-                updated_at = NOW()
+                updated_at = clock_timestamp()
             WHERE seat_id IN (
                 SELECT seat_id
                 FROM seats
@@ -61,11 +61,11 @@ public class SeatRepository {
             )
             """;
 
-    private static final String RELEASE_HELD_SEATS_SQL = """
+    static final String RELEASE_HELD_SEATS_SQL = """
             UPDATE seats
             SET status = 'AVAILABLE',
                 version = version + 1,
-                updated_at = NOW()
+                updated_at = clock_timestamp()
             WHERE seat_id IN (
                 SELECT seat_id
                 FROM seats
@@ -77,11 +77,11 @@ public class SeatRepository {
             )
             """;
 
-    private static final String CONFIRM_HELD_SEATS_SQL = """
+    static final String CONFIRM_HELD_SEATS_SQL = """
             UPDATE seats
             SET status = 'SOLD',
                 version = version + 1,
-                updated_at = NOW()
+                updated_at = clock_timestamp()
             WHERE seat_id IN (
                 SELECT seat_id
                 FROM seats

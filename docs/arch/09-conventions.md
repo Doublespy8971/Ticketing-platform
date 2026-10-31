@@ -132,6 +132,7 @@ All custom metrics use the `ticketing_` prefix, lowercase `snake_case`, and base
 | `POSTGRES_HOLD_TTL_SECONDS` | `inventory-service` | `600` | Authoritative PostgreSQL reservation hold duration (`expires_at`). |
 | `REDIS_SEAT_HOLD_TTL_SECONDS` | `inventory-service` | `660` | Redis `seat:{eventId}:{seatId}` safety-net TTL during a hold (60s longer than `POSTGRES_HOLD_TTL_SECONDS`). |
 | `HOLD_EXPIRY_SWEEP_INTERVAL_MS` | `inventory-service` | `1000` | Interval in milliseconds for the PostgreSQL expired-hold sweeper (`FOR UPDATE SKIP LOCKED`). |
+| `HOLD_EXPIRY_SWEEP_MAX_PAGES` | `inventory-service` | `20` | Maximum number of candidate pages processed per scheduled tick. |
 | `CHECKOUT_EXPIRY_GRACE_SECONDS` | `order-service` | `15` | Minimum remaining seconds before `expires_at` required to accept a checkout request. |
 | `MOCK_PAYMENT_FAILURE_RATE` | `payment-service` | `0.05` | Probability (`0.0` to `1.0`) of random charge failure when using a non-deterministic payment token. |
 | `MOCK_PAYMENT_MIN_LATENCY_MS` | `payment-service` | `50` | Minimum simulated payment processing latency in milliseconds. |

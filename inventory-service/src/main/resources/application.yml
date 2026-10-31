@@ -33,6 +33,7 @@ ticketing:
     enabled: ${HOLD_EXPIRY_SWEEP_ENABLED:true}
     interval-ms: ${HOLD_EXPIRY_SWEEP_INTERVAL_MS:1000}
     batch-size: ${HOLD_EXPIRY_SWEEP_BATCH_SIZE:500}
+    max-pages-per-tick: ${HOLD_EXPIRY_SWEEP_MAX_PAGES:20}
   redis:
     seat-hold-ttl-seconds: ${REDIS_SEAT_HOLD_TTL_SECONDS:660}
     event-drop-ts-ttl-seconds: 604800

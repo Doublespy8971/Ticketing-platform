@@ -87,19 +87,13 @@ return released_count
 ---
 
 #### 9.2.3 `confirm_inventory.lua` (Mark Seats SOLD Permanently on Payment Confirmation)
-Called **after** `inventory-service` commits `reservations.status = 'CONFIRMED'` and `seats.status = 'SOLD'` in PostgreSQL upon consuming `payment.succeeded`. Sets each `seat:{eventId}:{seatId}` key to `"SOLD"` **with no TTL** (persisting the key permanently so `SOLD` keys never expire in Redis).
+Called **after** `inventory-service` commits `reservations.status = 'CONFIRMED'` and `seats.status = 'SOLD'` in PostgreSQL upon consuming `payment.succeeded`. Sets each `seat:{eventId}:{seatId}` key to `"SOLD"` **with no TTL** (persisting the key permanently so `SOLD` keys never expire in Redis). Confirm only runs after PostgreSQL has committed `SOLD`, so Redis follows PostgreSQL even if the key is missing, expired or holds another reservation's temporary lock, and a later release by that other reservation cannot delete the `SOLD` marker because the token does not match.
 - **`KEYS[1 .. N]`**: `seat:{eventId}:{seatId_1}` .. `seat:{eventId}:{seatId_N}`
-- **`ARGV[1]`**: `reservationId`
 
 ```lua
 -- confirm_inventory.lua
-local reservation_id = ARGV[1]
-
 for i = 1, #KEYS do
-    local current_holder = redis.call('GET', KEYS[i])
-    if current_holder == reservation_id or current_holder == false then
-        redis.call('SET', KEYS[i], 'SOLD')
-    end
+    redis.call('SET', KEYS[i], 'SOLD')
 end
 
 return 'CONFIRMED'

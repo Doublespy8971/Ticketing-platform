@@ -131,8 +131,7 @@ public class RedisSeatGate {
         try {
             String raw = stringRedisTemplate.execute(
                     confirmInventoryScript,
-                    keys,
-                    reservationId.toString()
+                    keys
             );
             ConfirmOutcome outcome = ConfirmOutcome.fromRaw(raw);
             resultStr = outcome.name();

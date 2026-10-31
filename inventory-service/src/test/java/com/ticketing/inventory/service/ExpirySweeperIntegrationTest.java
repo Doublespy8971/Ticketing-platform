@@ -59,7 +59,13 @@ import org.testcontainers.junit.jupiter.Container;
 import org.testcontainers.junit.jupiter.Testcontainers;
 import org.testcontainers.utility.DockerImageName;
 
+import io.micrometer.core.instrument.simple.SimpleMeterRegistry;
+import org.mockito.Mockito;
+import org.springframework.jdbc.core.BatchPreparedStatementSetter;
+
 import javax.sql.DataSource;
+import java.sql.PreparedStatement;
+import java.sql.SQLException;
 import java.sql.Types;
 import java.time.Clock;
 import java.time.Duration;
@@ -81,6 +87,9 @@ import java.util.concurrent.atomic.AtomicBoolean;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.hamcrest.Matchers.is;
+import static org.mockito.Mockito.never;
+import static org.mockito.Mockito.times;
+import static org.mockito.Mockito.verify;
 import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.post;
 import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.jsonPath;
 import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.status;
@@ -255,16 +264,13 @@ class ExpirySweeperIntegrationTest {
         double overdueBeforeSweep = overdueGauge.value();
         assertThat(overdueBeforeSweep).isGreaterThanOrEqualTo(25.0);
 
-        double expiredTotalBefore = counterValue(ExpirySweeper.METRIC_INVENTORY_EXPIRED_RESERVATIONS);
         double ticketingExpiredBefore = counterValue(ExpirySweeper.METRIC_TICKETING_RESERVATIONS_EXPIRED);
         long sweepTimerCountBefore = timerCount(ExpirySweeper.METRIC_SWEEP_DURATION);
 
         int expiredCount = expirySweeper.sweep();
         assertThat(expiredCount).isEqualTo(1);
 
-        // Verify gauge is cached for 5 seconds (returns cached value before invalidation)
-        assertThat(overdueGauge.value()).isEqualTo(overdueBeforeSweep);
-        expirySweeper.invalidateOverdueHoldGaugeCache();
+        // Sweeper updates gauge at end of sweep; no more overdue holds, so gauge is now 0.0
         assertThat(overdueGauge.value()).isEqualTo(0.0);
 
         // 1. Reservation row is EXPIRED with expired_at from DB clock
@@ -312,8 +318,6 @@ class ExpirySweeperIntegrationTest {
         assertThat(stringRedisTemplate.hasKey(RedisKeys.seatKey(eventId, seat2))).isFalse();
 
         // 6. Metrics incremented
-        assertThat(counterValue(ExpirySweeper.METRIC_INVENTORY_EXPIRED_RESERVATIONS))
-                .isEqualTo(expiredTotalBefore + 1.0);
         assertThat(counterValue(ExpirySweeper.METRIC_TICKETING_RESERVATIONS_EXPIRED))
                 .isEqualTo(ticketingExpiredBefore + 1.0);
         assertThat(timerCount(ExpirySweeper.METRIC_SWEEP_DURATION))
@@ -1087,6 +1091,285 @@ class ExpirySweeperIntegrationTest {
                 );
             }
         });
+    }
+
+    @Test
+    void lockHookTestWhileTransactionHoldsRowLockExpireReservationReturnsSkippedWithoutBlockingAndLaterSweepExpiresIt()
+            throws Exception {
+        UUID eventId = UUID.randomUUID();
+        UUID seat1 = UUID.randomUUID();
+        UUID userId = UUID.randomUUID();
+        UUID reservationId = UUID.randomUUID();
+
+        seedEventAndSeats(eventId, List.of(
+                seatRecord(seat1, eventId, "SEC-A", "1", "101", 15000L, "HELD", 1L)
+        ));
+        seedReservationInDbAndRedis(reservationId, eventId, userId, List.of(seat1), "HELD", -30);
+
+        CountDownLatch lockAcquired = new CountDownLatch(1);
+        CountDownLatch releaseLock = new CountDownLatch(1);
+        ExecutorService lockHolderPool = Executors.newSingleThreadExecutor();
+        ExecutorService sweeperPool = Executors.newSingleThreadExecutor();
+
+        try {
+            // Thread 1: Acquire exclusive row lock on the reservation
+            Future<?> lockHolderFuture = lockHolderPool.submit(() -> {
+                transactionTemplate.executeWithoutResult(status -> {
+                    jdbcTemplate.queryForList(
+                            "SELECT reservation_id FROM reservations WHERE reservation_id = ? FOR UPDATE",
+                            reservationId);
+                    lockAcquired.countDown();
+                    try {
+                        assertThat(releaseLock.await(5, TimeUnit.SECONDS)).isTrue();
+                    } catch (InterruptedException e) {
+                        Thread.currentThread().interrupt();
+                    }
+                });
+            });
+
+            assertThat(lockAcquired.await(5, TimeUnit.SECONDS)).isTrue();
+
+            // Thread 2: expireReservation on another thread must return skipped (false) within 2 seconds
+            long startNanos = System.nanoTime();
+            Future<Boolean> expireFuture = sweeperPool.submit(() -> expirySweeper.expireReservation(reservationId));
+            Boolean expired = expireFuture.get(2, TimeUnit.SECONDS);
+            long elapsedMillis = TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - startNanos);
+
+            assertThat(expired).isFalse();
+            assertThat(elapsedMillis).isLessThan(2000L);
+
+            // Reservation is still HELD
+            ReservationRecord stillHeld = reservationRepository.findById(reservationId).orElseThrow();
+            assertThat(stillHeld.status()).isEqualTo("HELD");
+
+            // Release the lock
+            releaseLock.countDown();
+            lockHolderFuture.get(5, TimeUnit.SECONDS);
+
+            // Later sweep expires it
+            int swept = expirySweeper.sweep();
+            assertThat(swept).isEqualTo(1);
+
+            ReservationRecord expiredRes = reservationRepository.findById(reservationId).orElseThrow();
+            assertThat(expiredRes.status()).isEqualTo("EXPIRED");
+            assertThat(expiredRes.expiredAt()).isNotNull();
+            assertThat(expiredRes.expiredAt().compareTo(expiredRes.expiresAt())).isGreaterThanOrEqualTo(0);
+
+            SeatRecord seatAfter = seatRepository.findById(seat1).orElseThrow();
+            assertThat(seatAfter.status()).isEqualTo("AVAILABLE");
+            assertThat(seatAfter.version()).isEqualTo(2L);
+        } finally {
+            releaseLock.countDown();
+            lockHolderPool.shutdownNow();
+            sweeperPool.shutdownNow();
+        }
+    }
+
+    @Test
+    void scheduledBatchTestDrainsBacklogAndRespectsMaxPagesPerTick() {
+        boolean originalEnabled = sweeperProperties.isEnabled();
+        int originalBatchSize = sweeperProperties.getBatchSize();
+        int originalMaxPages = sweeperProperties.getMaxPagesPerTick();
+        sweeperProperties.setEnabled(true);
+        try {
+            // Part 1: 1200 expired reservations are all expired by a single call of scheduledSweep()
+            UUID eventId1 = UUID.randomUUID();
+            transactionTemplate.executeWithoutResult(status -> {
+                eventRepository.insert(new EventRecord(
+                        eventId1, "Big Event 1", "Venue",
+                        Instant.now().plus(7, ChronoUnit.DAYS), Instant.now().minus(2, ChronoUnit.HOURS),
+                        "ON_SALE", Instant.now(), Instant.now()));
+            });
+            bulkSeedExpiredReservations(eventId1, 1200);
+
+            int expiredTotal = expirySweeper.scheduledSweep();
+            assertThat(expiredTotal).isEqualTo(1200);
+
+            Integer expiredInDb = jdbcTemplate.queryForObject(
+                    "SELECT COUNT(*) FROM reservations WHERE status = 'EXPIRED'", Integer.class);
+            assertThat(expiredInDb).isEqualTo(1200);
+
+            // Part 2: with batch size 10 and max pages 3, one tick expires exactly 30
+            sweeperProperties.setBatchSize(10);
+            sweeperProperties.setMaxPagesPerTick(3);
+
+            UUID eventId2 = UUID.randomUUID();
+            transactionTemplate.executeWithoutResult(status -> {
+                eventRepository.insert(new EventRecord(
+                        eventId2, "Small Event 2", "Venue",
+                        Instant.now().plus(7, ChronoUnit.DAYS), Instant.now().minus(2, ChronoUnit.HOURS),
+                        "ON_SALE", Instant.now(), Instant.now()));
+            });
+            bulkSeedExpiredReservations(eventId2, 50);
+
+            int expiredTick = expirySweeper.scheduledSweep();
+            assertThat(expiredTick).isEqualTo(30);
+
+            // 30 expired from event2, leaving 20 HELD
+            Integer heldRemaining = jdbcTemplate.queryForObject(
+                    "SELECT COUNT(*) FROM reservations WHERE event_id = ? AND status = 'HELD'",
+                    Integer.class, eventId2);
+            assertThat(heldRemaining).isEqualTo(20);
+        } finally {
+            sweeperProperties.setEnabled(originalEnabled);
+            sweeperProperties.setBatchSize(originalBatchSize);
+            sweeperProperties.setMaxPagesPerTick(originalMaxPages);
+        }
+    }
+
+    @Test
+    void metricsTestOnlyTicketingExpiredCounterExistsAndGaugeReadsFromMemoryWithoutQueryingRepository() {
+        // 1. Assert only ticketing_reservations_expired_total exists and increments
+        assertThat(meterRegistry.find("inventory_expired_reservations_total").counter()).isNull();
+        Counter ticketingCounter = meterRegistry.find(ExpirySweeper.METRIC_TICKETING_RESERVATIONS_EXPIRED).counter();
+        assertThat(ticketingCounter).isNotNull();
+
+        double beforeCount = ticketingCounter.count();
+        UUID eventId = UUID.randomUUID();
+        UUID seatId = UUID.randomUUID();
+        UUID userId = UUID.randomUUID();
+        UUID reservationId = UUID.randomUUID();
+
+        seedEventAndSeats(eventId, List.of(
+                seatRecord(seatId, eventId, "SEC-M", "1", "1", 10000L, "HELD", 1L)
+        ));
+        seedReservationInDbAndRedis(reservationId, eventId, userId, List.of(seatId), "HELD", -10);
+
+        int swept = expirySweeper.sweep();
+        assertThat(swept).isEqualTo(1);
+        assertThat(ticketingCounter.count()).isEqualTo(beforeCount + 1.0);
+
+        // 2. Mockito spy on repository: verify gauge reads never query repository
+        ReservationRepository rawRepo = new ReservationRepository(jdbcTemplate);
+        ReservationRepository spyRepo = Mockito.spy(rawRepo);
+        SimpleMeterRegistry testRegistry = new SimpleMeterRegistry();
+        ExpirySweeperProperties testProps = new ExpirySweeperProperties();
+        ExpirySweeper sweeperWithSpy = new ExpirySweeper(
+                spyRepo, seatRepository, redisSeatGate, outboxWriter,
+                transactionManager, testProps,
+                new SimpleObjectProvider<>(testRegistry)
+        );
+
+        Gauge gauge = testRegistry.find(ExpirySweeper.METRIC_OLDEST_OVERDUE_HOLD).gauge();
+        assertThat(gauge).isNotNull();
+
+        // Reading gauge from registry must NEVER query repository
+        verify(spyRepo, never()).queryOldestOverdueHoldSeconds();
+        double gaugeValBefore = gauge.value();
+        verify(spyRepo, never()).queryOldestOverdueHoldSeconds();
+        assertThat(gaugeValBefore).isEqualTo(0.0);
+
+        // After sweep, gauge is updated by sweep and returns a number
+        sweeperWithSpy.sweep();
+        verify(spyRepo, times(1)).queryOldestOverdueHoldSeconds();
+        double gaugeValAfter = gauge.value();
+        assertThat(gaugeValAfter).isGreaterThanOrEqualTo(0.0);
+        // Reading again still does not invoke repository
+        verify(spyRepo, times(1)).queryOldestOverdueHoldSeconds();
+
+        // Idempotent registration: calling registerMetrics again keeps exactly 1 gauge
+        sweeperWithSpy.registerMetrics(testRegistry);
+        assertThat(testRegistry.find(ExpirySweeper.METRIC_OLDEST_OVERDUE_HOLD).gauges()).hasSize(1);
+    }
+
+    @Test
+    void clockTestAssertingExpiredAtIsGreaterThanOrEqualToExpiresAtForSweptReservations() {
+        UUID eventId = UUID.randomUUID();
+        UUID seat1 = UUID.randomUUID();
+        UUID userId = UUID.randomUUID();
+        UUID reservationId = UUID.randomUUID();
+
+        seedEventAndSeats(eventId, List.of(
+                seatRecord(seat1, eventId, "SEC-CLK", "1", "101", 15000L, "HELD", 1L)
+        ));
+        seedReservationInDbAndRedis(reservationId, eventId, userId, List.of(seat1), "HELD", -10);
+
+        int swept = expirySweeper.sweep();
+        assertThat(swept).isEqualTo(1);
+
+        ReservationRecord res = reservationRepository.findById(reservationId).orElseThrow();
+        assertThat(res.status()).isEqualTo("EXPIRED");
+        assertThat(res.expiredAt()).isNotNull();
+        assertThat(res.expiresAt()).isNotNull();
+        assertThat(res.expiredAt().compareTo(res.expiresAt())).isGreaterThanOrEqualTo(0);
+    }
+
+    private List<UUID> bulkSeedExpiredReservations(UUID eventId, int count) {
+        List<UUID> reservationIds = new ArrayList<>(count);
+        List<UUID> seatIds = new ArrayList<>(count);
+        List<SeatRecord> seats = new ArrayList<>(count);
+        Instant now = Instant.now().truncatedTo(ChronoUnit.MICROS);
+
+        for (int i = 0; i < count; i++) {
+            UUID seatId = UUID.randomUUID();
+            UUID resId = UUID.randomUUID();
+            seatIds.add(seatId);
+            reservationIds.add(resId);
+            seats.add(new SeatRecord(seatId, eventId, "SEC-BLK", "1", String.valueOf(i + 1), 10000L, "USD", "HELD", 1L, now, now));
+        }
+
+        transactionTemplate.executeWithoutResult(status -> {
+            seatRepository.bulkInsert(seats);
+
+            jdbcTemplate.batchUpdate("""
+                    INSERT INTO reservations (
+                        reservation_id, event_id, user_id, status, total_amount_cents, currency,
+                        created_at, expires_at, updated_at
+                    ) VALUES (?, ?, ?, 'HELD', 10000, 'USD',
+                              clock_timestamp() - INTERVAL '1 hour',
+                              clock_timestamp() - (? * INTERVAL '1 millisecond' + INTERVAL '10 seconds'),
+                              clock_timestamp())
+                    """,
+                    new BatchPreparedStatementSetter() {
+                        @Override
+                        public void setValues(PreparedStatement ps, int i) throws SQLException {
+                            ps.setObject(1, reservationIds.get(i), Types.OTHER);
+                            ps.setObject(2, eventId, Types.OTHER);
+                            ps.setObject(3, UUID.randomUUID(), Types.OTHER);
+                            ps.setLong(4, (count - i) * 10L);
+                        }
+
+                        @Override
+                        public int getBatchSize() {
+                            return count;
+                        }
+                    });
+
+            jdbcTemplate.batchUpdate("""
+                    INSERT INTO reservation_items (
+                        reservation_item_id, reservation_id, event_id, seat_id, section_code,
+                        row_label, seat_number, price_cents, status, created_at, updated_at
+                    ) VALUES (?, ?, ?, ?, 'SEC-BLK', '1', ?, 10000, 'HELD',
+                              clock_timestamp() - INTERVAL '1 hour',
+                              clock_timestamp())
+                    """,
+                    new BatchPreparedStatementSetter() {
+                        @Override
+                        public void setValues(PreparedStatement ps, int i) throws SQLException {
+                            ps.setObject(1, UUID.randomUUID(), Types.OTHER);
+                            ps.setObject(2, reservationIds.get(i), Types.OTHER);
+                            ps.setObject(3, eventId, Types.OTHER);
+                            ps.setObject(4, seatIds.get(i), Types.OTHER);
+                            ps.setString(5, String.valueOf(i + 1));
+                        }
+
+                        @Override
+                        public int getBatchSize() {
+                            return count;
+                        }
+                    });
+        });
+
+        return reservationIds;
+    }
+
+    private static class SimpleObjectProvider<T> implements ObjectProvider<T> {
+        private final T instance;
+        SimpleObjectProvider(T instance) { this.instance = instance; }
+        @Override public T getObject(Object... args) { return instance; }
+        @Override public T getIfAvailable() { return instance; }
+        @Override public T getIfUnique() { return instance; }
+        @Override public T getObject() { return instance; }
     }
 
     private double counterValue(String name) {

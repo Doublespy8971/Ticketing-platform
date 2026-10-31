@@ -7,6 +7,7 @@ public class ExpirySweeperProperties {
 
     public static final int DEFAULT_BATCH_SIZE = 500;
     public static final long DEFAULT_INTERVAL_MS = 1000L;
+    public static final int DEFAULT_MAX_PAGES_PER_TICK = 20;
 
     /** Whether scheduled background execution of the expiry sweeper is enabled. */
     private boolean enabled = true;
@@ -16,6 +17,9 @@ public class ExpirySweeperProperties {
 
     /** Maximum number of expired HELD reservations selected per sweep (default 500). */
     private int batchSize = DEFAULT_BATCH_SIZE;
+
+    /** Maximum number of sweep pages processed per scheduled tick (default 20). */
+    private int maxPagesPerTick = DEFAULT_MAX_PAGES_PER_TICK;
 
     public boolean isEnabled() {
         return enabled;
@@ -45,6 +49,17 @@ public class ExpirySweeperProperties {
             throw new IllegalArgumentException("batchSize must be positive");
         }
         this.batchSize = batchSize;
+    }
+
+    public int getMaxPagesPerTick() {
+        return maxPagesPerTick;
+    }
+
+    public void setMaxPagesPerTick(int maxPagesPerTick) {
+        if (maxPagesPerTick <= 0) {
+            throw new IllegalArgumentException("maxPagesPerTick must be positive");
+        }
+        this.maxPagesPerTick = maxPagesPerTick;
     }
 }
 

@@ -332,6 +332,65 @@ class RedisSeatGateIntegrationTest {
     }
 
     @Test
+    void confirmMissingKeySetsSoldWithTtlMinusOne() {
+        UUID eventId = UUID.randomUUID();
+        UUID seatId = UUID.randomUUID();
+        UUID reservationId = UUID.randomUUID();
+        String seatKey = RedisKeys.seatKey(eventId, seatId);
+
+        // Ensure key does not exist
+        stringRedisTemplate.delete(seatKey);
+        assertThat(stringRedisTemplate.hasKey(seatKey)).isFalse();
+
+        ConfirmOutcome outcome = redisSeatGate.confirm(eventId, List.of(seatId), reservationId);
+        assertThat(outcome).isEqualTo(ConfirmOutcome.CONFIRMED);
+        assertThat(stringRedisTemplate.opsForValue().get(seatKey)).isEqualTo(RedisKeys.SOLD_MARKER);
+        assertThat(stringRedisTemplate.getExpire(seatKey)).isEqualTo(-1L);
+    }
+
+    @Test
+    void confirmOverKeyHoldingAnotherReservationsTokenSetsSoldWithNoTtlAndLaterReleaseDoesNotDeleteIt() {
+        UUID eventId = UUID.randomUUID();
+        UUID seatId = UUID.randomUUID();
+        UUID otherReservationId = UUID.randomUUID();
+        UUID confirmingReservationId = UUID.randomUUID();
+        long nowMs = System.currentTimeMillis();
+        String seatKey = RedisKeys.seatKey(eventId, seatId);
+
+        cacheEventDropTime(eventId, nowMs - 1_000L);
+        assertThat(redisSeatGate.hold(eventId, List.of(seatId), otherReservationId, nowMs))
+                .isEqualTo(HoldOutcome.HELD);
+        assertThat(stringRedisTemplate.opsForValue().get(seatKey)).isEqualTo(otherReservationId.toString());
+
+        // Confirming reservation confirms over the other reservation's key
+        ConfirmOutcome outcome = redisSeatGate.confirm(eventId, List.of(seatId), confirmingReservationId);
+        assertThat(outcome).isEqualTo(ConfirmOutcome.CONFIRMED);
+        assertThat(stringRedisTemplate.opsForValue().get(seatKey)).isEqualTo(RedisKeys.SOLD_MARKER);
+        assertThat(stringRedisTemplate.getExpire(seatKey)).isEqualTo(-1L);
+
+        // A later release by the other reservation does not delete the SOLD key
+        long released = redisSeatGate.release(eventId, List.of(seatId), otherReservationId);
+        assertThat(released).isZero();
+        assertThat(stringRedisTemplate.opsForValue().get(seatKey)).isEqualTo(RedisKeys.SOLD_MARKER);
+        assertThat(stringRedisTemplate.getExpire(seatKey)).isEqualTo(-1L);
+    }
+
+    @Test
+    void confirmingAlreadySoldKeyKeepsItSoldWithTtlMinusOne() {
+        UUID eventId = UUID.randomUUID();
+        UUID seatId = UUID.randomUUID();
+        String seatKey = RedisKeys.seatKey(eventId, seatId);
+
+        stringRedisTemplate.opsForValue().set(seatKey, RedisKeys.SOLD_MARKER);
+        assertThat(stringRedisTemplate.opsForValue().get(seatKey)).isEqualTo(RedisKeys.SOLD_MARKER);
+
+        ConfirmOutcome outcome = redisSeatGate.confirm(eventId, List.of(seatId), UUID.randomUUID());
+        assertThat(outcome).isEqualTo(ConfirmOutcome.CONFIRMED);
+        assertThat(stringRedisTemplate.opsForValue().get(seatKey)).isEqualTo(RedisKeys.SOLD_MARKER);
+        assertThat(stringRedisTemplate.getExpire(seatKey)).isEqualTo(-1L);
+    }
+
+    @Test
     void afterFlushAllRewarmRestoresHeldSeatsWithCorrectRemainingTtlAndSoldSeatsWithNoTtl() {
         UUID eventId = UUID.randomUUID();
         UUID heldSeatId = UUID.randomUUID();

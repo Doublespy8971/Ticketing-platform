@@ -16,6 +16,7 @@ import io.micrometer.core.instrument.Timer;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.slf4j.MDC;
+import org.springframework.beans.factory.DisposableBean;
 import org.springframework.beans.factory.ObjectProvider;
 import org.springframework.scheduling.annotation.Scheduled;
 import org.springframework.stereotype.Service;
@@ -31,6 +32,8 @@ import java.util.Optional;
 import java.util.Set;
 import java.util.UUID;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.AtomicLong;
 
 /**
  * PostgreSQL-authoritative reservation hold expiry sweeper (docs/arch/08-redis.md, Section 9.3.2;
@@ -38,12 +41,12 @@ import java.util.concurrent.TimeUnit;
  *
  * <p>Runs every 1000 ms (configurable) on its own dedicated single-thread scheduler
  * ({@link ExpirySweeperConfig#SCHEDULER_BEAN_NAME}), separate from the outbox scheduler.
- * Each sweep selects up to 500 {@code HELD} reservations with {@code expires_at <= NOW()} using
+ * Each sweep selects up to 500 {@code HELD} reservations with {@code expires_at <= clock_timestamp()} using
  * {@code FOR UPDATE SKIP LOCKED} and expires each reservation in its own short PostgreSQL
  * transaction before releasing the Redis seat locks post-commit.
  */
 @Service
-public class ExpirySweeper {
+public class ExpirySweeper implements DisposableBean {
 
     private static final Logger log = LoggerFactory.getLogger(ExpirySweeper.class);
 
@@ -51,12 +54,9 @@ public class ExpirySweeper {
     public static final String TRIGGER_POSTGRES_SWEEPER = "postgres_sweeper";
 
     public static final String METRIC_TICKETING_RESERVATIONS_EXPIRED = "ticketing_reservations_expired_total";
-    public static final String METRIC_INVENTORY_EXPIRED_RESERVATIONS = "inventory_expired_reservations_total";
     public static final String METRIC_SWEEP_DURATION = "inventory_expiry_sweep_duration_seconds";
     public static final String METRIC_SWEEP_FAILURES = "inventory_expiry_sweep_failures_total";
     public static final String METRIC_OLDEST_OVERDUE_HOLD = "inventory_oldest_overdue_hold_seconds";
-
-    static final long OVERDUE_GAUGE_CACHE_TTL_NANOS = TimeUnit.SECONDS.toNanos(5);
 
     private record ExpiredReservationOutcome(
             UUID reservationId,
@@ -76,9 +76,14 @@ public class ExpirySweeper {
     private final ExpirySweeperProperties properties;
     private final MeterRegistry meterRegistry;
 
-    private double cachedOldestOverdueSeconds;
-    private long oldestOverdueUpdatedAtNanos;
-    private boolean oldestOverdueInitialized;
+    private final AtomicLong oldestOverdueSecondsDoubleBits = new AtomicLong(Double.doubleToLongBits(0.0));
+    private final AtomicInteger lastCandidateCount = new AtomicInteger(0);
+    private volatile boolean stopped = false;
+
+    // Cached Micrometer meters created once in constructor
+    private final Counter expiredReservationsCounter;
+    private final Counter sweepFailuresCounter;
+    private final Timer sweepDurationTimer;
 
     // Optional deterministic hooks for concurrency and failure testing
     private volatile Runnable afterReservationLockHook;
@@ -104,36 +109,66 @@ public class ExpirySweeper {
         this.properties = Objects.requireNonNull(properties, "properties must not be null");
         this.meterRegistry = meterRegistryProvider != null ? meterRegistryProvider.getIfAvailable() : null;
 
-        if (this.meterRegistry != null && this.meterRegistry.find(METRIC_OLDEST_OVERDUE_HOLD).gauge() == null) {
-            Gauge.builder(METRIC_OLDEST_OVERDUE_HOLD, this, ExpirySweeper::getCachedOldestOverdueHoldSeconds)
+        if (this.meterRegistry != null) {
+            this.expiredReservationsCounter = Counter.builder(METRIC_TICKETING_RESERVATIONS_EXPIRED)
                     .tag("service", SERVICE_NAME)
-                    .description("Age in seconds of the oldest overdue HELD reservation")
+                    .tag("trigger", TRIGGER_POSTGRES_SWEEPER)
                     .register(this.meterRegistry);
+            this.sweepFailuresCounter = Counter.builder(METRIC_SWEEP_FAILURES)
+                    .tag("service", SERVICE_NAME)
+                    .register(this.meterRegistry);
+            this.sweepDurationTimer = Timer.builder(METRIC_SWEEP_DURATION)
+                    .tag("service", SERVICE_NAME)
+                    .register(this.meterRegistry);
+
+            registerMetrics(this.meterRegistry);
+        } else {
+            this.expiredReservationsCounter = null;
+            this.sweepFailuresCounter = null;
+            this.sweepDurationTimer = null;
         }
 
         log.info("Reservation ExpirySweeper started: enabled={}, intervalMs={}",
                 this.properties.isEnabled(), this.properties.getIntervalMs());
     }
 
+    @Override
+    public void destroy() {
+        this.stopped = true;
+    }
+
     @Scheduled(
             fixedDelayString = "${ticketing.sweeper.interval-ms:${HOLD_EXPIRY_SWEEP_INTERVAL_MS:1000}}",
             scheduler = ExpirySweeperConfig.SCHEDULER_BEAN_NAME
     )
-    public void scheduledSweep() {
-        if (!properties.isEnabled()) {
-            return;
+    public int scheduledSweep() {
+        if (stopped || !properties.isEnabled()) {
+            return 0;
         }
-        sweep();
+        int totalExpired = 0;
+        int maxPages = properties.getMaxPagesPerTick();
+        int batchSize = properties.getBatchSize();
+        for (int page = 0; page < maxPages && !stopped; page++) {
+            int expired = sweep();
+            totalExpired += expired;
+            if (lastCandidateCount.get() < batchSize) {
+                break;
+            }
+        }
+        return totalExpired;
     }
 
     /**
      * Executes a single expiry sweep batch: selects up to {@code batchSize} (default 500)
-     * {@code HELD} reservation IDs with {@code expires_at <= NOW()} ordered by {@code expires_at ASC}
+     * {@code HELD} reservation IDs with {@code expires_at <= clock_timestamp()} ordered by {@code expires_at ASC}
      * using {@code FOR UPDATE SKIP LOCKED}, and expires each reservation in its own short transaction.
      *
      * @return the number of reservations transitioned to {@code EXPIRED} during this sweep
      */
     public int sweep() {
+        if (stopped) {
+            return 0;
+        }
         long startNanos = System.nanoTime();
         int expiredCount = 0;
         try {
@@ -145,14 +180,21 @@ public class ExpirySweeper {
             } catch (Throwable ex) {
                 recordSweepFailure();
                 log.error("Failed to select expired HELD reservations during expiry sweep", ex);
+                lastCandidateCount.set(0);
                 return 0;
             }
+            int candidateCount = candidates != null ? candidates.size() : 0;
+            lastCandidateCount.set(candidateCount);
+
             if (candidates == null || candidates.isEmpty()) {
                 return 0;
             }
 
             Set<UUID> processedInSweep = new LinkedHashSet<>(candidates.size());
             for (UUID reservationId : candidates) {
+                if (stopped) {
+                    break;
+                }
                 if (reservationId == null || !processedInSweep.add(reservationId)) {
                     continue;
                 }
@@ -168,6 +210,7 @@ public class ExpirySweeper {
             }
             return expiredCount;
         } finally {
+            updateOldestOverdueGauge();
             recordSweepDuration(startNanos);
         }
     }
@@ -176,14 +219,14 @@ public class ExpirySweeper {
      * Expires a single reservation in its own short PostgreSQL transaction and, only after
      * a successful commit, releases its seat locks in Redis.
      *
-     * <p>Concurrency guarantee: This method and {@link ReservationRepository#confirmIfHeld(UUID)}
-     * both acquire {@code SELECT ... FROM reservations WHERE reservation_id = ? FOR UPDATE} as their
-     * first step, serializing on the {@code reservations} row lock so that at most one observes
-     * {@code status = 'HELD'} and wins.
+     * <p>Concurrency guarantee: This method acquires
+     * {@code SELECT ... FROM reservations WHERE reservation_id = ? FOR UPDATE SKIP LOCKED}.
+     * If the row lock cannot be acquired because another transaction holds it, the method skips
+     * the reservation without blocking, leaves it {@code HELD}, and logs at {@code DEBUG} level.
      *
      * @param reservationId the reservation to expire
      * @return {@code true} if the reservation was transitioned from {@code HELD} to {@code EXPIRED};
-     *         {@code false} if it did not exist, was no longer {@code HELD}, or had not yet expired
+     *         {@code false} if it was skipped (locked), did not exist, was no longer {@code HELD}, or had not yet expired
      */
     public boolean expireReservation(UUID reservationId) {
         Objects.requireNonNull(reservationId, "reservationId must not be null");
@@ -201,6 +244,7 @@ public class ExpirySweeper {
             ExpiredReservationOutcome outcome = perReservationTxTemplate.execute(
                     status -> executeExpireTransaction(reservationId));
             if (outcome == null) {
+                log.debug("Skipped expiring reservation {}", reservationId);
                 return false;
             }
 
@@ -225,10 +269,11 @@ public class ExpirySweeper {
     }
 
     private ExpiredReservationOutcome executeExpireTransaction(UUID reservationId) {
-        // 1. Lock the reservation row and re-check that status is still HELD and expires_at has passed (DB clock)
+        // 1. Non-blocking lock: acquire row lock with SKIP LOCKED and re-check that status is still HELD and expires_at has passed (DB clock)
         Optional<ReservationRepository.LockedReservation> lockedOpt =
-                reservationRepository.lockForUpdate(reservationId);
+                reservationRepository.lockForUpdateSkipLocked(reservationId);
         if (lockedOpt.isEmpty()) {
+            log.debug("Skipped expiring reservation {}: row is locked by another transaction or does not exist", reservationId);
             return null;
         }
 
@@ -239,6 +284,8 @@ public class ExpirySweeper {
         }
 
         if (!"HELD".equals(locked.status()) || !locked.expired()) {
+            log.debug("Skipped expiring reservation {}: status={} (expected HELD), isExpired={}",
+                    reservationId, locked.status(), locked.expired());
             return null;
         }
 
@@ -300,49 +347,55 @@ public class ExpirySweeper {
         }
     }
 
-    public synchronized double getCachedOldestOverdueHoldSeconds() {
-        long now = System.nanoTime();
-        if (!oldestOverdueInitialized || (now - oldestOverdueUpdatedAtNanos) >= OVERDUE_GAUGE_CACHE_TTL_NANOS) {
-            cachedOldestOverdueSeconds = reservationRepository.queryOldestOverdueHoldSeconds();
-            oldestOverdueUpdatedAtNanos = now;
-            oldestOverdueInitialized = true;
+    private void updateOldestOverdueGauge() {
+        try {
+            double oldest = reservationRepository.queryOldestOverdueHoldSeconds();
+            oldestOverdueSecondsDoubleBits.set(Double.doubleToLongBits(Math.max(0.0, oldest)));
+        } catch (Throwable ex) {
+            log.warn("Failed to update oldest overdue hold gauge after sweep", ex);
         }
-        return cachedOldestOverdueSeconds;
     }
 
-    public synchronized void invalidateOverdueHoldGaugeCache() {
-        this.oldestOverdueInitialized = false;
+    public synchronized void registerMetrics(MeterRegistry registry) {
+        if (registry == null) {
+            return;
+        }
+        if (registry.find(METRIC_OLDEST_OVERDUE_HOLD).gauge() == null) {
+            Gauge.builder(METRIC_OLDEST_OVERDUE_HOLD, this.oldestOverdueSecondsDoubleBits, bits -> Double.longBitsToDouble(bits.get()))
+                    .strongReference(true)
+                    .tag("service", SERVICE_NAME)
+                    .description("Age in seconds of the oldest overdue HELD reservation")
+                    .register(registry);
+        }
+    }
+
+    public double getOldestOverdueHoldSeconds() {
+        return Double.longBitsToDouble(oldestOverdueSecondsDoubleBits.get());
+    }
+
+    public void invalidateOverdueHoldGaugeCache() {
+        updateOldestOverdueGauge();
+    }
+
+    public int getLastCandidateCount() {
+        return lastCandidateCount.get();
     }
 
     private void recordReservationExpired() {
-        if (meterRegistry != null) {
-            Counter.builder(METRIC_TICKETING_RESERVATIONS_EXPIRED)
-                    .tag("service", SERVICE_NAME)
-                    .tag("trigger", TRIGGER_POSTGRES_SWEEPER)
-                    .register(meterRegistry)
-                    .increment();
-            Counter.builder(METRIC_INVENTORY_EXPIRED_RESERVATIONS)
-                    .tag("service", SERVICE_NAME)
-                    .register(meterRegistry)
-                    .increment();
+        if (expiredReservationsCounter != null) {
+            expiredReservationsCounter.increment();
         }
     }
 
     private void recordSweepFailure() {
-        if (meterRegistry != null) {
-            Counter.builder(METRIC_SWEEP_FAILURES)
-                    .tag("service", SERVICE_NAME)
-                    .register(meterRegistry)
-                    .increment();
+        if (sweepFailuresCounter != null) {
+            sweepFailuresCounter.increment();
         }
     }
 
     private void recordSweepDuration(long startNanos) {
-        if (meterRegistry != null) {
-            Timer.builder(METRIC_SWEEP_DURATION)
-                    .tag("service", SERVICE_NAME)
-                    .register(meterRegistry)
-                    .record(System.nanoTime() - startNanos, TimeUnit.NANOSECONDS);
+        if (sweepDurationTimer != null) {
+            sweepDurationTimer.record(System.nanoTime() - startNanos, TimeUnit.NANOSECONDS);
         }
     }
 
@@ -354,4 +407,3 @@ public class ExpirySweeper {
         this.afterExpireCommitBeforeRedisReleaseHook = afterExpireCommitBeforeRedisReleaseHook;
     }
 }
-

@@ -94,42 +94,53 @@ public class ReservationRepository {
             Instant confirmedAt
     ) {}
 
-    private static final String SELECT_EXPIRED_HELD_IDS_FOR_UPDATE_SKIP_LOCKED_SQL = """
+    static final String SELECT_EXPIRED_HELD_IDS_FOR_UPDATE_SKIP_LOCKED_SQL = """
             SELECT reservation_id
             FROM reservations
             WHERE status = 'HELD'
-              AND expires_at <= NOW()
+              AND expires_at <= clock_timestamp()
             ORDER BY expires_at ASC
             LIMIT ?
             FOR UPDATE SKIP LOCKED
             """;
 
-    private static final String LOCK_RESERVATION_FOR_UPDATE_SQL = """
+    static final String LOCK_RESERVATION_FOR_UPDATE_SQL = """
             SELECT reservation_id,
                    event_id,
                    user_id,
                    status,
-                   (expires_at <= NOW()) AS is_expired
+                   (expires_at <= clock_timestamp()) AS is_expired
             FROM reservations
             WHERE reservation_id = ?
             FOR UPDATE
             """;
 
-    private static final String MARK_EXPIRED_WITH_DB_CLOCK_SQL = """
+    static final String LOCK_RESERVATION_FOR_UPDATE_SKIP_LOCKED_SQL = """
+            SELECT reservation_id,
+                   event_id,
+                   user_id,
+                   status,
+                   (expires_at <= clock_timestamp()) AS is_expired
+            FROM reservations
+            WHERE reservation_id = ?
+            FOR UPDATE SKIP LOCKED
+            """;
+
+    static final String MARK_EXPIRED_WITH_DB_CLOCK_SQL = """
             UPDATE reservations
             SET status = 'EXPIRED',
-                expired_at = date_trunc('microseconds', NOW()),
-                updated_at = date_trunc('microseconds', NOW())
+                expired_at = date_trunc('microseconds', clock_timestamp()),
+                updated_at = date_trunc('microseconds', clock_timestamp())
             WHERE reservation_id = ?
               AND status = 'HELD'
             RETURNING expired_at
             """;
 
-    private static final String EXPIRE_HELD_ITEMS_SQL = """
+    static final String EXPIRE_HELD_ITEMS_SQL = """
             WITH updated_items AS (
                 UPDATE reservation_items
                 SET status = 'EXPIRED',
-                    updated_at = date_trunc('microseconds', NOW())
+                    updated_at = date_trunc('microseconds', clock_timestamp())
                 WHERE reservation_id = ?
                   AND status = 'HELD'
                 RETURNING seat_id
@@ -139,21 +150,21 @@ public class ReservationRepository {
             ORDER BY seat_id ASC
             """;
 
-    private static final String MARK_CONFIRMED_WITH_DB_CLOCK_SQL = """
+    static final String MARK_CONFIRMED_WITH_DB_CLOCK_SQL = """
             UPDATE reservations
             SET status = 'CONFIRMED',
-                confirmed_at = date_trunc('microseconds', NOW()),
-                updated_at = date_trunc('microseconds', NOW())
+                confirmed_at = date_trunc('microseconds', clock_timestamp()),
+                updated_at = date_trunc('microseconds', clock_timestamp())
             WHERE reservation_id = ?
               AND status = 'HELD'
             RETURNING confirmed_at
             """;
 
-    private static final String CONFIRM_HELD_ITEMS_SQL = """
+    static final String CONFIRM_HELD_ITEMS_SQL = """
             WITH updated_items AS (
                 UPDATE reservation_items
                 SET status = 'CONFIRMED',
-                    updated_at = date_trunc('microseconds', NOW())
+                    updated_at = date_trunc('microseconds', clock_timestamp())
                 WHERE reservation_id = ?
                   AND status = 'HELD'
                 RETURNING seat_id
@@ -163,11 +174,11 @@ public class ReservationRepository {
             ORDER BY seat_id ASC
             """;
 
-    private static final String CONFIRM_HELD_SEATS_SQL = """
+    static final String CONFIRM_HELD_SEATS_SQL = """
             UPDATE seats
             SET status = 'SOLD',
                 version = version + 1,
-                updated_at = NOW()
+                updated_at = clock_timestamp()
             WHERE seat_id IN (
                 SELECT seat_id
                 FROM seats
@@ -179,11 +190,11 @@ public class ReservationRepository {
             )
             """;
 
-    private static final String OLDEST_OVERDUE_HOLD_SECONDS_SQL = """
-            SELECT COALESCE(EXTRACT(EPOCH FROM (NOW() - MIN(expires_at))), 0.0)
+    static final String OLDEST_OVERDUE_HOLD_SECONDS_SQL = """
+            SELECT COALESCE(EXTRACT(EPOCH FROM (clock_timestamp() - MIN(expires_at))), 0.0)
             FROM reservations
             WHERE status = 'HELD'
-              AND expires_at <= NOW()
+              AND expires_at <= clock_timestamp()
             """;
 
     private static final String INSERT_HELD_WITH_DB_CLOCK_SQL = """
@@ -430,6 +441,26 @@ public class ReservationRepository {
         Objects.requireNonNull(reservationId, "reservationId must not be null");
         return jdbcTemplate.query(
                 LOCK_RESERVATION_FOR_UPDATE_SQL,
+                (rs, rowNum) -> new LockedReservation(
+                        rs.getObject("reservation_id", UUID.class),
+                        rs.getObject("event_id", UUID.class),
+                        rs.getObject("user_id", UUID.class),
+                        rs.getString("status"),
+                        rs.getBoolean("is_expired")
+                ),
+                reservationId
+        ).stream().findFirst();
+    }
+
+    /**
+     * Attempts to acquire an exclusive row-level lock on the reservation row using {@code FOR UPDATE SKIP LOCKED}.
+     * Returns {@link Optional#empty()} when the row is locked by another transaction or does not exist.
+     */
+    @Transactional(propagation = Propagation.MANDATORY)
+    public Optional<LockedReservation> lockForUpdateSkipLocked(UUID reservationId) {
+        Objects.requireNonNull(reservationId, "reservationId must not be null");
+        return jdbcTemplate.query(
+                LOCK_RESERVATION_FOR_UPDATE_SKIP_LOCKED_SQL,
                 (rs, rowNum) -> new LockedReservation(
                         rs.getObject("reservation_id", UUID.class),
                         rs.getObject("event_id", UUID.class),
