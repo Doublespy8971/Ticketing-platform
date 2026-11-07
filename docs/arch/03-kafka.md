@@ -43,7 +43,7 @@ Every stateful Java consumer group (`inventory-service`, `order-service`, `payme
 - `backoff = @Backoff(delay = 2000, multiplier = 5.0)` (produces exact delays of `2000 ms` for `-retry-0` and `10000 ms` for `-retry-1`)
 - `autoCreateTopics = "false"` (all main, retry, and DLT topics are provisioned deterministically at startup via `kafka-topics.sh` / Strimzi `KafkaTopic` manifests)
 - `dltStrategy = DltStrategy.FAIL_ON_ERROR`
-- Non-retryable exceptions (`NonRetryableEventException`, `JsonProcessingException`, `IllegalArgumentException`, schema validation failures) bypass `-retry-0` and `-retry-1` and route directly to `-dlt`.
+- Non-retryable exceptions (`NonRetryableEventException` — thrown on malformed JSON, missing required envelope fields, unknown `eventType`, unsupported `schemaVersion != 1`, or explicit poison-record rejection) bypass `-retry-0` and `-retry-1` and route directly to `-dlt`; every other exception is retried.
 - **Dead-Letter Record Headers**: Every record published to `-dlt` carries the standard Spring Kafka dead-letter diagnostic headers (`KafkaHeaders`):
   - `kafka_dlt-original-topic`
   - `kafka_dlt-original-partition`

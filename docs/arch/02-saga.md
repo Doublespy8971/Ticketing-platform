@@ -111,7 +111,7 @@ stateDiagram-v2
 #### 3. Duplicate Kafka Events (At-Least-Once Delivery)
 - **Scenario**: An outbox poller crashes after sending a Kafka batch but before committing `UPDATE outbox_events SET published_at = NOW()`, or a Kafka consumer rebalances mid-batch, causing duplicate delivery of `inventory.seat.reserved`, `order.payment.requested`, or `payment.succeeded`.
 - **Mandatory Resolution**:
-  - Every stateful consumer (`inventory-service`, `order-service`, `payment-service`) executes `INSERT INTO processed_events (event_id, consumer_group, processed_at) VALUES (:eventId, :groupId, NOW()) ON CONFLICT (event_id, consumer_group) DO NOTHING` inside the same local PostgreSQL transaction as its domain table updates. If `0` rows are inserted, the consumer logs at `DEBUG` level and acknowledges the offset immediately without mutating state.
+  - Every stateful consumer (`inventory-service`, `order-service`, `payment-service`) executes `INSERT INTO processed_events (event_id, consumer_group, event_type, processed_at) VALUES (:eventId, :groupId, :eventType, NOW()) ON CONFLICT (event_id, consumer_group) DO NOTHING` inside the same local PostgreSQL transaction as its domain table updates. If `0` rows are inserted, the consumer logs at `DEBUG` level and acknowledges the offset immediately without mutating state.
   - Even if two different `eventId` instances represent the same logical transition (for example, multiple `inventory-service` instances running the `1000 ms` PostgreSQL sweeper or a sweeper racing with `payment.succeeded`), `FOR UPDATE SKIP LOCKED` and the `FOR UPDATE` row lock on `reservations` check `WHERE status = 'HELD'`, so only the first transaction succeeds and emits `inventory.reservation.expired`.
 
 #### 4. Service Crashing Mid-Saga
