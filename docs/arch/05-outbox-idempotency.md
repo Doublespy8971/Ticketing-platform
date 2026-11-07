@@ -175,6 +175,30 @@ CREATE INDEX idx_processed_events_processed_at
   4. If affected row count is `1`, execute the domain table mutation and `INSERT INTO outbox_events`, commit the PostgreSQL transaction, and acknowledge the Kafka offset.
   5. If any exception occurs during step 4, the PostgreSQL transaction rolls back (removing the `processed_events` insert) and the message is routed to `<topic>-<consumer-group>-retry-0`.
 
+#### `processed_events` Retention Cleanup
+- **Retention**: `192 hours` (8 days). This is deliberately longer than the `7 day` (`604800000 ms`) retention of every Kafka topic in Section 3.2, so a replay or consumer offset reset within topic retention can never reach an event whose deduplication row has already been purged and reprocess it.
+- **Schedule**: hourly (`@Scheduled(cron = "0 0 * * * *")`) on a dedicated single-thread scheduler (`ticketingConsumerCleanupScheduler`) that never shares a thread with the outbox poller or the hold expiry sweeper.
+- **Batching**: each batch deletes at most `5000` rows; a run loops over batches until a batch deletes fewer rows than the batch size, with a hard maximum of `100` iterations per run:
+  ```sql
+  DELETE FROM processed_events
+  WHERE (event_id, consumer_group) IN (
+      SELECT event_id, consumer_group
+      FROM processed_events
+      WHERE processed_at < NOW() - INTERVAL '192 hours'
+      ORDER BY processed_at ASC
+      LIMIT 5000
+      FOR UPDATE SKIP LOCKED
+  );
+  ```
+- **Properties** (startup fails if a value is out of range):
+
+  | Property | Default | Constraint |
+  | :--- | :--- | :--- |
+  | `ticketing.consumer.cleanup.enabled` | `true` | — |
+  | `ticketing.consumer.cleanup.retention-hours` | `192` | `>= 192` |
+  | `ticketing.consumer.cleanup.batch-size` | `5000` | `1..10000` |
+  | `ticketing.consumer.cleanup.cron` | `0 0 * * * *` | valid Spring cron expression |
+
 #### Stateless Go Service (`notification-service`)
 Because `notification-service` has no PostgreSQL database, it enforces idempotency using Redis 7:
 1. On receiving `order.confirmed` or `order.cancelled` with `eventId`, execute:

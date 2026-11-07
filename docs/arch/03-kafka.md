@@ -14,6 +14,7 @@
   - `isolation.level=read_committed`
   - `auto.offset.reset=earliest`
   - `max.poll.records=100`
+  - `max.poll.interval.ms=300000`
 
 ---
 
@@ -42,7 +43,15 @@ Every stateful Java consumer group (`inventory-service`, `order-service`, `payme
 - `backoff = @Backoff(delay = 2000, multiplier = 5.0)` (produces exact delays of `2000 ms` for `-retry-0` and `10000 ms` for `-retry-1`)
 - `autoCreateTopics = "false"` (all main, retry, and DLT topics are provisioned deterministically at startup via `kafka-topics.sh` / Strimzi `KafkaTopic` manifests)
 - `dltStrategy = DltStrategy.FAIL_ON_ERROR`
-- Non-retryable exceptions (`JsonProcessingException`, `IllegalArgumentException`, schema validation failures) bypass `-retry-0` and `-retry-1` and route directly to `-dlt`.
+- Non-retryable exceptions (`NonRetryableEventException`, `JsonProcessingException`, `IllegalArgumentException`, schema validation failures) bypass `-retry-0` and `-retry-1` and route directly to `-dlt`.
+- **Dead-Letter Record Headers**: Every record published to `-dlt` carries the standard Spring Kafka dead-letter diagnostic headers (`KafkaHeaders`):
+  - `kafka_dlt-original-topic`
+  - `kafka_dlt-original-partition`
+  - `kafka_dlt-original-offset`
+  - `kafka_dlt-original-timestamp`
+  - `kafka_dlt-exception-fqcn`
+  - `kafka_dlt-exception-message`
+  - `kafka_dlt-exception-stacktrace`
 - **No Retry or DLT Topics for `notification-service`**: Because customer notifications are non-critical to saga state convergence, `notification-service` does **not** have `-retry-0`, `-retry-1`, or `-dlt` topics. When `notification-service` fails to process or dispatch a notification, it logs the error at `ERROR` level, increments `ticketing_notifications_sent_total{status="FAILED"}`, commits the offset, and does not forward the message to any topic.
 
 #### Complete Retry & Dead-Letter Topics Table
