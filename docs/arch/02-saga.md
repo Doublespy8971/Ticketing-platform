@@ -48,6 +48,7 @@ stateDiagram-v2
     PAYMENT_PENDING --> CANCELLED_EXPIRED : Consumes inventory.reservation.expired\n(before payment result)\nEmits order.cancelled
     PAYMENT_PENDING --> REFUND_PENDING : Consumes inventory.seat.confirmation_rejected\nEmits order.refund.requested
     CANCELLED_EXPIRED --> REFUND_PENDING : Consumes late payment.succeeded\nor inventory.seat.confirmation_rejected\nEmits order.refund.requested
+    CANCELLED_PAYMENT_FAILED --> REFUND_PENDING : Consumes late payment.succeeded\nor inventory.seat.confirmation_rejected\nEmits order.refund.requested
     REFUND_PENDING --> CANCELLED_REFUNDED : Consumes payment.refunded\nEmits order.cancelled
     CONFIRMED --> [*]
     CANCELLED_PAYMENT_FAILED --> [*]
@@ -85,7 +86,7 @@ stateDiagram-v2
 | `PAYMENT_PENDING` | `payment.failed` | `orders.status = 'PAYMENT_PENDING'` | Update `orders` (`status = 'CANCELLED_PAYMENT_FAILED'`, `cancelled_at = now`, `cancellation_reason = 'PAYMENT_FAILED'`) | `order.cancelled` | `CANCELLED_PAYMENT_FAILED` |
 | `PAYMENT_PENDING` | `inventory.reservation.expired` | `orders.status = 'PAYMENT_PENDING'` and `payment_id IS NULL` | Update `orders` (`status = 'CANCELLED_EXPIRED'`, `cancelled_at = now`, `cancellation_reason = 'RESERVATION_EXPIRED'`) | `order.cancelled` | `CANCELLED_EXPIRED` |
 | `PAYMENT_PENDING` | `inventory.seat.confirmation_rejected` | `orders.status = 'PAYMENT_PENDING'` | Update `orders` (`status = 'REFUND_PENDING'`, `payment_id = payload.paymentId`, `cancellation_reason = 'LATE_PAYMENT_EXPIRED_HOLD'`) | `order.refund.requested` | `REFUND_PENDING` |
-| `CANCELLED_EXPIRED` | `payment.succeeded` OR `inventory.seat.confirmation_rejected` | `orders.status = 'CANCELLED_EXPIRED'` | Update `orders` (`status = 'REFUND_PENDING'`, `payment_id = payload.paymentId`, `cancellation_reason = 'LATE_PAYMENT_EXPIRED_HOLD'`) | `order.refund.requested` | `REFUND_PENDING` |
+| `CANCELLED_EXPIRED` or `CANCELLED_PAYMENT_FAILED` | `payment.succeeded` OR `inventory.seat.confirmation_rejected` | `orders.status IN ('CANCELLED_EXPIRED', 'CANCELLED_PAYMENT_FAILED')` | Update `orders` (`status = 'REFUND_PENDING'`, `payment_id = payload.paymentId`, `cancellation_reason = COALESCE(payload.reason, 'LATE_PAYMENT_AFTER_CANCELLATION')`) | `order.refund.requested` | `REFUND_PENDING` |
 | `REFUND_PENDING` | `payment.refunded` | `orders.status = 'REFUND_PENDING'` | Update `orders` (`status = 'CANCELLED_REFUNDED'`, `refunded_at = now`) | `order.cancelled` | `CANCELLED_REFUNDED` |
 | Any state | Any Kafka event not listed above | `(state, eventType)` pair not matched in this table | Record `event_id` in `processed_events`; no mutation to `orders`; log at `INFO` level and acknowledge Kafka offset immediately (never retried or sent to DLT) | None | Unchanged |
 
@@ -106,7 +107,7 @@ stateDiagram-v2
   2. **Authoritative Inventory Check**: `order-service` never transitions directly from `PAYMENT_PENDING` to `CONFIRMED` solely upon receiving `payment.succeeded`. Instead, `inventory-service` consumes `payment.succeeded` and checks `reservations.status` in `inventory_db` under `FOR UPDATE` row lock:
      - If `reservations.status == 'HELD'`, `inventory-service` transitions the reservation to `CONFIRMED`, marks seats `SOLD`, and emits `inventory.seat.confirmed`.
      - If `reservations.status IN ('EXPIRED', 'RELEASED')`, `inventory-service` leaves the reservation untouched and emits `inventory.seat.confirmation_rejected` with `paymentId` and `reason = 'RESERVATION_ALREADY_EXPIRED'`.
-  3. **Automatic Refund Compensation**: When `order-service` consumes `inventory.seat.confirmation_rejected` (or consumes `payment.succeeded` after already transitioning to `CANCELLED_EXPIRED`), it transitions the order to `REFUND_PENDING` and emits `order.refund.requested`. `payment-service` consumes `order.refund.requested`, refunds the charge, and emits `payment.refunded`, transitioning the order to `CANCELLED_REFUNDED`. Zero seats are oversold, and zero customers are charged for unfulfilled tickets.
+  3. **Automatic Refund Compensation**: The late-payment rule is general: a `payment.succeeded`, or an `inventory.seat.confirmation_rejected` for a payment, arriving when the order is in any cancelled state that has not been refunded (`CANCELLED_EXPIRED` or `CANCELLED_PAYMENT_FAILED`) moves the order to `REFUND_PENDING` and emits `order.refund.requested`. `payment-service` consumes `order.refund.requested`, refunds the charge, and emits `payment.refunded`, transitioning the order to `CANCELLED_REFUNDED`. Zero seats are oversold, and zero customers are charged for unfulfilled tickets.
 
 #### 3. Duplicate Kafka Events (At-Least-Once Delivery)
 - **Scenario**: An outbox poller crashes after sending a Kafka batch but before committing `UPDATE outbox_events SET published_at = NOW()`, or a Kafka consumer rebalances mid-batch, causing duplicate delivery of `inventory.seat.reserved`, `order.payment.requested`, or `payment.succeeded`.

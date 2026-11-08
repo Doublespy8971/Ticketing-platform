@@ -46,6 +46,8 @@ import org.springframework.data.redis.core.script.DefaultRedisScript;
 import org.springframework.http.MediaType;
 import org.springframework.jdbc.core.JdbcTemplate;
 import org.springframework.scheduling.concurrent.ThreadPoolTaskScheduler;
+import org.springframework.scheduling.config.ScheduledTask;
+import org.springframework.scheduling.config.ScheduledTaskHolder;
 import org.springframework.test.context.DynamicPropertyRegistry;
 import org.springframework.test.context.DynamicPropertySource;
 import org.springframework.test.web.servlet.MockMvc;
@@ -1164,52 +1166,70 @@ class ExpirySweeperIntegrationTest {
 
     @Test
     void scheduledBatchTestDrainsBacklogAndRespectsMaxPagesPerTick() {
-        ExpirySweeperProperties localProps = new ExpirySweeperProperties();
-        localProps.setEnabled(true);
-        ExpirySweeper localSweeper = new ExpirySweeper(
-                reservationRepository, seatRepository, redisSeatGate, outboxWriter,
-                transactionManager, localProps,
-                new SimpleObjectProvider<>(new SimpleMeterRegistry()));
+        boolean originalEnabled = sweeperProperties.isEnabled();
+        int originalBatchSize = sweeperProperties.getBatchSize();
+        int originalMaxPages = sweeperProperties.getMaxPagesPerTick();
 
-        // Part 1: 1200 expired reservations are all expired by a single call of
-        // scheduledSweep()
-        UUID eventId1 = UUID.randomUUID();
-        transactionTemplate.executeWithoutResult(status -> {
-            eventRepository.insert(new EventRecord(
-                    eventId1, "Big Event 1", "Venue",
-                    Instant.now().plus(7, ChronoUnit.DAYS), Instant.now().minus(2, ChronoUnit.HOURS),
-                    "ON_SALE", Instant.now(), Instant.now()));
-        });
-        bulkSeedExpiredReservations(eventId1, 1200);
+        Counter ticketingCounter = meterRegistry.find(ExpirySweeper.METRIC_TICKETING_RESERVATIONS_EXPIRED).counter();
+        double initialExpiredCount = ticketingCounter != null ? ticketingCounter.count() : 0.0;
 
-        int expiredTotal = localSweeper.scheduledSweep();
-        assertThat(expiredTotal).isEqualTo(1200);
+        ScheduledTaskHolder taskHolder = applicationContext.getBean(ScheduledTaskHolder.class);
+        taskHolder.getScheduledTasks().forEach(ScheduledTask::cancel);
 
-        Integer expiredInDb = jdbcTemplate.queryForObject(
-                "SELECT COUNT(*) FROM reservations WHERE status = 'EXPIRED'", Integer.class);
-        assertThat(expiredInDb).isEqualTo(1200);
+        try {
+            sweeperProperties.setEnabled(true);
 
-        // Part 2: with batch size 10 and max pages 3, one tick expires exactly 30
-        localProps.setBatchSize(10);
-        localProps.setMaxPagesPerTick(3);
+            // Part 1: 1200 expired reservations are all expired by a single call of
+            // scheduledSweep()
+            UUID eventId1 = UUID.randomUUID();
+            transactionTemplate.executeWithoutResult(status -> {
+                eventRepository.insert(new EventRecord(
+                        eventId1, "Big Event 1", "Venue",
+                        Instant.now().plus(7, ChronoUnit.DAYS), Instant.now().minus(2, ChronoUnit.HOURS),
+                        "ON_SALE", Instant.now(), Instant.now()));
+            });
+            bulkSeedExpiredReservations(eventId1, 1200);
 
-        UUID eventId2 = UUID.randomUUID();
-        transactionTemplate.executeWithoutResult(status -> {
-            eventRepository.insert(new EventRecord(
-                    eventId2, "Small Event 2", "Venue",
-                    Instant.now().plus(7, ChronoUnit.DAYS), Instant.now().minus(2, ChronoUnit.HOURS),
-                    "ON_SALE", Instant.now(), Instant.now()));
-        });
-        bulkSeedExpiredReservations(eventId2, 50);
+            int expiredTotal = expirySweeper.scheduledSweep();
+            assertThat(expiredTotal).isEqualTo(1200);
 
-        int expiredTick = localSweeper.scheduledSweep();
-        assertThat(expiredTick).isEqualTo(30);
+            Integer expiredInDb = jdbcTemplate.queryForObject(
+                    "SELECT COUNT(*) FROM reservations WHERE status = 'EXPIRED'", Integer.class);
+            assertThat(expiredInDb).isEqualTo(1200);
 
-        // 30 expired from event2, leaving 20 HELD
-        Integer heldRemaining = jdbcTemplate.queryForObject(
-                "SELECT COUNT(*) FROM reservations WHERE event_id = ? AND status = 'HELD'",
-                Integer.class, eventId2);
-        assertThat(heldRemaining).isEqualTo(20);
+            if (ticketingCounter != null) {
+                assertThat(ticketingCounter.count()).isEqualTo(initialExpiredCount + 1200.0);
+            }
+
+            // Part 2: with batch size 10 and max pages 3, one tick expires exactly 30
+            UUID eventId2 = UUID.randomUUID();
+            transactionTemplate.executeWithoutResult(status -> {
+                eventRepository.insert(new EventRecord(
+                        eventId2, "Small Event 2", "Venue",
+                        Instant.now().plus(7, ChronoUnit.DAYS), Instant.now().minus(2, ChronoUnit.HOURS),
+                        "ON_SALE", Instant.now(), Instant.now()));
+            });
+            bulkSeedExpiredReservations(eventId2, 50);
+
+            sweeperProperties.setBatchSize(10);
+            sweeperProperties.setMaxPagesPerTick(3);
+            int expiredTick = expirySweeper.scheduledSweep();
+            assertThat(expiredTick).isEqualTo(30);
+
+            // 30 expired from event2, leaving 20 HELD
+            Integer heldRemaining = jdbcTemplate.queryForObject(
+                    "SELECT COUNT(*) FROM reservations WHERE event_id = ? AND status = 'HELD'",
+                    Integer.class, eventId2);
+            assertThat(heldRemaining).isEqualTo(20);
+
+            if (ticketingCounter != null) {
+                assertThat(ticketingCounter.count()).isEqualTo(initialExpiredCount + 1230.0);
+            }
+        } finally {
+            sweeperProperties.setEnabled(originalEnabled);
+            sweeperProperties.setBatchSize(originalBatchSize);
+            sweeperProperties.setMaxPagesPerTick(originalMaxPages);
+        }
     }
 
     @Test

@@ -592,6 +592,7 @@ public class ReservationService {
             }
 
             compensateRedisHold(eventId, seatIds, reservationId, correlationId);
+            healSoldSeatsInRedisSafely(eventId, seatIds, reservationId, correlationId);
         } finally {
             if (interrupted) {
                 Thread.currentThread().interrupt();
@@ -609,6 +610,25 @@ public class ReservationService {
         } catch (Throwable releaseEx) {
             log.error("Failed to release Redis seat hold during compensation for reservationId={}, eventId={}, correlationId={}; relying on 660s Redis safety-net TTL",
                     reservationId, eventId, correlationId, releaseEx);
+        } finally {
+            if (interrupted) {
+                Thread.currentThread().interrupt();
+            }
+        }
+    }
+
+    private void healSoldSeatsInRedisSafely(UUID eventId, List<UUID> seatIds, UUID reservationId, String correlationId) {
+        boolean interrupted = Thread.interrupted();
+        try {
+            List<UUID> soldSeatIds = seatRepository.findSoldSeatIdsByEventIdAndSeatIds(eventId, seatIds);
+            if (!soldSeatIds.isEmpty()) {
+                redisSeatGate.confirm(eventId, soldSeatIds, reservationId);
+                log.info("Healed {} SOLD seats in Redis: eventId={}, seatIds={}, correlationId={}",
+                        soldSeatIds.size(), eventId, soldSeatIds, correlationId);
+            }
+        } catch (Throwable ex) {
+            log.warn("Failed to heal SOLD seats in Redis: eventId={}, correlationId={}",
+                    eventId, correlationId, ex);
         } finally {
             if (interrupted) {
                 Thread.currentThread().interrupt();

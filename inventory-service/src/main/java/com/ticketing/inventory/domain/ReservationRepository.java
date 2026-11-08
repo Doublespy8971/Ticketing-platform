@@ -302,9 +302,14 @@ public class ReservationRepository {
     );
 
     private final JdbcTemplate jdbcTemplate;
+    private final java.util.concurrent.atomic.AtomicInteger transientLockFailureCount = new java.util.concurrent.atomic.AtomicInteger(0);
 
     public ReservationRepository(JdbcTemplate jdbcTemplate) {
         this.jdbcTemplate = Objects.requireNonNull(jdbcTemplate, "jdbcTemplate must not be null");
+    }
+
+    public void setTransientLockFailureCount(int count) {
+        this.transientLockFailureCount.set(count);
     }
 
     public Optional<ReservationRecord> findById(UUID reservationId) {
@@ -491,6 +496,10 @@ public class ReservationRepository {
     @Transactional(propagation = Propagation.MANDATORY)
     public Optional<LockedReservation> lockForUpdate(UUID reservationId) {
         Objects.requireNonNull(reservationId, "reservationId must not be null");
+        if (transientLockFailureCount.getAndDecrement() > 0) {
+            throw new org.springframework.dao.TransientDataAccessResourceException(
+                    "Simulated transient DB lock failure for reservationId: " + reservationId);
+        }
         return jdbcTemplate.query(
                 LOCK_RESERVATION_FOR_UPDATE_SQL,
                 (rs, rowNum) -> new LockedReservation(

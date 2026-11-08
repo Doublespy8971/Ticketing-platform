@@ -901,7 +901,8 @@ class ReservationControllerIntegrationTest {
                                 .andExpect(jsonPath("$.status", is(409)))
                                 .andExpect(jsonPath("$.errorCode", is("SEAT_ALREADY_TAKEN")));
 
-                assertThat(stringRedisTemplate.opsForValue().get(RedisKeys.seatKey(eventId, soldSeatInPg))).isNull();
+                assertThat(stringRedisTemplate.opsForValue().get(RedisKeys.seatKey(eventId, soldSeatInPg)))
+                                .isEqualTo(RedisKeys.SOLD_MARKER);
 
                 // 2. Requesting heldSeatInPg: passes Redis hold, rejected by PostgreSQL
                 // idx_reservation_items_active_seat

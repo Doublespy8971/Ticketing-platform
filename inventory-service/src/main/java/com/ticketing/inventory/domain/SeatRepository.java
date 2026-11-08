@@ -101,6 +101,12 @@ public class SeatRepository {
             WHERE event_id = ? AND status = 'SOLD'
             """;
 
+    private static final String SELECT_SOLD_SEAT_IDS_BY_EVENT_AND_IDS_SQL = """
+            SELECT seat_id
+            FROM seats
+            WHERE event_id = ? AND status = 'SOLD' AND seat_id = ANY(?)
+            """;
+
     private static final String SELECT_SOLD_SEATS_PAGE_FIRST_SQL = """
             SELECT event_id, seat_id
             FROM seats
@@ -266,6 +272,22 @@ public class SeatRepository {
                 (rs, rowNum) -> rs.getObject("seat_id", UUID.class),
                 eventId
         );
+    }
+
+    public List<UUID> findSoldSeatIdsByEventIdAndSeatIds(UUID eventId, Collection<UUID> seatIds) {
+        Objects.requireNonNull(eventId, "eventId must not be null");
+        Objects.requireNonNull(seatIds, "seatIds must not be null");
+        if (seatIds.isEmpty()) {
+            return List.of();
+        }
+        UUID[] idArray = seatIds.toArray(new UUID[0]);
+        return jdbcTemplate.query(con -> {
+            PreparedStatement ps = con.prepareStatement(SELECT_SOLD_SEAT_IDS_BY_EVENT_AND_IDS_SQL);
+            ps.setObject(1, eventId, Types.OTHER);
+            Array sqlArray = con.createArrayOf("uuid", idArray);
+            ps.setArray(2, sqlArray);
+            return ps;
+        }, (rs, rowNum) -> rs.getObject("seat_id", UUID.class));
     }
 
     public List<SoldSeat> findSoldSeatsByEventIdKeyset(UUID eventId, UUID afterSeatId, int limit) {

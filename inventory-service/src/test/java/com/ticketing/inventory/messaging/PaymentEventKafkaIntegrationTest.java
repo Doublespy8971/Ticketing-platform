@@ -90,12 +90,14 @@ import java.util.Map;
 import java.util.Optional;
 import java.util.Set;
 import java.util.UUID;
+import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.CyclicBarrier;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.Future;
 import java.util.concurrent.TimeUnit;
 import java.util.function.Predicate;
+import org.slf4j.MDC;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.mockito.ArgumentMatchers.any;
@@ -250,6 +252,10 @@ class PaymentEventKafkaIntegrationTest {
         staticOutboxPoller = this.outboxPoller;
         Mockito.reset(redisSeatGate);
         paymentEventService.setRedisConfirmRetryPauseMs(50L);
+        paymentEventService.setAfterReservationLockHook(null);
+        expirySweeper.setAfterReservationLockHook(null);
+        reservationRepository.setTransientLockFailureCount(0);
+        MDC.remove(CorrelationConstants.MDC_KEY);
 
         Flyway.configure()
                 .dataSource(dataSource)
@@ -272,6 +278,10 @@ class PaymentEventKafkaIntegrationTest {
     void tearDown() {
         Mockito.reset(redisSeatGate);
         paymentEventService.setRedisConfirmRetryPauseMs(50L);
+        paymentEventService.setAfterReservationLockHook(null);
+        expirySweeper.setAfterReservationLockHook(null);
+        reservationRepository.setTransientLockFailureCount(0);
+        MDC.remove(CorrelationConstants.MDC_KEY);
     }
 
     // =========================================================================
@@ -705,12 +715,11 @@ class PaymentEventKafkaIntegrationTest {
         assertThat(dlt1.value()).contains(missingRes1.toString());
         assertThat(dlt2.value()).contains(missingRes2.toString());
 
-        List<ConsumerRecord<String, String>> retryRecords = pollRecordsSince(
+        assertNoNewRecordsMatching(
                 PAYMENT_RETRY_0_TOPIC,
                 retry0Offsets,
                 rec -> missingRes1.toString().equals(rec.key()) || missingRes2.toString().equals(rec.key())
         );
-        assertThat(retryRecords).isEmpty();
     }
 
     // =========================================================================
@@ -735,12 +744,11 @@ class PaymentEventKafkaIntegrationTest {
         );
         assertThat(dltRecord.value()).isEqualTo(malformedJson);
 
-        List<ConsumerRecord<String, String>> retryRecords = pollRecordsSince(
+        assertNoNewRecordsMatching(
                 PAYMENT_RETRY_0_TOPIC,
                 retry0Offsets,
                 rec -> key.equals(rec.key())
         );
-        assertThat(retryRecords).isEmpty();
     }
 
     // =========================================================================
@@ -781,12 +789,11 @@ class PaymentEventKafkaIntegrationTest {
         );
         assertThat(processed).isEqualTo(1);
 
-        List<ConsumerRecord<String, String>> dltRecords = pollRecordsSince(
+        assertNoNewRecordsMatching(
                 PAYMENT_DLT_TOPIC,
                 dltOffsets,
                 rec -> key.equals(rec.key())
         );
-        assertThat(dltRecords).isEmpty();
     }
 
     // =========================================================================
@@ -919,6 +926,463 @@ class PaymentEventKafkaIntegrationTest {
             }
         } finally {
             pool.shutdownNow();
+        }
+    }
+
+    // =========================================================================
+    // 14. payment.succeeded for overdue HELD reservation when sweeper not running confirms it
+    // =========================================================================
+
+    @Test
+    void paymentSucceededForOverdueHeldReservationWhenSweeperNotRunning_confirmsDbAndRedis() throws Exception {
+        UUID eventId = insertOnSaleEvent("Bruce Springsteen Tour");
+        UUID seat1 = insertSeat(eventId, "H", "1", "1", 25000L, "AVAILABLE");
+        UUID userId = UUID.randomUUID();
+
+        ReservationResponse hold = createHoldViaHttp(eventId, userId, List.of(seat1), UUID.randomUUID().toString());
+        UUID reservationId = hold.reservationId();
+
+        // Make the reservation overdue in PostgreSQL
+        jdbcTemplate.update(
+                "UPDATE reservations SET created_at = clock_timestamp() - INTERVAL '1 hour', expires_at = clock_timestamp() - INTERVAL '15 seconds' WHERE reservation_id = ?",
+                reservationId
+        );
+
+        Map<TopicPartition, Long> inventoryOffsets = currentEndOffsets(Topics.INVENTORY_EVENTS);
+        UUID paymentEventId = UUID.randomUUID();
+        UUID paymentId = UUID.randomUUID();
+        String correlationId = UUID.randomUUID().toString();
+
+        publishPaymentSucceeded(paymentEventId, paymentId, reservationId, userId, 25000L, correlationId);
+
+        ConsumerRecord<String, String> confirmedRecord = awaitSingleRecord(
+                Topics.INVENTORY_EVENTS,
+                inventoryOffsets,
+                rec -> reservationId.toString().equals(rec.key())
+                        && rec.value().contains(EventTypes.INVENTORY_SEAT_CONFIRMED),
+                TIMEOUT
+        );
+        assertThat(confirmedRecord).isNotNull();
+
+        ReservationRecord res = reservationRepository.findById(reservationId).orElseThrow();
+        assertThat(res.status()).isEqualTo("CONFIRMED");
+        assertThat(res.confirmedAt()).isNotNull();
+
+        SeatRecord seat = seatRepository.findById(seat1).orElseThrow();
+        assertThat(seat.status()).isEqualTo("SOLD");
+        assertThat(seat.version()).isEqualTo(2L);
+
+        awaitCondition(TIMEOUT, () -> {
+            String val = stringRedisTemplate.opsForValue().get(RedisKeys.seatKey(eventId, seat1));
+            Long ttl = stringRedisTemplate.getExpire(RedisKeys.seatKey(eventId, seat1));
+            return RedisKeys.SOLD_MARKER.equals(val) && Long.valueOf(-1L).equals(ttl);
+        });
+
+        assertThat(countOutboxEvents(reservationId, EventTypes.INVENTORY_SEAT_CONFIRMED)).isEqualTo(1);
+    }
+
+    // =========================================================================
+    // 15. Transient DataAccessException on repository lock retries via retry-0 and succeeds
+    // =========================================================================
+
+    @Test
+    void transientDataAccessExceptionOnFirstDelivery_retriesThroughRetry0AndSucceeds() throws Exception {
+        UUID eventId = insertOnSaleEvent("Pink Floyd Experience");
+        UUID seat1 = insertSeat(eventId, "I", "2", "3", 19000L, "AVAILABLE");
+        UUID userId = UUID.randomUUID();
+
+        ReservationResponse hold = createHoldViaHttp(eventId, userId, List.of(seat1), UUID.randomUUID().toString());
+        UUID reservationId = hold.reservationId();
+
+        Map<TopicPartition, Long> retry0Offsets = currentEndOffsets(PAYMENT_RETRY_0_TOPIC);
+        Map<TopicPartition, Long> inventoryOffsets = currentEndOffsets(Topics.INVENTORY_EVENTS);
+
+        UUID paymentEventId = UUID.randomUUID();
+        UUID paymentId = UUID.randomUUID();
+        String correlationId = UUID.randomUUID().toString();
+
+        // Cause the first repository lock call to throw a transient DataAccessException
+        reservationRepository.setTransientLockFailureCount(1);
+
+        publishPaymentSucceeded(paymentEventId, paymentId, reservationId, userId, 19000L, correlationId);
+
+        // Await delivery into payment retry-0 topic
+        ConsumerRecord<String, String> retryRecord = awaitSingleRecord(
+                PAYMENT_RETRY_0_TOPIC,
+                retry0Offsets,
+                rec -> reservationId.toString().equals(rec.key()),
+                TIMEOUT
+        );
+        assertThat(retryRecord).isNotNull();
+
+        // Await successful confirmation on inventory.events
+        ConsumerRecord<String, String> confirmedRecord = awaitSingleRecord(
+                Topics.INVENTORY_EVENTS,
+                inventoryOffsets,
+                rec -> reservationId.toString().equals(rec.key())
+                        && rec.value().contains(EventTypes.INVENTORY_SEAT_CONFIRMED),
+                TIMEOUT
+        );
+        assertThat(confirmedRecord).isNotNull();
+
+        Integer processedCount = jdbcTemplate.queryForObject(
+                "SELECT COUNT(*) FROM processed_events WHERE event_id = ? AND consumer_group = ?",
+                Integer.class,
+                paymentEventId,
+                PaymentEventService.CONSUMER_GROUP
+        );
+        assertThat(processedCount).isEqualTo(1);
+        assertThat(countOutboxEvents(reservationId, EventTypes.INVENTORY_SEAT_CONFIRMED)).isEqualTo(1);
+        assertThat(reservationRepository.findById(reservationId).orElseThrow().status()).isEqualTo("CONFIRMED");
+    }
+
+    // =========================================================================
+    // 16. Deterministic lock ordering between payment.succeeded and ExpirySweeper
+    // =========================================================================
+
+    @Test
+    void deterministicLockOrderingBetweenPaymentSucceededAndExpirySweeper_forcesBothOutcomes() throws Exception {
+        UUID eventId = insertOnSaleEvent("Hans Zimmer Live");
+        UUID userId = UUID.randomUUID();
+        ExecutorService pool = Executors.newFixedThreadPool(2);
+
+        try {
+            // -------------------------------------------------------------------------
+            // Ordering 1: Payment lock first -> Confirm wins, sweeper gets SKIP LOCKED false
+            // -------------------------------------------------------------------------
+            UUID seat1 = insertSeat(eventId, "K", "1", "1", 16000L, "AVAILABLE");
+            ReservationResponse hold1 = createHoldViaHttp(eventId, userId, List.of(seat1), UUID.randomUUID().toString());
+            UUID res1 = hold1.reservationId();
+            jdbcTemplate.update(
+                    "UPDATE reservations SET created_at = clock_timestamp() - INTERVAL '1 hour', expires_at = clock_timestamp() - INTERVAL '10 seconds' WHERE reservation_id = ?",
+                    res1
+            );
+
+            UUID payEvent1 = UUID.randomUUID();
+            UUID payId1 = UUID.randomUUID();
+            String payJson1 = objectMapper.writeValueAsString(new EventEnvelope<>(
+                    payEvent1,
+                    EventTypes.PAYMENT_SUCCEEDED,
+                    Instant.now().truncatedTo(ChronoUnit.MICROS),
+                    UUID.randomUUID().toString(),
+                    1,
+                    new PaymentSucceededPayload(payId1, res1, res1, userId, 16000L, "USD", "pi_det_1", Instant.now().truncatedTo(ChronoUnit.MICROS))
+            ));
+
+            CountDownLatch pay1LockAcquired = new CountDownLatch(1);
+            CountDownLatch sweeper1Attempted = new CountDownLatch(1);
+
+            paymentEventService.setAfterReservationLockHook(() -> {
+                pay1LockAcquired.countDown();
+                try {
+                    sweeper1Attempted.await(5, TimeUnit.SECONDS);
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                }
+            });
+
+            Future<Boolean> payFuture1 = pool.submit(() -> paymentEventService.handlePaymentEventRecord(payJson1));
+            assertThat(pay1LockAcquired.await(5, TimeUnit.SECONDS)).isTrue();
+
+            boolean sweeperResult1 = expirySweeper.expireReservation(res1);
+            sweeper1Attempted.countDown();
+            boolean payResult1 = payFuture1.get(5, TimeUnit.SECONDS);
+
+            assertThat(sweeperResult1).isFalse();
+            assertThat(payResult1).isTrue();
+
+            ReservationRecord r1 = reservationRepository.findById(res1).orElseThrow();
+            assertThat(r1.status()).isEqualTo("CONFIRMED");
+            assertThat(seatRepository.findById(seat1).orElseThrow().status()).isEqualTo("SOLD");
+            awaitCondition(TIMEOUT, () -> RedisKeys.SOLD_MARKER.equals(
+                    stringRedisTemplate.opsForValue().get(RedisKeys.seatKey(eventId, seat1))));
+            assertThat(countOutboxEvents(res1, EventTypes.INVENTORY_SEAT_CONFIRMED)).isEqualTo(1);
+            assertThat(countOutboxEvents(res1, EventTypes.INVENTORY_RESERVATION_EXPIRED)).isZero();
+            assertThat(countOutboxEvents(res1, EventTypes.INVENTORY_SEAT_CONFIRMATION_REJECTED)).isZero();
+
+            // -------------------------------------------------------------------------
+            // Ordering 2: Sweeper lock first -> Sweeper wins, payment blocks and emits confirmation_rejected
+            // -------------------------------------------------------------------------
+            paymentEventService.setAfterReservationLockHook(null);
+            expirySweeper.setAfterReservationLockHook(null);
+
+            UUID seat2 = insertSeat(eventId, "K", "1", "2", 16000L, "AVAILABLE");
+            ReservationResponse hold2 = createHoldViaHttp(eventId, userId, List.of(seat2), UUID.randomUUID().toString());
+            UUID res2 = hold2.reservationId();
+            jdbcTemplate.update(
+                    "UPDATE reservations SET created_at = clock_timestamp() - INTERVAL '1 hour', expires_at = clock_timestamp() - INTERVAL '10 seconds' WHERE reservation_id = ?",
+                    res2
+            );
+
+            UUID payEvent2 = UUID.randomUUID();
+            UUID payId2 = UUID.randomUUID();
+            String payJson2 = objectMapper.writeValueAsString(new EventEnvelope<>(
+                    payEvent2,
+                    EventTypes.PAYMENT_SUCCEEDED,
+                    Instant.now().truncatedTo(ChronoUnit.MICROS),
+                    UUID.randomUUID().toString(),
+                    1,
+                    new PaymentSucceededPayload(payId2, res2, res2, userId, 16000L, "USD", "pi_det_2", Instant.now().truncatedTo(ChronoUnit.MICROS))
+            ));
+
+            CountDownLatch sweeper2LockAcquired = new CountDownLatch(1);
+            CountDownLatch pay2Started = new CountDownLatch(1);
+
+            expirySweeper.setAfterReservationLockHook(() -> {
+                sweeper2LockAcquired.countDown();
+                try {
+                    pay2Started.await(5, TimeUnit.SECONDS);
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                }
+            });
+
+            Future<Boolean> sweeperFuture2 = pool.submit(() -> expirySweeper.expireReservation(res2));
+            assertThat(sweeper2LockAcquired.await(5, TimeUnit.SECONDS)).isTrue();
+
+            Future<Boolean> payFuture2 = pool.submit(() -> paymentEventService.handlePaymentEventRecord(payJson2));
+            pay2Started.countDown();
+
+            boolean sweeperResult2 = sweeperFuture2.get(5, TimeUnit.SECONDS);
+            boolean payResult2 = payFuture2.get(5, TimeUnit.SECONDS);
+
+            assertThat(sweeperResult2).isTrue();
+            assertThat(payResult2).isTrue();
+
+            ReservationRecord r2 = reservationRepository.findById(res2).orElseThrow();
+            assertThat(r2.status()).isEqualTo("EXPIRED");
+            assertThat(seatRepository.findById(seat2).orElseThrow().status()).isEqualTo("AVAILABLE");
+            assertThat(stringRedisTemplate.hasKey(RedisKeys.seatKey(eventId, seat2))).isFalse();
+            assertThat(countOutboxEvents(res2, EventTypes.INVENTORY_RESERVATION_EXPIRED)).isEqualTo(1);
+            assertThat(countOutboxEvents(res2, EventTypes.INVENTORY_SEAT_CONFIRMATION_REJECTED)).isEqualTo(1);
+            assertThat(countOutboxEvents(res2, EventTypes.INVENTORY_SEAT_CONFIRMED)).isZero();
+        } finally {
+            paymentEventService.setAfterReservationLockHook(null);
+            expirySweeper.setAfterReservationLockHook(null);
+            pool.shutdownNow();
+        }
+    }
+
+    // =========================================================================
+    // 17. Duplicate and new payment.failed on RELEASED reservation
+    // =========================================================================
+
+    @Test
+    void duplicatePaymentFailedAndNewPaymentFailedOnReleasedReservation_incrementsMetricsAndLeavesOneReleasedEvent() throws Exception {
+        UUID eventId = insertOnSaleEvent("Rolling Stones Hackney Diamonds");
+        UUID seat1 = insertSeat(eventId, "L", "1", "1", 22000L, "AVAILABLE");
+        UUID userId = UUID.randomUUID();
+
+        ReservationResponse hold = createHoldViaHttp(eventId, userId, List.of(seat1), UUID.randomUUID().toString());
+        UUID reservationId = hold.reservationId();
+
+        Map<TopicPartition, Long> inventoryOffsets = currentEndOffsets(Topics.INVENTORY_EVENTS);
+        UUID paymentEventId1 = UUID.randomUUID();
+        UUID paymentId = UUID.randomUUID();
+
+        publishPaymentFailed(paymentEventId1, paymentId, reservationId, userId, 22000L, UUID.randomUUID().toString());
+
+        awaitSingleRecord(
+                Topics.INVENTORY_EVENTS,
+                inventoryOffsets,
+                rec -> reservationId.toString().equals(rec.key())
+                        && rec.value().contains(EventTypes.INVENTORY_SEAT_RELEASED),
+                TIMEOUT
+        );
+        assertThat(reservationRepository.findById(reservationId).orElseThrow().status()).isEqualTo("RELEASED");
+        assertThat(countOutboxEvents(reservationId, EventTypes.INVENTORY_SEAT_RELEASED)).isEqualTo(1);
+
+        double duplicateBefore = counterValue("consumer_events_duplicate_total",
+                "consumer_group", PaymentEventService.CONSUMER_GROUP,
+                "event_type", EventTypes.PAYMENT_FAILED);
+        double noopBefore = counterValue(PaymentEventService.METRIC_PAYMENT_EVENTS_HANDLED,
+                "event_type", EventTypes.PAYMENT_FAILED,
+                "outcome", PaymentEventService.OUTCOME_NOOP);
+
+        // 1. Duplicate payment.failed with SAME eventId
+        publishPaymentFailed(paymentEventId1, paymentId, reservationId, userId, 22000L, UUID.randomUUID().toString());
+        awaitCondition(TIMEOUT, () -> counterValue("consumer_events_duplicate_total",
+                "consumer_group", PaymentEventService.CONSUMER_GROUP,
+                "event_type", EventTypes.PAYMENT_FAILED) >= duplicateBefore + 1.0);
+
+        // 2. Second payment.failed with NEW eventId on already RELEASED reservation
+        UUID paymentEventId2 = UUID.randomUUID();
+        publishPaymentFailed(paymentEventId2, UUID.randomUUID(), reservationId, userId, 22000L, UUID.randomUUID().toString());
+        awaitCondition(TIMEOUT, () -> counterValue(PaymentEventService.METRIC_PAYMENT_EVENTS_HANDLED,
+                "event_type", EventTypes.PAYMENT_FAILED,
+                "outcome", PaymentEventService.OUTCOME_NOOP) >= noopBefore + 1.0);
+
+        assertThat(countOutboxEvents(reservationId, EventTypes.INVENTORY_SEAT_RELEASED)).isEqualTo(1);
+        assertThat(reservationRepository.findById(reservationId).orElseThrow().status()).isEqualTo("RELEASED");
+    }
+
+    // =========================================================================
+    // 18. Hold request for SOLD seat missing from Redis rejected with 409 and healed to SOLD
+    // =========================================================================
+
+    @Test
+    void holdRequestForSoldSeatMissingFromRedis_rejectedWith409AndHealedToSoldInRedis() throws Exception {
+        UUID eventId = insertOnSaleEvent("Billie Eilish Tour");
+        UUID seat1 = insertSeat(eventId, "M", "1", "1", 17000L, "AVAILABLE");
+        UUID userId = UUID.randomUUID();
+
+        // Mark seat SOLD in PostgreSQL
+        jdbcTemplate.update("UPDATE seats SET status = 'SOLD', version = version + 1 WHERE seat_id = ?", seat1);
+
+        // Ensure key is deleted from Redis
+        stringRedisTemplate.delete(RedisKeys.seatKey(eventId, seat1));
+
+        // Submit hold request via HTTP -> must fail with 409
+        CreateReservationRequest req = new CreateReservationRequest(eventId, List.of(seat1));
+        mockMvc.perform(post("/api/v1/reservations")
+                        .header("Idempotency-Key", UUID.randomUUID().toString())
+                        .header(CorrelationConstants.USER_ID_HEADER, userId.toString())
+                        .header("X-User-Roles", "USER")
+                        .header(CorrelationConstants.HTTP_HEADER, UUID.randomUUID().toString())
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content(objectMapper.writeValueAsString(req)))
+                .andExpect(status().isConflict());
+
+        // Assert Redis key was healed to SOLD with TTL -1
+        awaitCondition(TIMEOUT, () -> {
+            String val = stringRedisTemplate.opsForValue().get(RedisKeys.seatKey(eventId, seat1));
+            Long ttl = stringRedisTemplate.getExpire(RedisKeys.seatKey(eventId, seat1));
+            return RedisKeys.SOLD_MARKER.equals(val) && Long.valueOf(-1L).equals(ttl);
+        });
+    }
+
+    // =========================================================================
+    // 19. Transient Redis failure during post-commit release of payment.failed retries and deletes key
+    // =========================================================================
+
+    @Test
+    void transientRedisFailureDuringPostCommitReleaseOfPaymentFailed_retriesAndDeletesKey() throws Exception {
+        UUID eventId = insertOnSaleEvent("Depeche Mode Memento Mori");
+        UUID seat1 = insertSeat(eventId, "N", "1", "1", 13000L, "AVAILABLE");
+        UUID userId = UUID.randomUUID();
+
+        ReservationResponse hold = createHoldViaHttp(eventId, userId, List.of(seat1), UUID.randomUUID().toString());
+        UUID reservationId = hold.reservationId();
+
+        // Assert hold key exists in Redis
+        assertThat(stringRedisTemplate.opsForValue().get(RedisKeys.seatKey(eventId, seat1))).isEqualTo(reservationId.toString());
+
+        java.util.concurrent.atomic.AtomicInteger releaseAttempts = new java.util.concurrent.atomic.AtomicInteger(0);
+        Mockito.doAnswer(inv -> {
+            if (releaseAttempts.getAndIncrement() == 0) {
+                throw new RedisUnavailableException("Simulated transient Redis failure during release");
+            }
+            return inv.callRealMethod();
+        }).when(redisSeatGate).release(any(), any(), any());
+
+        paymentEventService.setRedisConfirmRetryPauseMs(10L);
+        double failuresBefore = counterValue(PaymentEventService.METRIC_REDIS_RELEASE_FAILURES);
+
+        publishPaymentFailed(UUID.randomUUID(), UUID.randomUUID(), reservationId, userId, 13000L, UUID.randomUUID().toString());
+
+        awaitCondition(TIMEOUT, () -> Boolean.FALSE.equals(stringRedisTemplate.hasKey(RedisKeys.seatKey(eventId, seat1))));
+        assertThat(reservationRepository.findById(reservationId).orElseThrow().status()).isEqualTo("RELEASED");
+        assertThat(releaseAttempts.get()).isGreaterThanOrEqualTo(2);
+        assertThat(counterValue(PaymentEventService.METRIC_REDIS_RELEASE_FAILURES)).isEqualTo(failuresBefore);
+    }
+
+    // =========================================================================
+    // 20. Envelope with non-UUID correlationId ends in dead-letter topic
+    // =========================================================================
+
+    @Test
+    void envelopeWithNonUuidCorrelationId_endsInDeadLetterTopic() throws Exception {
+        UUID eventId = insertOnSaleEvent("The Weeknd After Hours");
+        UUID seat1 = insertSeat(eventId, "O", "1", "1", 14000L, "AVAILABLE");
+        ReservationResponse hold = createHoldViaHttp(eventId, UUID.randomUUID(), List.of(seat1), UUID.randomUUID().toString());
+        UUID reservationId = hold.reservationId();
+
+        String nonUuidCorrelationId = "non-uuid-correlation-string-12345";
+        String key = reservationId.toString();
+
+        String envelopeJson = objectMapper.writeValueAsString(Map.of(
+                "eventId", UUID.randomUUID().toString(),
+                "eventType", EventTypes.PAYMENT_SUCCEEDED,
+                "occurredAt", Instant.now().truncatedTo(ChronoUnit.MICROS).toString(),
+                "correlationId", nonUuidCorrelationId,
+                "schemaVersion", 1,
+                "payload", Map.of(
+                        "paymentId", UUID.randomUUID().toString(),
+                        "reservationId", reservationId.toString(),
+                        "orderId", reservationId.toString(),
+                        "userId", UUID.randomUUID().toString(),
+                        "amountCents", 14000L,
+                        "currency", "USD",
+                        "paymentIntentId", "pi_test",
+                        "paidAt", Instant.now().truncatedTo(ChronoUnit.MICROS).toString()
+                )
+        ));
+
+        Map<TopicPartition, Long> retry0Offsets = currentEndOffsets(PAYMENT_RETRY_0_TOPIC);
+        Map<TopicPartition, Long> dltOffsets = currentEndOffsets(PAYMENT_DLT_TOPIC);
+
+        testProducer.send(new ProducerRecord<>(Topics.PAYMENT_EVENTS, key, envelopeJson)).get(5, TimeUnit.SECONDS);
+
+        ConsumerRecord<String, String> dltRecord = awaitSingleRecord(
+                PAYMENT_DLT_TOPIC,
+                dltOffsets,
+                rec -> key.equals(rec.key()),
+                TIMEOUT
+        );
+        assertThat(dltRecord.value()).isEqualTo(envelopeJson);
+
+        assertNoNewRecordsMatching(PAYMENT_RETRY_0_TOPIC, retry0Offsets, rec -> key.equals(rec.key()));
+    }
+
+    // =========================================================================
+    // 21. Stale MDC correlationId on thread does not leak into outbox row
+    // =========================================================================
+
+    @Test
+    void staleMdcCorrelationIdOnThread_doesNotLeakIntoOutboxRow() throws Exception {
+        UUID eventId = insertOnSaleEvent("Arctic Monkeys Tour");
+        UUID seat1 = insertSeat(eventId, "P", "1", "1", 15500L, "AVAILABLE");
+        UUID userId = UUID.randomUUID();
+
+        ReservationResponse hold = createHoldViaHttp(eventId, userId, List.of(seat1), UUID.randomUUID().toString());
+        UUID reservationId = hold.reservationId();
+
+        String staleMdc = UUID.randomUUID().toString();
+        String incomingCorrelationId = UUID.randomUUID().toString();
+
+        MDC.put(CorrelationConstants.MDC_KEY, staleMdc);
+        try {
+            String paymentJson = objectMapper.writeValueAsString(new EventEnvelope<>(
+                    UUID.randomUUID(),
+                    EventTypes.PAYMENT_SUCCEEDED,
+                    Instant.now().truncatedTo(ChronoUnit.MICROS),
+                    incomingCorrelationId,
+                    1,
+                    new PaymentSucceededPayload(
+                            UUID.randomUUID(),
+                            reservationId,
+                            reservationId,
+                            userId,
+                            15500L,
+                            "USD",
+                            "pi_mdc_test",
+                            Instant.now().truncatedTo(ChronoUnit.MICROS)
+                    )
+            ));
+
+            boolean processed = paymentEventService.handlePaymentEventRecord(paymentJson);
+            assertThat(processed).isTrue();
+
+            UUID outboxCorrelationId = jdbcTemplate.queryForObject(
+                    "SELECT correlation_id FROM outbox_events WHERE aggregate_id = ? AND event_type = ?",
+                    UUID.class,
+                    reservationId,
+                    EventTypes.INVENTORY_SEAT_CONFIRMED
+            );
+            assertThat(outboxCorrelationId).isEqualTo(UUID.fromString(incomingCorrelationId));
+            assertThat(MDC.get(CorrelationConstants.MDC_KEY)).isEqualTo(staleMdc);
+        } finally {
+            MDC.remove(CorrelationConstants.MDC_KEY);
         }
     }
 
@@ -1091,23 +1555,51 @@ class PaymentEventKafkaIntegrationTest {
         throw new AssertionError("Timed out after " + timeout + " waiting for matching record on topic " + topic);
     }
 
-    private List<ConsumerRecord<String, String>> pollRecordsSince(String topic,
-                                                                  Map<TopicPartition, Long> startOffsets,
-                                                                  Predicate<ConsumerRecord<String, String>> filter) {
+    private void assertNoNewRecordsMatching(String topic,
+                                            Map<TopicPartition, Long> startOffsets,
+                                            Predicate<ConsumerRecord<String, String>> filter) {
+        Map<TopicPartition, Long> currentEnds = currentEndOffsets(topic);
+        boolean anyDifferent = false;
+        for (Map.Entry<TopicPartition, Long> entry : currentEnds.entrySet()) {
+            Long start = startOffsets.get(entry.getKey());
+            if (start != null && entry.getValue() > start) {
+                anyDifferent = true;
+                break;
+            }
+        }
+        if (!anyDifferent) {
+            return;
+        }
+
         List<ConsumerRecord<String, String>> matched = new ArrayList<>();
         try (KafkaConsumer<String, String> consumer = newTestConsumer()) {
             consumer.assign(startOffsets.keySet());
             for (Map.Entry<TopicPartition, Long> entry : startOffsets.entrySet()) {
                 consumer.seek(entry.getKey(), entry.getValue());
             }
-            ConsumerRecords<String, String> records = consumer.poll(Duration.ofMillis(300));
-            for (ConsumerRecord<String, String> record : records) {
-                if (filter.test(record)) {
-                    matched.add(record);
+
+            long deadline = System.nanoTime() + TIMEOUT.toNanos();
+            while (System.nanoTime() < deadline) {
+                boolean allCaughtUp = true;
+                for (Map.Entry<TopicPartition, Long> entry : currentEnds.entrySet()) {
+                    long currentPosition = consumer.position(entry.getKey());
+                    if (currentPosition < entry.getValue()) {
+                        allCaughtUp = false;
+                        break;
+                    }
+                }
+                ConsumerRecords<String, String> records = consumer.poll(Duration.ofMillis(100));
+                for (ConsumerRecord<String, String> record : records) {
+                    if (filter.test(record)) {
+                        matched.add(record);
+                    }
+                }
+                if (allCaughtUp) {
+                    break;
                 }
             }
         }
-        return matched;
+        assertThat(matched).as("Expected no matching records on topic " + topic).isEmpty();
     }
 
     private KafkaConsumer<String, String> newTestConsumer() {

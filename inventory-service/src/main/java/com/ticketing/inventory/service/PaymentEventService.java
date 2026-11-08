@@ -34,6 +34,7 @@ import java.util.List;
 import java.util.Objects;
 import java.util.Optional;
 import java.util.UUID;
+import java.util.concurrent.TimeUnit;
 
 /**
  * Handles events consumed from {@code payment.events} inside {@link IdempotentEventProcessor}'s
@@ -48,6 +49,7 @@ public class PaymentEventService {
 
     public static final String METRIC_PAYMENT_EVENTS_HANDLED = "inventory_payment_events_handled_total";
     public static final String METRIC_REDIS_CONFIRM_FAILURES = "inventory_redis_confirm_failures_total";
+    public static final String METRIC_REDIS_RELEASE_FAILURES = "inventory_redis_release_failures_total";
 
     public static final String OUTCOME_CONFIRMED = "confirmed";
     public static final String OUTCOME_REJECTED = "rejected";
@@ -61,6 +63,7 @@ public class PaymentEventService {
 
     private static final int REDIS_CONFIRM_MAX_RETRIES = 3;
     private static final long DEFAULT_REDIS_CONFIRM_RETRY_PAUSE_MS = 50L;
+    private static final long POST_COMMIT_REDIS_BUDGET_MS = 1000L;
 
     private final IdempotentEventProcessor idempotentEventProcessor;
     private final ReservationRepository reservationRepository;
@@ -69,8 +72,10 @@ public class PaymentEventService {
     private final ObjectMapper objectMapper;
     private final MeterRegistry meterRegistry;
     private final Counter redisConfirmFailuresCounter;
+    private final Counter redisReleaseFailuresCounter;
 
     private volatile long redisConfirmRetryPauseMs = DEFAULT_REDIS_CONFIRM_RETRY_PAUSE_MS;
+    private volatile Runnable afterReservationLockHook;
 
     public PaymentEventService(IdempotentEventProcessor idempotentEventProcessor,
                                ReservationRepository reservationRepository,
@@ -86,6 +91,9 @@ public class PaymentEventService {
         this.meterRegistry = Objects.requireNonNull(meterRegistry, "meterRegistry must not be null");
         this.redisConfirmFailuresCounter = Counter.builder(METRIC_REDIS_CONFIRM_FAILURES)
                 .description("Total Redis confirm failures after retries in inventory-service")
+                .register(meterRegistry);
+        this.redisReleaseFailuresCounter = Counter.builder(METRIC_REDIS_RELEASE_FAILURES)
+                .description("Total Redis release failures after retries in inventory-service")
                 .register(meterRegistry);
 
         preRegisterMeters();
@@ -110,12 +118,8 @@ public class PaymentEventService {
     public boolean handlePaymentEventRecord(String rawJson) {
         EventEnvelope<JsonNode> envelope = parseEnvelope(rawJson);
 
-        String existingMdcCorrelationId = MDC.get(CorrelationConstants.MDC_KEY);
-        boolean setMdc = false;
-        if (existingMdcCorrelationId == null || existingMdcCorrelationId.isBlank()) {
-            MDC.put(CorrelationConstants.MDC_KEY, envelope.correlationId());
-            setMdc = true;
-        }
+        String previousMdcCorrelationId = MDC.get(CorrelationConstants.MDC_KEY);
+        MDC.put(CorrelationConstants.MDC_KEY, envelope.correlationId());
 
         try {
             return idempotentEventProcessor.process(
@@ -125,7 +129,9 @@ public class PaymentEventService {
                     () -> dispatchInsideTransaction(envelope)
             );
         } finally {
-            if (setMdc) {
+            if (previousMdcCorrelationId != null && !previousMdcCorrelationId.isBlank()) {
+                MDC.put(CorrelationConstants.MDC_KEY, previousMdcCorrelationId);
+            } else {
                 MDC.remove(CorrelationConstants.MDC_KEY);
             }
         }
@@ -157,6 +163,11 @@ public class PaymentEventService {
             throw new NonRetryableEventException(
                     "Reservation does not exist for payment.succeeded: reservationId=" + reservationId
                             + ", paymentId=" + paymentId);
+        }
+
+        Runnable lockHook = this.afterReservationLockHook;
+        if (lockHook != null) {
+            lockHook.run();
         }
 
         LockedReservation locked = lockedOpt.get();
@@ -306,14 +317,31 @@ public class PaymentEventService {
                                                 String correlationId) {
         Throwable lastError = null;
         boolean interrupted = Thread.interrupted();
+        long deadlineNanos = System.nanoTime() + TimeUnit.MILLISECONDS.toNanos(POST_COMMIT_REDIS_BUDGET_MS);
         try {
             for (int attempt = 0; attempt <= REDIS_CONFIRM_MAX_RETRIES; attempt++) {
+                if (System.nanoTime() >= deadlineNanos) {
+                    log.warn("Redis confirm time budget ({} ms) spent for reservationId={}, eventId={}",
+                            POST_COMMIT_REDIS_BUDGET_MS, reservationId, eventId);
+                    break;
+                }
                 if (attempt > 0 && redisConfirmRetryPauseMs > 0) {
+                    long remainingMs = TimeUnit.NANOSECONDS.toMillis(deadlineNanos - System.nanoTime());
+                    if (remainingMs <= 0) {
+                        log.warn("Redis confirm time budget ({} ms) spent before retry sleep for reservationId={}, eventId={}",
+                                POST_COMMIT_REDIS_BUDGET_MS, reservationId, eventId);
+                        break;
+                    }
                     try {
-                        Thread.sleep(redisConfirmRetryPauseMs);
+                        Thread.sleep(Math.min(redisConfirmRetryPauseMs, remainingMs));
                     } catch (InterruptedException ie) {
                         interrupted = true;
                     }
+                }
+                if (System.nanoTime() >= deadlineNanos) {
+                    log.warn("Redis confirm time budget ({} ms) spent for reservationId={}, eventId={}",
+                            POST_COMMIT_REDIS_BUDGET_MS, reservationId, eventId);
+                    break;
                 }
                 try {
                     ConfirmOutcome outcome = redisSeatGate.confirm(eventId, seatIds, reservationId);
@@ -327,8 +355,8 @@ public class PaymentEventService {
                 }
             }
             redisConfirmFailuresCounter.increment();
-            log.error("Failed to confirm seats in Redis after {} retries for reservationId={}, eventId={}, seatIds={}, correlationId={}; relying on Redis rewarm / PostgreSQL source of truth",
-                    REDIS_CONFIRM_MAX_RETRIES, reservationId, eventId, seatIds, correlationId, lastError);
+            log.error("Failed to confirm seats in Redis for reservationId={}, eventId={}, seatIds={}, correlationId={}; relying on Redis rewarm / PostgreSQL source of truth",
+                    reservationId, eventId, seatIds, correlationId, lastError);
         } finally {
             if (interrupted) {
                 Thread.currentThread().interrupt();
@@ -340,14 +368,48 @@ public class PaymentEventService {
                                                 List<UUID> seatIds,
                                                 UUID reservationId,
                                                 String correlationId) {
+        Throwable lastError = null;
         boolean interrupted = Thread.interrupted();
+        long deadlineNanos = System.nanoTime() + TimeUnit.MILLISECONDS.toNanos(POST_COMMIT_REDIS_BUDGET_MS);
         try {
-            long releasedCount = redisSeatGate.release(eventId, seatIds, reservationId);
-            log.debug("Released seats in Redis after payment.failed commit: reservationId={}, eventId={}, releasedCount={}, correlationId={}",
-                    reservationId, eventId, releasedCount, correlationId);
-        } catch (Throwable ex) {
-            log.warn("Failed to release Redis seat hold after payment.failed for reservationId={}, eventId={}, correlationId={}; relying on 660s safety-net TTL",
-                    reservationId, eventId, correlationId, ex);
+            for (int attempt = 0; attempt <= REDIS_CONFIRM_MAX_RETRIES; attempt++) {
+                if (System.nanoTime() >= deadlineNanos) {
+                    log.warn("Redis release time budget ({} ms) spent for reservationId={}, eventId={}",
+                            POST_COMMIT_REDIS_BUDGET_MS, reservationId, eventId);
+                    break;
+                }
+                if (attempt > 0 && redisConfirmRetryPauseMs > 0) {
+                    long remainingMs = TimeUnit.NANOSECONDS.toMillis(deadlineNanos - System.nanoTime());
+                    if (remainingMs <= 0) {
+                        log.warn("Redis release time budget ({} ms) spent before retry sleep for reservationId={}, eventId={}",
+                                POST_COMMIT_REDIS_BUDGET_MS, reservationId, eventId);
+                        break;
+                    }
+                    try {
+                        Thread.sleep(Math.min(redisConfirmRetryPauseMs, remainingMs));
+                    } catch (InterruptedException ie) {
+                        interrupted = true;
+                    }
+                }
+                if (System.nanoTime() >= deadlineNanos) {
+                    log.warn("Redis release time budget ({} ms) spent for reservationId={}, eventId={}",
+                            POST_COMMIT_REDIS_BUDGET_MS, reservationId, eventId);
+                    break;
+                }
+                try {
+                    long releasedCount = redisSeatGate.release(eventId, seatIds, reservationId);
+                    log.debug("Released seats in Redis after payment.failed commit: reservationId={}, eventId={}, releasedCount={}, correlationId={}",
+                            reservationId, eventId, releasedCount, correlationId);
+                    return;
+                } catch (Throwable ex) {
+                    lastError = ex;
+                    log.warn("Redis release failed (attempt {}/{}) for reservationId={}, eventId={}, correlationId={}",
+                            attempt + 1, REDIS_CONFIRM_MAX_RETRIES + 1, reservationId, eventId, correlationId, ex);
+                }
+            }
+            redisReleaseFailuresCounter.increment();
+            log.error("Failed to release Redis seat hold after payment.failed for reservationId={}, eventId={}, seatIds={}, correlationId={}; relying on 660s safety-net TTL",
+                    reservationId, eventId, seatIds, correlationId, lastError);
         } finally {
             if (interrupted) {
                 Thread.currentThread().interrupt();
@@ -408,6 +470,11 @@ public class PaymentEventService {
         }
 
         String correlationId = requireText(root, "correlationId");
+        try {
+            UUID.fromString(correlationId);
+        } catch (IllegalArgumentException e) {
+            throw new NonRetryableEventException("Invalid UUID for correlationId: " + correlationId, e);
+        }
 
         JsonNode payloadNode = root.get("payload");
         if (payloadNode == null || payloadNode.isNull() || payloadNode.isMissingNode()) {
@@ -465,6 +532,10 @@ public class PaymentEventService {
 
     public void setRedisConfirmRetryPauseMs(long redisConfirmRetryPauseMs) {
         this.redisConfirmRetryPauseMs = Math.max(0L, redisConfirmRetryPauseMs);
+    }
+
+    public void setAfterReservationLockHook(Runnable afterReservationLockHook) {
+        this.afterReservationLockHook = afterReservationLockHook;
     }
 }
 
