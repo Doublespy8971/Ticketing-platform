@@ -24,8 +24,8 @@ Order lifecycle and saga choreography service for the Ticketing Platform (`port 
 
 ## Metrics
 
-- `order_checkout_requests_total{outcome}`: Total checkout requests tagged by `outcome` (`accepted`, `not_ready`, `expired`, `conflict`, `replay`).
-- `order_checkout_duration_seconds`: Histogram of checkout processing duration.
+- `ticketing_orders_checkout_total{outcome}`: Total checkout requests tagged by `outcome` (`ACCEPTED`, `ORDER_NOT_READY`, `RESERVATION_EXPIRED`, `INVALID_ORDER_STATE`, `REPLAY`).
+- `order_checkout_duration_seconds`: Duration of order checkout processing.
 
 ## Assumptions
 

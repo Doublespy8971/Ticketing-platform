@@ -120,7 +120,7 @@ public class CheckoutService {
                                     + ", but found " + existing.responseStatus());
                 }
                 CheckoutResponse storedResponse = deserializeResponse(existing.responseBody());
-                recordOutcome("replay", System.nanoTime() - startNanos);
+                recordOutcome(CheckoutMetrics.OUTCOME_REPLAY, System.nanoTime() - startNanos);
                 log.info("Idempotent replay for checkout: orderId={}, userId={}, idempotencyKey={}, correlationId={}",
                         orderId, userId, idempotencyKey, correlationId);
                 return new CheckoutExecutionResult(HttpStatus.ACCEPTED.value(), storedResponse, true);
@@ -136,18 +136,13 @@ public class CheckoutService {
                 }
 
                 CheckoutResponse createdResponse = transactionTemplate.execute(status -> {
-                    Runnable txHook = this.inTransactionHook;
-                    if (txHook != null) {
-                        txHook.run();
-                    }
-
-                    // 1. Lock the order and verify DB clock
+                    // 1. Lock the order and verify DB clock (order_id = ? AND user_id = ?)
                     Optional<OrderRepository.OrderCheckoutLockResult> lockResultOpt =
-                            orderRepository.findByIdForCheckout(orderId);
+                            orderRepository.findByIdAndUserIdForCheckout(orderId, userId);
 
                     // Early-checkout race / missing order / mismatched user:
                     // Return 409 ORDER_NOT_READY without leaking whether order exists for another user
-                    if (lockResultOpt.isEmpty() || !lockResultOpt.get().order().userId().equals(userId)) {
+                    if (lockResultOpt.isEmpty()) {
                         log.info("Order not ready or user mismatch: orderId={}, userId={}, correlationId={}",
                                 orderId, userId, correlationId);
                         throw new ConflictException(ErrorCode.ORDER_NOT_READY,
@@ -156,6 +151,11 @@ public class CheckoutService {
 
                     OrderRepository.OrderCheckoutLockResult lockResult = lockResultOpt.get();
                     OrderRecord order = lockResult.order();
+
+                    Runnable txHook = this.inTransactionHook;
+                    if (txHook != null) {
+                        txHook.run();
+                    }
 
                     // 2. Validate order status
                     if (!"RESERVED".equals(order.status())) {
@@ -229,7 +229,7 @@ public class CheckoutService {
                 });
 
                 idempotencyCommitted = true;
-                recordOutcome("accepted", System.nanoTime() - startNanos);
+                recordOutcome(CheckoutMetrics.OUTCOME_ACCEPTED, System.nanoTime() - startNanos);
                 log.info("Order checkout accepted: orderId={}, userId={}, totalAmountCents={}, correlationId={}",
                         orderId, userId, createdResponse.totalAmountCents(), correlationId);
                 return new CheckoutExecutionResult(HttpStatus.ACCEPTED.value(), createdResponse, false);
@@ -241,18 +241,18 @@ public class CheckoutService {
         } catch (ConflictException ex) {
             long duration = System.nanoTime() - startNanos;
             if (ex.errorCode() == ErrorCode.ORDER_NOT_READY) {
-                recordOutcome("not_ready", duration);
+                recordOutcome(CheckoutMetrics.OUTCOME_ORDER_NOT_READY, duration);
             } else if (ex.errorCode() == ErrorCode.RESERVATION_EXPIRED) {
-                recordOutcome("expired", duration);
+                recordOutcome(CheckoutMetrics.OUTCOME_RESERVATION_EXPIRED, duration);
             } else {
-                recordOutcome("conflict", duration);
+                recordOutcome(CheckoutMetrics.OUTCOME_INVALID_ORDER_STATE, duration);
             }
             throw ex;
         } catch (IdempotencyRequestInProgressException | IdempotencyPayloadMismatchException ex) {
-            recordOutcome("conflict", System.nanoTime() - startNanos);
+            recordOutcome(CheckoutMetrics.OUTCOME_INVALID_ORDER_STATE, System.nanoTime() - startNanos);
             throw ex;
         } catch (Exception ex) {
-            recordOutcome("conflict", System.nanoTime() - startNanos);
+            recordOutcome(CheckoutMetrics.OUTCOME_INVALID_ORDER_STATE, System.nanoTime() - startNanos);
             throw ex;
         }
     }
@@ -375,11 +375,14 @@ public class CheckoutService {
 
     private void recordOutcome(String outcome, long durationNanos) {
         if (meterRegistry != null) {
-            Counter.builder("order_checkout_requests_total")
-                    .tag("outcome", outcome)
+            String safeOutcome = CheckoutMetrics.ALLOWED_OUTCOMES.contains(outcome)
+                    ? outcome
+                    : CheckoutMetrics.OUTCOME_INVALID_ORDER_STATE;
+            Counter.builder(CheckoutMetrics.COUNTER_NAME)
+                    .tag(CheckoutMetrics.TAG_OUTCOME, safeOutcome)
                     .register(meterRegistry)
                     .increment();
-            Timer.builder("order_checkout_duration_seconds")
+            Timer.builder(CheckoutMetrics.TIMER_NAME)
                     .register(meterRegistry)
                     .record(durationNanos, TimeUnit.NANOSECONDS);
         }

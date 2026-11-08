@@ -95,7 +95,8 @@ All custom metrics use the `ticketing_` prefix, lowercase `snake_case`, and base
 | `ticketing_redis_lua_duration_seconds` | `Timer` | `service`, `script`, `result` | `gateway-service`, `inventory-service` | Execution duration of Redis Lua scripts. |
 | `ticketing_outbox_unpublished_records` | `Gauge` | `service` | `inventory-service`, `order-service`, `payment-service` | Count of rows in `outbox_events` where `published_at IS NULL`. |
 | `ticketing_outbox_publish_latency_seconds` | `Timer` | `service`, `topic` | `inventory-service`, `order-service`, `payment-service` | Elapsed time between `outbox_events.created_at` and `published_at`. |
-| `ticketing_orders_checkout_total` | `Counter` | `service`, `outcome` (`ACCEPTED`, `ORDER_NOT_READY`, `RESERVATION_EXPIRED`, `INVALID_ORDER_STATE`) | `order-service` | Total checkout attempts partitioned by outcome. |
+| `ticketing_orders_checkout_total` | `Counter` | `service`, `outcome` (`ACCEPTED`, `ORDER_NOT_READY`, `RESERVATION_EXPIRED`, `INVALID_ORDER_STATE`, `REPLAY`) | `order-service` | Total checkout attempts partitioned by outcome. |
+| `order_checkout_duration_seconds` | `Timer` | `service` | `order-service` | Duration of order checkout processing. |
 | `ticketing_orders_materialization_lag_seconds` | `Timer` | `service` | `order-service` | Elapsed time between `inventory.seat.reserved.occurredAt` and `orders` insert in `order_db`. |
 | `ticketing_orders_terminal_total` | `Counter` | `service`, `final_status` | `order-service` | Total orders reaching `CONFIRMED`, `CANCELLED_PAYMENT_FAILED`, `CANCELLED_EXPIRED`, or `CANCELLED_REFUNDED`. |
 | `ticketing_payments_processed_total` | `Counter` | `service`, `status` (`SUCCEEDED`, `FAILED`, `REFUNDED`), `failure_code` | `payment-service` | Total payment charges and compensating refunds processed. |

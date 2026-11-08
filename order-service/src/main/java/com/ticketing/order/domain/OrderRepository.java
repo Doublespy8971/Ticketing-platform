@@ -60,7 +60,7 @@ public class OrderRepository {
             WHERE order_id = ?
             """;
 
-    private static final String SELECT_ORDER_BY_ID_FOR_CHECKOUT_SQL = """
+    private static final String SELECT_ORDER_BY_ID_AND_USER_ID_FOR_CHECKOUT_SQL = """
             SELECT order_id, reservation_id, user_id, event_id, status, total_amount_cents,
                    currency, payment_method_token, payment_id, cancellation_reason, version,
                    reserved_at, expires_at, checkout_at, paid_at, confirmed_at, cancelled_at,
@@ -68,7 +68,7 @@ public class OrderRepository {
                    clock_timestamp() AS db_clock,
                    (expires_at - clock_timestamp() >= INTERVAL '15 seconds') AS grace_buffer_valid
             FROM orders
-            WHERE order_id = ?
+            WHERE order_id = ? AND user_id = ?
             FOR UPDATE
             """;
 
@@ -222,12 +222,14 @@ public class OrderRepository {
     }
 
     @Transactional(propagation = Propagation.MANDATORY)
-    public Optional<OrderCheckoutLockResult> findByIdForCheckout(UUID orderId) {
+    public Optional<OrderCheckoutLockResult> findByIdAndUserIdForCheckout(UUID orderId, UUID userId) {
         Objects.requireNonNull(orderId, "orderId must not be null");
+        Objects.requireNonNull(userId, "userId must not be null");
         List<OrderCheckoutLockResult> results = jdbcTemplate.query(
-                SELECT_ORDER_BY_ID_FOR_CHECKOUT_SQL,
+                SELECT_ORDER_BY_ID_AND_USER_ID_FOR_CHECKOUT_SQL,
                 CHECKOUT_LOCK_MAPPER,
-                orderId
+                orderId,
+                userId
         );
         return results.stream().findFirst();
     }

@@ -15,7 +15,9 @@ import com.ticketing.order.api.dto.CheckoutRequest;
 import com.ticketing.order.domain.OrderItemRecord;
 import com.ticketing.order.domain.OrderRecord;
 import com.ticketing.order.domain.OrderRepository;
+import com.ticketing.order.idempotency.IdempotencyKeyRecord;
 import com.ticketing.order.idempotency.IdempotencyKeyRepository;
+import com.ticketing.order.service.CheckoutMetrics;
 import com.ticketing.order.service.CheckoutService;
 import io.micrometer.core.instrument.Counter;
 import io.micrometer.core.instrument.MeterRegistry;
@@ -42,8 +44,11 @@ import org.testcontainers.junit.jupiter.Testcontainers;
 import org.testcontainers.utility.DockerImageName;
 
 import javax.sql.DataSource;
+import java.nio.charset.StandardCharsets;
+import java.security.MessageDigest;
 import java.time.Instant;
 import java.time.temporal.ChronoUnit;
+import java.util.HexFormat;
 import java.util.List;
 import java.util.UUID;
 import java.util.concurrent.CountDownLatch;
@@ -224,13 +229,13 @@ class CheckoutControllerIntegrationTest {
         assertThat(idempRecord.responseStatus()).isEqualTo(202);
 
         // Verify metrics
-        Counter counter = meterRegistry.find("order_checkout_requests_total")
-                .tag("outcome", "accepted")
+        Counter counter = meterRegistry.find(CheckoutMetrics.COUNTER_NAME)
+                .tag(CheckoutMetrics.TAG_OUTCOME, CheckoutMetrics.OUTCOME_ACCEPTED)
                 .counter();
         assertThat(counter).isNotNull();
         assertThat(counter.count()).isGreaterThanOrEqualTo(1.0);
 
-        Timer timer = meterRegistry.find("order_checkout_duration_seconds").timer();
+        Timer timer = meterRegistry.find(CheckoutMetrics.TIMER_NAME).timer();
         assertThat(timer).isNotNull();
         assertThat(timer.count()).isGreaterThanOrEqualTo(1L);
     }
@@ -314,13 +319,13 @@ class CheckoutControllerIntegrationTest {
     }
 
     @Test
-    @DisplayName("6. Invalid order status (CONFIRMED, CANCELLED) returns 409 INVALID_ORDER_STATE")
+    @DisplayName("6. Invalid order status (CONFIRMED, CANCELLED) returns 409 INVALID_ORDER_STATE even when expires_at is in past")
     void checkoutInvalidOrderStatus() throws Exception {
         UUID orderId1 = UUID.randomUUID();
         UUID orderId2 = UUID.randomUUID();
         UUID userId = UUID.randomUUID();
-        insertOrder(orderId1, userId, "CONFIRMED", Instant.now().plus(600, ChronoUnit.SECONDS));
-        insertOrder(orderId2, userId, "CANCELLED_PAYMENT_FAILED", Instant.now().plus(600, ChronoUnit.SECONDS));
+        insertOrder(orderId1, userId, "CONFIRMED", Instant.now().minus(60, ChronoUnit.SECONDS));
+        insertOrder(orderId2, userId, "CANCELLED_PAYMENT_FAILED", Instant.now().minus(60, ChronoUnit.SECONDS));
 
         CheckoutRequest request = new CheckoutRequest("pm_tok_visa_success");
 
@@ -613,6 +618,10 @@ class CheckoutControllerIntegrationTest {
                             .content(objectMapper.writeValueAsString(request)))
                     .andExpect(status().isAccepted());
 
+            assertThat(listAppender.list).isNotEmpty();
+            assertThat(listAppender.list)
+                    .anyMatch(event -> event.getFormattedMessage().contains("Order checkout accepted"));
+
             // Scan all captured log events
             for (ILoggingEvent event : listAppender.list) {
                 String formatted = event.getFormattedMessage();
@@ -672,6 +681,262 @@ class CheckoutControllerIntegrationTest {
                         .header(CorrelationConstants.USER_ID_HEADER, userId.toString()))
                 .andExpect(status().isNotFound())
                 .andExpect(jsonPath("$.errorCode", is(ErrorCode.RESOURCE_NOT_FOUND.name())));
+    }
+
+    @Test
+    @DisplayName("Thread 1 holds row lock on User A order; Thread 2 checks out as User B, finishes within 500ms without blocking, returns 409 ORDER_NOT_READY")
+    void checkoutUserBDoesNotBlockOnUserALock() throws Exception {
+        UUID orderId = UUID.randomUUID();
+        UUID userA = UUID.randomUUID();
+        UUID userB = UUID.randomUUID();
+        UUID keyA = UUID.randomUUID();
+        UUID keyB = UUID.randomUUID();
+        insertOrder(orderId, userA, "RESERVED", Instant.now().plus(600, ChronoUnit.SECONDS));
+        CheckoutRequest request = new CheckoutRequest("pm_tok_visa_success");
+
+        CountDownLatch t1LockedLatch = new CountDownLatch(1);
+        CountDownLatch t2DoneLatch = new CountDownLatch(1);
+
+        checkoutService.setInTransactionHook(() -> {
+            t1LockedLatch.countDown();
+            try {
+                boolean done = t2DoneLatch.await(5, TimeUnit.SECONDS);
+                if (!done) {
+                    throw new RuntimeException("Timed out waiting for Thread 2");
+                }
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+            }
+        });
+
+        ExecutorService executor = Executors.newSingleThreadExecutor();
+        try {
+            Future<MvcResult> t1Future = executor.submit(() ->
+                    mockMvc.perform(post("/api/v1/orders/{orderId}/checkout", orderId)
+                                    .header(CorrelationConstants.USER_ID_HEADER, userA.toString())
+                                    .header("Idempotency-Key", keyA.toString())
+                                    .contentType(MediaType.APPLICATION_JSON)
+                                    .content(objectMapper.writeValueAsString(request)))
+                            .andReturn()
+            );
+
+            // Wait until Thread 1 has acquired the row lock inside transaction
+            assertThat(t1LockedLatch.await(5, TimeUnit.SECONDS)).isTrue();
+
+            // Thread 2 checks out the same order as User B
+            long start = System.currentTimeMillis();
+            mockMvc.perform(post("/api/v1/orders/{orderId}/checkout", orderId)
+                            .header(CorrelationConstants.USER_ID_HEADER, userB.toString())
+                            .header("Idempotency-Key", keyB.toString())
+                            .contentType(MediaType.APPLICATION_JSON)
+                            .content(objectMapper.writeValueAsString(request)))
+                    .andExpect(status().isConflict())
+                    .andExpect(header().string(HttpHeaders.RETRY_AFTER, "1"))
+                    .andExpect(jsonPath("$.errorCode", is(ErrorCode.ORDER_NOT_READY.name())))
+                    .andExpect(jsonPath("$.status", is(409)));
+            long elapsed = System.currentTimeMillis() - start;
+            assertThat(elapsed).isLessThan(500);
+
+            // Thread 2 done, release Thread 1
+            t2DoneLatch.countDown();
+
+            MvcResult t1Result = t1Future.get(5, TimeUnit.SECONDS);
+            assertThat(t1Result.getResponse().getStatus()).isEqualTo(202);
+
+            // Verify order state is PAYMENT_PENDING and 1 outbox event written
+            OrderRecord updated = orderRepository.findById(orderId).orElseThrow();
+            assertThat(updated.status()).isEqualTo("PAYMENT_PENDING");
+            assertThat(countOutboxEvents(orderId)).isEqualTo(1);
+        } finally {
+            executor.shutdownNow();
+        }
+    }
+
+    @Test
+    @DisplayName("Two concurrent checkouts for same RESERVED order with different keys: exactly one 202 and one 409 INVALID_ORDER_STATE, one outbox row, losing key IN_PROGRESS removed")
+    void checkoutConcurrentDifferentKeysOnlyOneSucceeds() throws Exception {
+        UUID orderId = UUID.randomUUID();
+        UUID userId = UUID.randomUUID();
+        UUID key1 = UUID.randomUUID();
+        UUID key2 = UUID.randomUUID();
+        insertOrder(orderId, userId, "RESERVED", Instant.now().plus(600, ChronoUnit.SECONDS));
+        CheckoutRequest request = new CheckoutRequest("pm_tok_visa_success");
+
+        ExecutorService executor = Executors.newFixedThreadPool(2);
+        CountDownLatch startLatch = new CountDownLatch(1);
+
+        try {
+            Future<MvcResult> f1 = executor.submit(() -> {
+                startLatch.await(5, TimeUnit.SECONDS);
+                return mockMvc.perform(post("/api/v1/orders/{orderId}/checkout", orderId)
+                                .header(CorrelationConstants.USER_ID_HEADER, userId.toString())
+                                .header("Idempotency-Key", key1.toString())
+                                .contentType(MediaType.APPLICATION_JSON)
+                                .content(objectMapper.writeValueAsString(request)))
+                        .andReturn();
+            });
+
+            Future<MvcResult> f2 = executor.submit(() -> {
+                startLatch.await(5, TimeUnit.SECONDS);
+                return mockMvc.perform(post("/api/v1/orders/{orderId}/checkout", orderId)
+                                .header(CorrelationConstants.USER_ID_HEADER, userId.toString())
+                                .header("Idempotency-Key", key2.toString())
+                                .contentType(MediaType.APPLICATION_JSON)
+                                .content(objectMapper.writeValueAsString(request)))
+                        .andReturn();
+            });
+
+            startLatch.countDown();
+
+            MvcResult r1 = f1.get(10, TimeUnit.SECONDS);
+            MvcResult r2 = f2.get(10, TimeUnit.SECONDS);
+
+            int status1 = r1.getResponse().getStatus();
+            int status2 = r2.getResponse().getStatus();
+
+            // Exactly one 202 and one 409
+            assertThat(List.of(status1, status2)).containsExactlyInAnyOrder(202, 409);
+
+            MvcResult conflictResult = (status1 == 409) ? r1 : r2;
+            UUID losingKey = (status1 == 409) ? key1 : key2;
+            UUID winningKey = (status1 == 202) ? key1 : key2;
+
+            JsonNode conflictJson = objectMapper.readTree(conflictResult.getResponse().getContentAsString());
+            assertThat(conflictJson.get("errorCode").asText()).isEqualTo(ErrorCode.INVALID_ORDER_STATE.name());
+
+            // Exactly one outbox row
+            assertThat(countOutboxEvents(orderId)).isEqualTo(1);
+
+            // Winning key is COMPLETED
+            var winRecord = idempotencyKeyRepository.findByUserAndKey(userId, winningKey).orElseThrow();
+            assertThat(winRecord.status()).isEqualTo("COMPLETED");
+
+            // Losing key's IN_PROGRESS row was removed
+            assertThat(idempotencyKeyRepository.findByUserAndKey(userId, losingKey)).isEmpty();
+        } finally {
+            executor.shutdownNow();
+        }
+    }
+
+    @Test
+    @DisplayName("Pre-seeded IN_PROGRESS idempotency row older than 35 seconds is reclaimed with fresh fencing timestamp and succeeds with 202")
+    void checkoutStaleInProgressReclaimedAfter35Seconds() throws Exception {
+        UUID orderId = UUID.randomUUID();
+        UUID userId = UUID.randomUUID();
+        UUID idempotencyKey = UUID.randomUUID();
+        insertOrder(orderId, userId, "RESERVED", Instant.now().plus(600, ChronoUnit.SECONDS));
+
+        CheckoutRequest request = new CheckoutRequest("pm_tok_visa_success");
+        String endpoint = "/api/v1/orders/" + orderId + "/checkout";
+        String canonicalJson = objectMapper.writeValueAsString(request);
+        String hashInput = "POST:" + endpoint + ":" + canonicalJson;
+        MessageDigest digest = MessageDigest.getInstance("SHA-256");
+        String requestHash = HexFormat.of().formatHex(digest.digest(hashInput.getBytes(StandardCharsets.UTF_8)));
+
+        // Pre-seed an IN_PROGRESS idempotency row older than 35 seconds
+        jdbcTemplate.update("""
+                INSERT INTO idempotency_keys (user_id, idempotency_key, endpoint, request_hash, status, created_at, expires_at)
+                VALUES (?, ?, ?, ?, 'IN_PROGRESS', NOW() - INTERVAL '35 seconds', NOW() + INTERVAL '24 hours')
+                """,
+                userId, idempotencyKey, endpoint, requestHash);
+
+        var preSeeded = idempotencyKeyRepository.findByUserAndKey(userId, idempotencyKey).orElseThrow();
+        Instant seededCreatedAt = preSeeded.createdAt();
+
+        // Perform checkout with the same key
+        mockMvc.perform(post("/api/v1/orders/{orderId}/checkout", orderId)
+                        .header(CorrelationConstants.USER_ID_HEADER, userId.toString())
+                        .header("Idempotency-Key", idempotencyKey.toString())
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content(objectMapper.writeValueAsString(request)))
+                .andExpect(status().isAccepted())
+                .andExpect(jsonPath("$.orderId", is(orderId.toString())))
+                .andExpect(jsonPath("$.status", is("PAYMENT_PENDING")));
+
+        // Verify key reclaimed, fresh fencing timestamp, completed
+        var completed = idempotencyKeyRepository.findByUserAndKey(userId, idempotencyKey).orElseThrow();
+        assertThat(completed.status()).isEqualTo("COMPLETED");
+        assertThat(completed.responseStatus()).isEqualTo(202);
+        assertThat(completed.createdAt()).isAfter(seededCreatedAt);
+        assertThat(completed.completedAt()).isNotNull();
+
+        assertThat(countOutboxEvents(orderId)).isEqualTo(1);
+    }
+
+    @Test
+    @DisplayName("Documented counter exists with documented tag values and order_checkout_requests_total does not exist")
+    void checkoutMetricsConformToConventionsDoc() throws Exception {
+        // Assert old counter does not exist
+        assertThat(meterRegistry.find("order_checkout_requests_total").counter()).isNull();
+
+        UUID orderId = UUID.randomUUID();
+        UUID userId = UUID.randomUUID();
+        UUID key1 = UUID.randomUUID();
+        insertOrder(orderId, userId, "RESERVED", Instant.now().plus(600, ChronoUnit.SECONDS));
+        CheckoutRequest request = new CheckoutRequest("pm_tok_visa_success");
+
+        // 1. ACCEPTED
+        mockMvc.perform(post("/api/v1/orders/{orderId}/checkout", orderId)
+                        .header(CorrelationConstants.USER_ID_HEADER, userId.toString())
+                        .header("Idempotency-Key", key1.toString())
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content(objectMapper.writeValueAsString(request)))
+                .andExpect(status().isAccepted());
+
+        // 2. REPLAY
+        mockMvc.perform(post("/api/v1/orders/{orderId}/checkout", orderId)
+                        .header(CorrelationConstants.USER_ID_HEADER, userId.toString())
+                        .header("Idempotency-Key", key1.toString())
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content(objectMapper.writeValueAsString(request)))
+                .andExpect(status().isAccepted());
+
+        // 3. INVALID_ORDER_STATE (retry with new key while PAYMENT_PENDING)
+        mockMvc.perform(post("/api/v1/orders/{orderId}/checkout", orderId)
+                        .header(CorrelationConstants.USER_ID_HEADER, userId.toString())
+                        .header("Idempotency-Key", UUID.randomUUID().toString())
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content(objectMapper.writeValueAsString(request)))
+                .andExpect(status().isConflict());
+
+        // 4. ORDER_NOT_READY (unknown order)
+        mockMvc.perform(post("/api/v1/orders/{orderId}/checkout", UUID.randomUUID())
+                        .header(CorrelationConstants.USER_ID_HEADER, userId.toString())
+                        .header("Idempotency-Key", UUID.randomUUID().toString())
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content(objectMapper.writeValueAsString(request)))
+                .andExpect(status().isConflict());
+
+        // 5. RESERVATION_EXPIRED
+        UUID expiredOrderId = UUID.randomUUID();
+        insertOrder(expiredOrderId, userId, "RESERVED", Instant.now().minus(60, ChronoUnit.SECONDS));
+        mockMvc.perform(post("/api/v1/orders/{orderId}/checkout", expiredOrderId)
+                        .header(CorrelationConstants.USER_ID_HEADER, userId.toString())
+                        .header("Idempotency-Key", UUID.randomUUID().toString())
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content(objectMapper.writeValueAsString(request)))
+                .andExpect(status().isConflict());
+
+        // Assert all documented outcome tags exist and have count >= 1
+        for (String outcome : CheckoutMetrics.ALLOWED_OUTCOMES) {
+            Counter counter = meterRegistry.find(CheckoutMetrics.COUNTER_NAME)
+                    .tag(CheckoutMetrics.TAG_OUTCOME, outcome)
+                    .counter();
+            assertThat(counter)
+                    .as("Counter for outcome %s should exist", outcome)
+                    .isNotNull();
+            assertThat(counter.count())
+                    .as("Count for outcome %s should be >= 1", outcome)
+                    .isGreaterThanOrEqualTo(1.0);
+        }
+
+        // Verify timer exists
+        Timer timer = meterRegistry.find(CheckoutMetrics.TIMER_NAME).timer();
+        assertThat(timer).isNotNull();
+        assertThat(timer.count()).isGreaterThanOrEqualTo(5L);
+
+        // Ensure legacy counter is still absent
+        assertThat(meterRegistry.find("order_checkout_requests_total").counter()).isNull();
     }
 
     private int countOutboxEvents(UUID orderId) {
