@@ -127,6 +127,7 @@ class ExpirySweeperIntegrationTest {
         registry.add("spring.data.redis.port", () -> REDIS.getMappedPort(6379));
         registry.add("ticketing.outbox.enabled", () -> "false");
         registry.add("ticketing.sweeper.enabled", () -> "false");
+        registry.add("spring.kafka.listener.auto-startup", () -> "false");
     }
 
     @Autowired
@@ -1149,7 +1150,7 @@ class ExpirySweeperIntegrationTest {
             ReservationRecord expiredRes = reservationRepository.findById(reservationId).orElseThrow();
             assertThat(expiredRes.status()).isEqualTo("EXPIRED");
             assertThat(expiredRes.expiredAt()).isNotNull();
-            assertThat(expiredRes.expiredAt()).isGreaterThanOrEqualTo(expiredRes.expiresAt());
+            assertThat(expiredRes.expiredAt()).isAfterOrEqualTo(expiredRes.expiresAt());
 
             SeatRecord seatAfter = seatRepository.findById(seat1).orElseThrow();
             assertThat(seatAfter.status()).isEqualTo("AVAILABLE");
@@ -1163,52 +1164,52 @@ class ExpirySweeperIntegrationTest {
 
     @Test
     void scheduledBatchTestDrainsBacklogAndRespectsMaxPagesPerTick() {
-        int originalBatchSize = sweeperProperties.getBatchSize();
-        int originalMaxPages = sweeperProperties.getMaxPagesPerTick();
-        try {
-            // Part 1: 1200 expired reservations are all expired by a single call of
-            // scheduledSweep()
-            UUID eventId1 = UUID.randomUUID();
-            transactionTemplate.executeWithoutResult(status -> {
-                eventRepository.insert(new EventRecord(
-                        eventId1, "Big Event 1", "Venue",
-                        Instant.now().plus(7, ChronoUnit.DAYS), Instant.now().minus(2, ChronoUnit.HOURS),
-                        "ON_SALE", Instant.now(), Instant.now()));
-            });
-            bulkSeedExpiredReservations(eventId1, 1200);
+        ExpirySweeperProperties localProps = new ExpirySweeperProperties();
+        localProps.setEnabled(true);
+        ExpirySweeper localSweeper = new ExpirySweeper(
+                reservationRepository, seatRepository, redisSeatGate, outboxWriter,
+                transactionManager, localProps,
+                new SimpleObjectProvider<>(new SimpleMeterRegistry()));
 
-            int expiredTotal = expirySweeper.scheduledSweep();
-            assertThat(expiredTotal).isEqualTo(1200);
+        // Part 1: 1200 expired reservations are all expired by a single call of
+        // scheduledSweep()
+        UUID eventId1 = UUID.randomUUID();
+        transactionTemplate.executeWithoutResult(status -> {
+            eventRepository.insert(new EventRecord(
+                    eventId1, "Big Event 1", "Venue",
+                    Instant.now().plus(7, ChronoUnit.DAYS), Instant.now().minus(2, ChronoUnit.HOURS),
+                    "ON_SALE", Instant.now(), Instant.now()));
+        });
+        bulkSeedExpiredReservations(eventId1, 1200);
 
-            Integer expiredInDb = jdbcTemplate.queryForObject(
-                    "SELECT COUNT(*) FROM reservations WHERE status = 'EXPIRED'", Integer.class);
-            assertThat(expiredInDb).isEqualTo(1200);
+        int expiredTotal = localSweeper.scheduledSweep();
+        assertThat(expiredTotal).isEqualTo(1200);
 
-            // Part 2: with batch size 10 and max pages 3, one tick expires exactly 30
-            sweeperProperties.setBatchSize(10);
-            sweeperProperties.setMaxPagesPerTick(3);
+        Integer expiredInDb = jdbcTemplate.queryForObject(
+                "SELECT COUNT(*) FROM reservations WHERE status = 'EXPIRED'", Integer.class);
+        assertThat(expiredInDb).isEqualTo(1200);
 
-            UUID eventId2 = UUID.randomUUID();
-            transactionTemplate.executeWithoutResult(status -> {
-                eventRepository.insert(new EventRecord(
-                        eventId2, "Small Event 2", "Venue",
-                        Instant.now().plus(7, ChronoUnit.DAYS), Instant.now().minus(2, ChronoUnit.HOURS),
-                        "ON_SALE", Instant.now(), Instant.now()));
-            });
-            bulkSeedExpiredReservations(eventId2, 50);
+        // Part 2: with batch size 10 and max pages 3, one tick expires exactly 30
+        localProps.setBatchSize(10);
+        localProps.setMaxPagesPerTick(3);
 
-            int expiredTick = expirySweeper.scheduledSweep();
-            assertThat(expiredTick).isEqualTo(30);
+        UUID eventId2 = UUID.randomUUID();
+        transactionTemplate.executeWithoutResult(status -> {
+            eventRepository.insert(new EventRecord(
+                    eventId2, "Small Event 2", "Venue",
+                    Instant.now().plus(7, ChronoUnit.DAYS), Instant.now().minus(2, ChronoUnit.HOURS),
+                    "ON_SALE", Instant.now(), Instant.now()));
+        });
+        bulkSeedExpiredReservations(eventId2, 50);
 
-            // 30 expired from event2, leaving 20 HELD
-            Integer heldRemaining = jdbcTemplate.queryForObject(
-                    "SELECT COUNT(*) FROM reservations WHERE event_id = ? AND status = 'HELD'",
-                    Integer.class, eventId2);
-            assertThat(heldRemaining).isEqualTo(20);
-        } finally {
-            sweeperProperties.setBatchSize(originalBatchSize);
-            sweeperProperties.setMaxPagesPerTick(originalMaxPages);
-        }
+        int expiredTick = localSweeper.scheduledSweep();
+        assertThat(expiredTick).isEqualTo(30);
+
+        // 30 expired from event2, leaving 20 HELD
+        Integer heldRemaining = jdbcTemplate.queryForObject(
+                "SELECT COUNT(*) FROM reservations WHERE event_id = ? AND status = 'HELD'",
+                Integer.class, eventId2);
+        assertThat(heldRemaining).isEqualTo(20);
     }
 
     @Test
@@ -1233,7 +1234,7 @@ class ExpirySweeperIntegrationTest {
         assertThat(ticketingCounter.count()).isEqualTo(beforeCount + 1.0);
 
         // 2. Mockito spy on repository: verify gauge reads never query repository
-        ReservationRepository spyRepo = Mockito.spy(reservationRepository);
+        ReservationRepository spyRepo = Mockito.spy(new ReservationRepository(jdbcTemplate));
         SimpleMeterRegistry testRegistry = new SimpleMeterRegistry();
         ExpirySweeperProperties testProps = new ExpirySweeperProperties();
         ExpirySweeper sweeperWithSpy = new ExpirySweeper(
@@ -1281,7 +1282,7 @@ class ExpirySweeperIntegrationTest {
         assertThat(res.status()).isEqualTo("EXPIRED");
         assertThat(res.expiredAt()).isNotNull();
         assertThat(res.expiresAt()).isNotNull();
-        assertThat(res.expiredAt()).isGreaterThanOrEqualTo(res.expiresAt());
+        assertThat(res.expiredAt()).isAfterOrEqualTo(res.expiresAt());
     }
 
     private List<UUID> bulkSeedExpiredReservations(UUID eventId, int count) {
@@ -1299,55 +1300,57 @@ class ExpirySweeperIntegrationTest {
                     now, now));
         }
 
-        seatRepository.bulkInsert(seats);
+        transactionTemplate.executeWithoutResult(status -> {
+            seatRepository.bulkInsert(seats);
 
-        jdbcTemplate.batchUpdate("""
-                INSERT INTO reservations (
-                    reservation_id, event_id, user_id, status, total_amount_cents, currency,
-                    created_at, expires_at, updated_at
-                ) VALUES (?, ?, ?, 'HELD', 10000, 'USD',
-                          clock_timestamp() - INTERVAL '1 hour',
-                          clock_timestamp() - (? * INTERVAL '1 millisecond' + INTERVAL '10 seconds'),
-                          clock_timestamp())
-                """,
-                new BatchPreparedStatementSetter() {
-                    @Override
-                    public void setValues(PreparedStatement ps, int i) throws SQLException {
-                        ps.setObject(1, reservationIds.get(i), Types.OTHER);
-                        ps.setObject(2, eventId, Types.OTHER);
-                        ps.setObject(3, UUID.randomUUID(), Types.OTHER);
-                        ps.setLong(4, (count - i) * 10L);
-                    }
+            jdbcTemplate.batchUpdate("""
+                    INSERT INTO reservations (
+                        reservation_id, event_id, user_id, status, total_amount_cents, currency,
+                        created_at, expires_at, updated_at
+                    ) VALUES (?, ?, ?, 'HELD', 10000, 'USD',
+                              clock_timestamp() - INTERVAL '1 hour',
+                              clock_timestamp() - (? * INTERVAL '1 millisecond' + INTERVAL '10 seconds'),
+                              clock_timestamp())
+                    """,
+                    new BatchPreparedStatementSetter() {
+                        @Override
+                        public void setValues(PreparedStatement ps, int i) throws SQLException {
+                            ps.setObject(1, reservationIds.get(i), Types.OTHER);
+                            ps.setObject(2, eventId, Types.OTHER);
+                            ps.setObject(3, UUID.randomUUID(), Types.OTHER);
+                            ps.setLong(4, (count - i) * 10L);
+                        }
 
-                    @Override
-                    public int getBatchSize() {
-                        return count;
-                    }
-                });
+                        @Override
+                        public int getBatchSize() {
+                            return count;
+                        }
+                    });
 
-        jdbcTemplate.batchUpdate("""
-                INSERT INTO reservation_items (
-                    reservation_item_id, reservation_id, event_id, seat_id, section_code,
-                    row_label, seat_number, price_cents, status, created_at, updated_at
-                ) VALUES (?, ?, ?, ?, 'SEC-BLK', '1', ?, 10000, 'HELD',
-                          clock_timestamp() - INTERVAL '1 hour',
-                          clock_timestamp())
-                """,
-                new BatchPreparedStatementSetter() {
-                    @Override
-                    public void setValues(PreparedStatement ps, int i) throws SQLException {
-                        ps.setObject(1, UUID.randomUUID(), Types.OTHER);
-                        ps.setObject(2, reservationIds.get(i), Types.OTHER);
-                        ps.setObject(3, eventId, Types.OTHER);
-                        ps.setObject(4, seatIds.get(i), Types.OTHER);
-                        ps.setString(5, String.valueOf(i + 1));
-                    }
+            jdbcTemplate.batchUpdate("""
+                    INSERT INTO reservation_items (
+                        reservation_item_id, reservation_id, event_id, seat_id, section_code,
+                        row_label, seat_number, price_cents, status, created_at, updated_at
+                    ) VALUES (?, ?, ?, ?, 'SEC-BLK', '1', ?, 10000, 'HELD',
+                              clock_timestamp() - INTERVAL '1 hour',
+                              clock_timestamp())
+                    """,
+                    new BatchPreparedStatementSetter() {
+                        @Override
+                        public void setValues(PreparedStatement ps, int i) throws SQLException {
+                            ps.setObject(1, UUID.randomUUID(), Types.OTHER);
+                            ps.setObject(2, reservationIds.get(i), Types.OTHER);
+                            ps.setObject(3, eventId, Types.OTHER);
+                            ps.setObject(4, seatIds.get(i), Types.OTHER);
+                            ps.setString(5, String.valueOf(i + 1));
+                        }
 
-                    @Override
-                    public int getBatchSize() {
-                        return count;
-                    }
-                });
+                        @Override
+                        public int getBatchSize() {
+                            return count;
+                        }
+                    });
+        });
 
         return reservationIds;
     }

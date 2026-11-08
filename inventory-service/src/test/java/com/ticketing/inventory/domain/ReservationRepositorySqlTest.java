@@ -21,6 +21,10 @@ class ReservationRepositorySqlTest {
                 ReservationRepository.MARK_CONFIRMED_WITH_DB_CLOCK_SQL,
                 ReservationRepository.CONFIRM_HELD_ITEMS_SQL,
                 ReservationRepository.CONFIRM_HELD_SEATS_SQL,
+                ReservationRepository.MARK_RELEASED_WITH_DB_CLOCK_SQL,
+                ReservationRepository.RELEASE_HELD_ITEMS_SQL,
+                ReservationRepository.RELEASE_HELD_SEATS_SQL,
+                ReservationRepository.CURRENT_DB_TIMESTAMP_SQL,
                 ReservationRepository.OLDEST_OVERDUE_HOLD_SECONDS_SQL
         );
 

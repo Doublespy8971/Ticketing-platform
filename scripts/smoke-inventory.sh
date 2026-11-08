@@ -11,6 +11,9 @@ set -euo pipefail
 INVENTORY_URL="${INVENTORY_URL:-http://localhost:8081}"
 POSTGRES_CONTAINER="${POSTGRES_CONTAINER:-postgres-inventory}"
 REDIS_CONTAINER="${REDIS_CONTAINER:-redis}"
+KAFKA_CONTAINER="${KAFKA_CONTAINER:-kafka}"
+KAFKA_BOOTSTRAP="${KAFKA_BOOTSTRAP:-localhost:9092}"
+KAFKA_BIN="${KAFKA_BIN:-/opt/kafka/bin}"
 POSTGRES_USER="${POSTGRES_USER:-ticketing}"
 POSTGRES_DB="inventory_db"
 
@@ -54,6 +57,7 @@ echo "Starting inventory-service end-to-end smoke test"
 echo "Target URL:            ${INVENTORY_URL}"
 echo "Postgres Container:    ${POSTGRES_CONTAINER}"
 echo "Redis Container:       ${REDIS_CONTAINER}"
+echo "Kafka Container:       ${KAFKA_CONTAINER}"
 echo "=================================================================="
 
 # ------------------------------------------------------------------------------
@@ -581,7 +585,221 @@ else
 fi
 
 # ------------------------------------------------------------------------------
-# 10) Final summary
+# 10) Kafka outbox + payment.events consumer checks via docker exec on kafka
+# ------------------------------------------------------------------------------
+echo ""
+echo "--- Kafka check ---"
+
+if [ -n "${EVENT_ID}" ] && [ "${#SEAT_IDS[@]}" -ge 5 ]; then
+    KAFKA_SEAT1="${SEAT_IDS[3]}"
+    KAFKA_SEAT2="${SEAT_IDS[4]}"
+
+    # 10a. Create Hold A on KAFKA_SEAT1 and verify inventory.seat.reserved on inventory.events + published_at IS NOT NULL
+    KAFKA_USER1=$(uuid_gen)
+    KAFKA_IDEMP1=$(uuid_gen)
+    KAFKA_CORR1=$(uuid_gen)
+    KAFKA_HOLD1_BODY=$(jq -n \
+        --arg eventId "${EVENT_ID}" \
+        --arg userId "${KAFKA_USER1}" \
+        --arg seatId "${KAFKA_SEAT1}" \
+        '{eventId: $eventId, userId: $userId, seatIds: [$seatId]}')
+
+    KAFKA_HOLD1_RAW=$(curl -s -w "\n%{http_code}" -X POST "${INVENTORY_URL}/api/v1/reservations" \
+        -H "Content-Type: application/json" \
+        -H "X-User-Id: ${KAFKA_USER1}" \
+        -H "X-User-Roles: USER" \
+        -H "X-Correlation-Id: ${KAFKA_CORR1}" \
+        -H "Idempotency-Key: ${KAFKA_IDEMP1}" \
+        -d "${KAFKA_HOLD1_BODY}")
+    KAFKA_HOLD1_HTTP=$(echo "${KAFKA_HOLD1_RAW}" | tail -n1)
+    KAFKA_HOLD1_RES=$(echo "${KAFKA_HOLD1_RAW}" | sed '$d')
+    KAFKA_RES1_ID=$(echo "${KAFKA_HOLD1_RES}" | jq -r '.reservationId // empty')
+
+    if [ "${KAFKA_HOLD1_HTTP}" = "201" ] && [ -n "${KAFKA_RES1_ID}" ]; then
+        PUBLISHED_COUNT=0
+        for i in $(seq 1 20); do
+            PUBLISHED_COUNT=$(run_psql "SELECT count(*) FROM outbox_events WHERE aggregate_id = '${KAFKA_RES1_ID}'::uuid AND event_type = 'inventory.seat.reserved' AND published_at IS NOT NULL;")
+            if [ "${PUBLISHED_COUNT}" -eq 1 ]; then
+                break
+            fi
+            sleep 0.5
+        done
+
+        KAFKA_RESERVED_MSG=$(docker exec "${KAFKA_CONTAINER}" sh -c \
+            "${KAFKA_BIN}/kafka-console-consumer.sh --bootstrap-server ${KAFKA_BOOTSTRAP} --topic inventory.events --from-beginning --timeout-ms 5000 2>/dev/null || true" \
+            | grep "${KAFKA_RES1_ID}" | grep "inventory.seat.reserved" || true)
+
+        if [ "${PUBLISHED_COUNT}" -eq 1 ] && [ -n "${KAFKA_RESERVED_MSG}" ]; then
+            record_pass "Kafka check: inventory.seat.reserved published on inventory.events and published_at IS NOT NULL (reservationId=${KAFKA_RES1_ID})"
+        else
+            record_fail "Kafka check: inventory.seat.reserved published on inventory.events and published_at IS NOT NULL" "published_count=${PUBLISHED_COUNT}, msg_found=$([ -n "${KAFKA_RESERVED_MSG}" ] && echo yes || echo no)"
+        fi
+
+        # 10b. Produce payment.succeeded for Hold A and verify CONFIRMED / SOLD and inventory.seat.confirmed
+        PAYMENT_EVENT1_ID=$(uuid_gen)
+        PAYMENT1_ID=$(uuid_gen)
+        PAID_AT=$(jq -r -n 'now | todateiso8601')
+        PAYMENT_SUCCEEDED_JSON=$(jq -c -n \
+            --arg eventId "${PAYMENT_EVENT1_ID}" \
+            --arg occurredAt "${PAID_AT}" \
+            --arg correlationId "${KAFKA_CORR1}" \
+            --arg paymentId "${PAYMENT1_ID}" \
+            --arg orderId "${KAFKA_RES1_ID}" \
+            --arg reservationId "${KAFKA_RES1_ID}" \
+            --arg userId "${KAFKA_USER1}" \
+            --arg paidAt "${PAID_AT}" \
+            '{
+                eventId: $eventId,
+                eventType: "payment.succeeded",
+                occurredAt: $occurredAt,
+                correlationId: $correlationId,
+                schemaVersion: 1,
+                payload: {
+                    paymentId: $paymentId,
+                    orderId: $orderId,
+                    reservationId: $reservationId,
+                    userId: $userId,
+                    amountCents: 10000,
+                    currency: "USD",
+                    providerReference: ("pi_" + $paymentId),
+                    paidAt: $paidAt
+                }
+            }')
+
+        docker exec -i "${KAFKA_CONTAINER}" sh -c \
+            "${KAFKA_BIN}/kafka-console-producer.sh --bootstrap-server ${KAFKA_BOOTSTRAP} --topic payment.events --property parse.key=true --property key.separator=:" \
+            <<< "${KAFKA_RES1_ID}:${PAYMENT_SUCCEEDED_JSON}"
+
+        CONFIRMED_STATUS=""
+        for i in $(seq 1 20); do
+            CONFIRMED_STATUS=$(run_psql "SELECT status FROM reservations WHERE reservation_id = '${KAFKA_RES1_ID}'::uuid;")
+            if [ "${CONFIRMED_STATUS}" = "CONFIRMED" ]; then
+                break
+            fi
+            sleep 0.5
+        done
+
+        SEAT1_STATUS=$(run_psql "SELECT status FROM seats WHERE seat_id = '${KAFKA_SEAT1}'::uuid;")
+        CONFIRMED_OUTBOX=$(run_psql "SELECT count(*) FROM outbox_events WHERE aggregate_id = '${KAFKA_RES1_ID}'::uuid AND event_type = 'inventory.seat.confirmed' AND published_at IS NOT NULL;")
+        for i in $(seq 1 10); do
+            if [ "${CONFIRMED_OUTBOX}" -eq 1 ]; then
+                break
+            fi
+            sleep 0.5
+            CONFIRMED_OUTBOX=$(run_psql "SELECT count(*) FROM outbox_events WHERE aggregate_id = '${KAFKA_RES1_ID}'::uuid AND event_type = 'inventory.seat.confirmed' AND published_at IS NOT NULL;")
+        done
+
+        KAFKA_CONFIRMED_MSG=$(docker exec "${KAFKA_CONTAINER}" sh -c \
+            "${KAFKA_BIN}/kafka-console-consumer.sh --bootstrap-server ${KAFKA_BOOTSTRAP} --topic inventory.events --from-beginning --timeout-ms 5000 2>/dev/null || true" \
+            | grep "${KAFKA_RES1_ID}" | grep "inventory.seat.confirmed" || true)
+
+        if [ "${CONFIRMED_STATUS}" = "CONFIRMED" ] && [ "${SEAT1_STATUS}" = "SOLD" ] && [ -n "${KAFKA_CONFIRMED_MSG}" ]; then
+            record_pass "Kafka check: payment.succeeded -> CONFIRMED / SOLD and inventory.seat.confirmed on inventory.events"
+        else
+            record_fail "Kafka check: payment.succeeded -> CONFIRMED / SOLD and inventory.seat.confirmed on inventory.events" "res_status=${CONFIRMED_STATUS}, seat_status=${SEAT1_STATUS}, msg_found=$([ -n "${KAFKA_CONFIRMED_MSG}" ] && echo yes || echo no)"
+        fi
+    else
+        record_fail "Kafka check: create hold for payment.succeeded" "HTTP=${KAFKA_HOLD1_HTTP}, body=${KAFKA_HOLD1_RES}"
+    fi
+
+    # 10c. Create Hold B on KAFKA_SEAT2, produce payment.failed, verify RELEASED and seat can be held again
+    KAFKA_USER2=$(uuid_gen)
+    KAFKA_IDEMP2=$(uuid_gen)
+    KAFKA_CORR2=$(uuid_gen)
+    KAFKA_HOLD2_BODY=$(jq -n \
+        --arg eventId "${EVENT_ID}" \
+        --arg userId "${KAFKA_USER2}" \
+        --arg seatId "${KAFKA_SEAT2}" \
+        '{eventId: $eventId, userId: $userId, seatIds: [$seatId]}')
+
+    KAFKA_HOLD2_RAW=$(curl -s -w "\n%{http_code}" -X POST "${INVENTORY_URL}/api/v1/reservations" \
+        -H "Content-Type: application/json" \
+        -H "X-User-Id: ${KAFKA_USER2}" \
+        -H "X-User-Roles: USER" \
+        -H "X-Correlation-Id: ${KAFKA_CORR2}" \
+        -H "Idempotency-Key: ${KAFKA_IDEMP2}" \
+        -d "${KAFKA_HOLD2_BODY}")
+    KAFKA_HOLD2_HTTP=$(echo "${KAFKA_HOLD2_RAW}" | tail -n1)
+    KAFKA_HOLD2_RES=$(echo "${KAFKA_HOLD2_RAW}" | sed '$d')
+    KAFKA_RES2_ID=$(echo "${KAFKA_HOLD2_RES}" | jq -r '.reservationId // empty')
+
+    if [ "${KAFKA_HOLD2_HTTP}" = "201" ] && [ -n "${KAFKA_RES2_ID}" ]; then
+        PAYMENT_EVENT2_ID=$(uuid_gen)
+        PAYMENT2_ID=$(uuid_gen)
+        FAILED_AT=$(jq -r -n 'now | todateiso8601')
+        PAYMENT_FAILED_JSON=$(jq -c -n \
+            --arg eventId "${PAYMENT_EVENT2_ID}" \
+            --arg occurredAt "${FAILED_AT}" \
+            --arg correlationId "${KAFKA_CORR2}" \
+            --arg paymentId "${PAYMENT2_ID}" \
+            --arg orderId "${KAFKA_RES2_ID}" \
+            --arg reservationId "${KAFKA_RES2_ID}" \
+            --arg userId "${KAFKA_USER2}" \
+            --arg failedAt "${FAILED_AT}" \
+            '{
+                eventId: $eventId,
+                eventType: "payment.failed",
+                occurredAt: $occurredAt,
+                correlationId: $correlationId,
+                schemaVersion: 1,
+                payload: {
+                    paymentId: $paymentId,
+                    orderId: $orderId,
+                    reservationId: $reservationId,
+                    userId: $userId,
+                    amountCents: 10000,
+                    currency: "USD",
+                    failureCode: "CARD_DECLINED",
+                    failureMessage: "Insufficient funds",
+                    failedAt: $failedAt
+                }
+            }')
+
+        docker exec -i "${KAFKA_CONTAINER}" sh -c \
+            "${KAFKA_BIN}/kafka-console-producer.sh --bootstrap-server ${KAFKA_BOOTSTRAP} --topic payment.events --property parse.key=true --property key.separator=:" \
+            <<< "${KAFKA_RES2_ID}:${PAYMENT_FAILED_JSON}"
+
+        RELEASED_STATUS=""
+        for i in $(seq 1 20); do
+            RELEASED_STATUS=$(run_psql "SELECT status FROM reservations WHERE reservation_id = '${KAFKA_RES2_ID}'::uuid;")
+            if [ "${RELEASED_STATUS}" = "RELEASED" ]; then
+                break
+            fi
+            sleep 0.5
+        done
+
+        # Re-hold the released seat as another user
+        KAFKA_USER3=$(uuid_gen)
+        KAFKA_IDEMP3=$(uuid_gen)
+        REHOLD_BODY=$(jq -n \
+            --arg eventId "${EVENT_ID}" \
+            --arg userId "${KAFKA_USER3}" \
+            --arg seatId "${KAFKA_SEAT2}" \
+            '{eventId: $eventId, userId: $userId, seatIds: [$seatId]}')
+        REHOLD_RAW=$(curl -s -w "\n%{http_code}" -X POST "${INVENTORY_URL}/api/v1/reservations" \
+            -H "Content-Type: application/json" \
+            -H "X-User-Id: ${KAFKA_USER3}" \
+            -H "X-User-Roles: USER" \
+            -H "Idempotency-Key: ${KAFKA_IDEMP3}" \
+            -d "${REHOLD_BODY}")
+        REHOLD_HTTP=$(echo "${REHOLD_RAW}" | tail -n1)
+        REHOLD_RES=$(echo "${REHOLD_RAW}" | sed '$d')
+        REHOLD_STATUS=$(echo "${REHOLD_RES}" | jq -r '.status // empty')
+
+        if [ "${RELEASED_STATUS}" = "RELEASED" ] && [ "${REHOLD_HTTP}" = "201" ] && [ "${REHOLD_STATUS}" = "HELD" ]; then
+            record_pass "Kafka check: payment.failed -> RELEASED and seat can be held again (HTTP 201)"
+        else
+            record_fail "Kafka check: payment.failed -> RELEASED and seat can be held again" "released_status=${RELEASED_STATUS}, rehold_http=${REHOLD_HTTP}, rehold_status=${REHOLD_STATUS}"
+        fi
+    else
+        record_fail "Kafka check: create hold for payment.failed" "HTTP=${KAFKA_HOLD2_HTTP}, body=${KAFKA_HOLD2_RES}"
+    fi
+else
+    record_fail "Kafka check" "Skipped due to missing event or seats"
+fi
+
+# ------------------------------------------------------------------------------
+# 11) Final summary
 # ------------------------------------------------------------------------------
 echo ""
 echo "=================================================================="

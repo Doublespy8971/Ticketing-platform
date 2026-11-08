@@ -104,6 +104,8 @@ class ReservationControllerIntegrationTest {
                 registry.add("spring.datasource.hikari.maximum-pool-size", () -> "30");
                 registry.add("spring.data.redis.host", REDIS::getHost);
                 registry.add("spring.data.redis.port", () -> REDIS.getMappedPort(6379));
+                registry.add("ticketing.outbox.enabled", () -> "false");
+                registry.add("spring.kafka.listener.auto-startup", () -> "false");
         }
 
         @Autowired

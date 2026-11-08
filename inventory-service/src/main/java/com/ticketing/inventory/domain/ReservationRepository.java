@@ -94,6 +94,14 @@ public class ReservationRepository {
             Instant confirmedAt
     ) {}
 
+    public record ReleasedReservation(
+            UUID reservationId,
+            UUID eventId,
+            UUID userId,
+            List<UUID> seatIds,
+            Instant releasedAt
+    ) {}
+
     static final String SELECT_EXPIRED_HELD_IDS_FOR_UPDATE_SKIP_LOCKED_SQL = """
             SELECT reservation_id
             FROM reservations
@@ -188,6 +196,50 @@ public class ReservationRepository {
                 ORDER BY seat_id ASC
                 FOR UPDATE
             )
+            """;
+
+    static final String MARK_RELEASED_WITH_DB_CLOCK_SQL = """
+            UPDATE reservations
+            SET status = 'RELEASED',
+                released_at = date_trunc('microseconds', clock_timestamp()),
+                updated_at = date_trunc('microseconds', clock_timestamp())
+            WHERE reservation_id = ?
+              AND status = 'HELD'
+            RETURNING released_at
+            """;
+
+    static final String RELEASE_HELD_ITEMS_SQL = """
+            WITH updated_items AS (
+                UPDATE reservation_items
+                SET status = 'RELEASED',
+                    updated_at = date_trunc('microseconds', clock_timestamp())
+                WHERE reservation_id = ?
+                  AND status = 'HELD'
+                RETURNING seat_id
+            )
+            SELECT seat_id
+            FROM updated_items
+            ORDER BY seat_id ASC
+            """;
+
+    static final String RELEASE_HELD_SEATS_SQL = """
+            UPDATE seats
+            SET status = 'AVAILABLE',
+                version = version + 1,
+                updated_at = clock_timestamp()
+            WHERE seat_id IN (
+                SELECT seat_id
+                FROM seats
+                WHERE event_id = ?
+                  AND seat_id = ANY(?)
+                  AND status = 'HELD'
+                ORDER BY seat_id ASC
+                FOR UPDATE
+            )
+            """;
+
+    static final String CURRENT_DB_TIMESTAMP_SQL = """
+            SELECT date_trunc('microseconds', clock_timestamp()) AS now_ts
             """;
 
     static final String OLDEST_OVERDUE_HOLD_SECONDS_SQL = """
@@ -572,6 +624,82 @@ public class ReservationRepository {
                 seatIds,
                 confirmedAtOpt.get()
         ));
+    }
+
+    /**
+     * Releases a {@code HELD} reservation for the {@code payment.failed} handler (docs/arch/02-saga.md, Section 2.4.1).
+     *
+     * <p>Acquires a blocking {@code FOR UPDATE} lock on the reservation row ({@link #lockForUpdate(UUID)}),
+     * transitions {@code status} from {@code HELD} to {@code RELEASED} with {@code released_at} from the
+     * PostgreSQL clock, transitions all {@code HELD} items to {@code RELEASED}, and transitions the
+     * corresponding {@code HELD} seats back to {@code AVAILABLE} with {@code version} incremented.
+     */
+    @Transactional(propagation = Propagation.MANDATORY)
+    public Optional<ReleasedReservation> releaseIfHeld(UUID reservationId) {
+        Objects.requireNonNull(reservationId, "reservationId must not be null");
+
+        Optional<LockedReservation> lockedOpt = lockForUpdate(reservationId);
+        if (lockedOpt.isEmpty()) {
+            return Optional.empty();
+        }
+        LockedReservation locked = lockedOpt.get();
+        if (!"HELD".equals(locked.status())) {
+            return Optional.empty();
+        }
+
+        Optional<Instant> releasedAtOpt = jdbcTemplate.query(
+                MARK_RELEASED_WITH_DB_CLOCK_SQL,
+                (rs, rowNum) -> toInstant(rs.getObject("released_at", OffsetDateTime.class)),
+                reservationId
+        ).stream().findFirst();
+        if (releasedAtOpt.isEmpty()) {
+            return Optional.empty();
+        }
+
+        List<UUID> seatIds = jdbcTemplate.query(
+                RELEASE_HELD_ITEMS_SQL,
+                (rs, rowNum) -> rs.getObject("seat_id", UUID.class),
+                reservationId
+        );
+        if (seatIds.isEmpty()) {
+            throw new IllegalStateException(
+                    "Released reservation " + reservationId + " had no HELD reservation_items");
+        }
+
+        UUID[] idArray = seatIds.toArray(new UUID[0]);
+        int updatedSeats = jdbcTemplate.update(con -> {
+            PreparedStatement ps = con.prepareStatement(RELEASE_HELD_SEATS_SQL);
+            ps.setObject(1, locked.eventId(), Types.OTHER);
+            Array sqlArray = con.createArrayOf("uuid", idArray);
+            ps.setArray(2, sqlArray);
+            return ps;
+        });
+        if (updatedSeats != seatIds.size()) {
+            throw new IllegalStateException(
+                    "Seat update count mismatch when releasing reservation " + reservationId
+                            + ": expected " + seatIds.size() + " HELD seats for event " + locked.eventId()
+                            + ", but updated " + updatedSeats);
+        }
+
+        return Optional.of(new ReleasedReservation(
+                reservationId,
+                locked.eventId(),
+                locked.userId(),
+                seatIds,
+                releasedAtOpt.get()
+        ));
+    }
+
+    /**
+     * Queries the current PostgreSQL database timestamp truncated to microseconds.
+     */
+    @Transactional(propagation = Propagation.MANDATORY)
+    public Instant currentDatabaseTimestamp() {
+        Instant ts = jdbcTemplate.queryForObject(
+                CURRENT_DB_TIMESTAMP_SQL,
+                (rs, rowNum) -> toInstant(rs.getObject("now_ts", OffsetDateTime.class))
+        );
+        return Objects.requireNonNull(ts, "database timestamp must not be null");
     }
 
     /**

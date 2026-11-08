@@ -76,6 +76,8 @@ class AdminEventControllerIntegrationTest {
         registry.add("spring.datasource.password", POSTGRES::getPassword);
         registry.add("spring.data.redis.host", REDIS::getHost);
         registry.add("spring.data.redis.port", () -> REDIS.getMappedPort(6379));
+        registry.add("ticketing.outbox.enabled", () -> "false");
+        registry.add("spring.kafka.listener.auto-startup", () -> "false");
     }
 
     @Autowired

@@ -59,6 +59,8 @@ class InventoryDatabaseIntegrationTest {
         registry.add("spring.datasource.url", POSTGRES::getJdbcUrl);
         registry.add("spring.datasource.username", POSTGRES::getUsername);
         registry.add("spring.datasource.password", POSTGRES::getPassword);
+        registry.add("ticketing.outbox.enabled", () -> "false");
+        registry.add("spring.kafka.listener.auto-startup", () -> "false");
     }
 
     @Autowired
