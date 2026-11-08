@@ -60,6 +60,42 @@ public class OrderRepository {
             WHERE order_id = ?
             """;
 
+    private static final String SELECT_ORDER_BY_ID_FOR_CHECKOUT_SQL = """
+            SELECT order_id, reservation_id, user_id, event_id, status, total_amount_cents,
+                   currency, payment_method_token, payment_id, cancellation_reason, version,
+                   reserved_at, expires_at, checkout_at, paid_at, confirmed_at, cancelled_at,
+                   refunded_at, created_at, updated_at,
+                   clock_timestamp() AS db_clock,
+                   (expires_at - clock_timestamp() >= INTERVAL '15 seconds') AS grace_buffer_valid
+            FROM orders
+            WHERE order_id = ?
+            FOR UPDATE
+            """;
+
+    private static final String UPDATE_ORDER_FOR_CHECKOUT_SQL = """
+            UPDATE orders
+            SET status = 'PAYMENT_PENDING',
+                payment_method_token = ?,
+                checkout_at = clock_timestamp(),
+                version = version + 1,
+                updated_at = clock_timestamp()
+            WHERE order_id = ?
+              AND status = 'RESERVED'
+            RETURNING checkout_at, version, updated_at
+            """;
+
+    public record OrderCheckoutLockResult(
+            OrderRecord order,
+            Instant dbClock,
+            boolean graceBufferValid
+    ) {}
+
+    public record OrderCheckoutUpdateResult(
+            Instant checkoutAt,
+            long version,
+            Instant updatedAt
+    ) {}
+
     private static final RowMapper<OrderRecord> ORDER_ROW_MAPPER = (rs, rowNum) -> new OrderRecord(
             rs.getObject("order_id", UUID.class),
             rs.getObject("reservation_id", UUID.class),
@@ -82,6 +118,13 @@ public class OrderRepository {
             toInstant(rs.getTimestamp("created_at")),
             toInstant(rs.getTimestamp("updated_at"))
     );
+
+    private static final RowMapper<OrderCheckoutLockResult> CHECKOUT_LOCK_MAPPER = (rs, rowNum) -> {
+        OrderRecord order = ORDER_ROW_MAPPER.mapRow(rs, rowNum);
+        Instant dbClock = toInstant(rs.getTimestamp("db_clock"));
+        boolean graceBufferValid = rs.getBoolean("grace_buffer_valid");
+        return new OrderCheckoutLockResult(order, dbClock, graceBufferValid);
+    };
 
     private static final RowMapper<OrderItemRecord> ORDER_ITEM_ROW_MAPPER = (rs, rowNum) -> new OrderItemRecord(
             rs.getObject("order_item_id", UUID.class),
@@ -176,6 +219,38 @@ public class OrderRepository {
                 ORDER_ITEM_ROW_MAPPER,
                 orderId
         );
+    }
+
+    @Transactional(propagation = Propagation.MANDATORY)
+    public Optional<OrderCheckoutLockResult> findByIdForCheckout(UUID orderId) {
+        Objects.requireNonNull(orderId, "orderId must not be null");
+        List<OrderCheckoutLockResult> results = jdbcTemplate.query(
+                SELECT_ORDER_BY_ID_FOR_CHECKOUT_SQL,
+                CHECKOUT_LOCK_MAPPER,
+                orderId
+        );
+        return results.stream().findFirst();
+    }
+
+    @Transactional(propagation = Propagation.MANDATORY)
+    public OrderCheckoutUpdateResult updateStatusToPaymentPending(UUID orderId, String paymentMethodToken) {
+        Objects.requireNonNull(orderId, "orderId must not be null");
+        Objects.requireNonNull(paymentMethodToken, "paymentMethodToken must not be null");
+
+        List<OrderCheckoutUpdateResult> results = jdbcTemplate.query(
+                UPDATE_ORDER_FOR_CHECKOUT_SQL,
+                (rs, rowNum) -> new OrderCheckoutUpdateResult(
+                        toInstant(rs.getTimestamp("checkout_at")),
+                        rs.getLong("version"),
+                        toInstant(rs.getTimestamp("updated_at"))
+                ),
+                paymentMethodToken,
+                orderId
+        );
+        if (results.isEmpty()) {
+            throw new IllegalStateException("Failed to transition order " + orderId + " to PAYMENT_PENDING");
+        }
+        return results.get(0);
     }
 
     private static Instant toInstant(Timestamp ts) {
