@@ -68,22 +68,36 @@ run_docker_exec() {
     elif command -v gtimeout >/dev/null 2>&1; then
         gtimeout "${timeout_sec}" command docker exec "$@" || exit_code=$?
     else
-        command docker exec "$@" <&0 &
+        local tmp_out
+        tmp_out=$(mktemp)
+        command docker exec "$@" <&0 >"${tmp_out}" 2>&1 &
         local cmd_pid=$!
-        (
-            sleep "${timeout_sec}"
+        local limit_tenths=$((timeout_sec * 10))
+        local elapsed_tenths=0
+        local timed_out=0
+
+        while kill -0 "${cmd_pid}" 2>/dev/null; do
+            if [ "${elapsed_tenths}" -ge "${limit_tenths}" ]; then
+                timed_out=1
+                break
+            fi
+            sleep 0.1
+            elapsed_tenths=$((elapsed_tenths + 1))
+        done
+
+        if [ "${timed_out}" -eq 1 ]; then
             kill -TERM "${cmd_pid}" 2>/dev/null || true
-            sleep 1
+            sleep 0.1
             kill -KILL "${cmd_pid}" 2>/dev/null || true
-        ) &
-        local watcher_pid=$!
-        if wait "${cmd_pid}" 2>/dev/null; then
-            exit_code=0
+            wait "${cmd_pid}" 2>/dev/null || true
+            rm -f "${tmp_out}"
+            record_fail "${CHECK_NAME:-Unknown check}" "docker exec timed out after ${timeout_sec}s (docker exec $*)"
+            return 124
         else
-            exit_code=$?
+            wait "${cmd_pid}" 2>/dev/null || exit_code=$?
+            cat "${tmp_out}"
+            rm -f "${tmp_out}"
         fi
-        kill "${watcher_pid}" 2>/dev/null || true
-        wait "${watcher_pid}" 2>/dev/null || true
     fi
 
     if [ "${exit_code}" -eq 124 ] || [ "${exit_code}" -eq 137 ] || [ "${exit_code}" -eq 143 ]; then
