@@ -1,5 +1,6 @@
 package com.ticketing.consumer;
 
+import com.ticketing.common.messaging.Topics;
 import org.springframework.kafka.config.KafkaListenerEndpoint;
 import org.springframework.kafka.retrytopic.DestinationTopic;
 import org.springframework.kafka.retrytopic.RetryTopicNamesProviderFactory;
@@ -7,6 +8,7 @@ import org.springframework.kafka.support.Suffixer;
 
 import java.util.List;
 import java.util.Objects;
+import java.util.Set;
 import java.util.function.Supplier;
 
 /**
@@ -23,6 +25,26 @@ public class TicketingRetryTopicNamesProviderFactory implements RetryTopicNamesP
     public static final String RETRY_0_SUFFIX = "-retry-0";
     public static final String RETRY_1_SUFFIX = "-retry-1";
     public static final String DLT_SUFFIX = "-dlt";
+
+    public static final String ORDER_SERVICE_INVENTORY_CG = "order-service-inventory-cg";
+    public static final String PAYMENT_SERVICE_ORDER_CG = "payment-service-order-cg";
+    public static final String INVENTORY_SERVICE_PAYMENT_CG = "inventory-service-payment-cg";
+    public static final String ORDER_SERVICE_PAYMENT_CG = "order-service-payment-cg";
+    public static final String NOTIFICATION_SERVICE_ORDER_CG = "notification-service-order-cg";
+
+    public static final Set<String> WHITELISTED_CONSUMER_GROUPS = Set.of(
+            ORDER_SERVICE_INVENTORY_CG,
+            PAYMENT_SERVICE_ORDER_CG,
+            INVENTORY_SERVICE_PAYMENT_CG,
+            ORDER_SERVICE_PAYMENT_CG,
+            NOTIFICATION_SERVICE_ORDER_CG
+    );
+
+    private static final Set<String> WHITELISTED_TOPICS = Set.of(
+            Topics.INVENTORY_EVENTS,
+            Topics.ORDER_EVENTS,
+            Topics.PAYMENT_EVENTS
+    );
 
     private static final ThreadLocal<String> ENDPOINT_CONSUMER_GROUP = new ThreadLocal<>();
 
@@ -41,9 +63,10 @@ public class TicketingRetryTopicNamesProviderFactory implements RetryTopicNamesP
      * customizes a {@code @KafkaListener} endpoint and collects its retry and DLT topic names.
      */
     public static <T> T withConsumerGroup(String consumerGroup, Supplier<T> action) {
+        String validated = validateWhitelistedConsumerGroup(consumerGroup);
         String previous = ENDPOINT_CONSUMER_GROUP.get();
         try {
-            ENDPOINT_CONSUMER_GROUP.set(consumerGroup);
+            ENDPOINT_CONSUMER_GROUP.set(validated);
             return action.get();
         } finally {
             if (previous == null) {
@@ -54,19 +77,40 @@ public class TicketingRetryTopicNamesProviderFactory implements RetryTopicNamesP
         }
     }
 
+    /**
+     * Validates that {@code groupId} is non-blank and, after stripping any retry or DLT suffix,
+     * belongs to {@link #WHITELISTED_CONSUMER_GROUPS} defined in {@code docs/arch/03-kafka.md}.
+     *
+     * @throws IllegalStateException if {@code groupId} is null, blank, or not in the whitelist
+     */
+    public static String validateWhitelistedConsumerGroup(String groupId) {
+        if (groupId == null || groupId.isBlank()) {
+            throw new IllegalStateException(
+                    "A @KafkaListener endpoint must declare an explicit non-blank groupId");
+        }
+        String baseGroup = stripRetryOrDltSuffix(groupId.trim());
+        if (baseGroup == null || baseGroup.isBlank() || !WHITELISTED_CONSUMER_GROUPS.contains(baseGroup)) {
+            throw new IllegalStateException(
+                    "Consumer group '" + groupId + "' (base group '" + baseGroup
+                            + "') is not in the whitelisted consumer groups from docs/arch/03-kafka.md: "
+                            + WHITELISTED_CONSUMER_GROUPS);
+        }
+        return baseGroup;
+    }
+
     public static String retryTopicName(String mainTopic, String consumerGroup, int attemptIndex) {
         requireNonBlank(mainTopic, "mainTopic");
         requireNonBlank(consumerGroup, "consumerGroup");
         if (attemptIndex < 0) {
             throw new IllegalArgumentException("attemptIndex must be >= 0, but was: " + attemptIndex);
         }
-        return mainTopic + "-" + consumerGroup + "-retry-" + attemptIndex;
+        return mainTopic + "-" + stripRetryOrDltSuffix(consumerGroup.trim()) + "-retry-" + attemptIndex;
     }
 
     public static String dltTopicName(String mainTopic, String consumerGroup) {
         requireNonBlank(mainTopic, "mainTopic");
         requireNonBlank(consumerGroup, "consumerGroup");
-        return mainTopic + "-" + consumerGroup + DLT_SUFFIX;
+        return mainTopic + "-" + stripRetryOrDltSuffix(consumerGroup.trim()) + DLT_SUFFIX;
     }
 
     public static String retryGroupId(String consumerGroup, int attemptIndex) {
@@ -74,44 +118,106 @@ public class TicketingRetryTopicNamesProviderFactory implements RetryTopicNamesP
         if (attemptIndex < 0) {
             throw new IllegalArgumentException("attemptIndex must be >= 0, but was: " + attemptIndex);
         }
-        return consumerGroup + "-retry-" + attemptIndex;
+        return stripRetryOrDltSuffix(consumerGroup.trim()) + "-retry-" + attemptIndex;
     }
 
     public static String dltGroupId(String consumerGroup) {
         requireNonBlank(consumerGroup, "consumerGroup");
-        return consumerGroup + DLT_SUFFIX;
+        return stripRetryOrDltSuffix(consumerGroup.trim()) + DLT_SUFFIX;
     }
 
     public static RetryTopicNames topicNamesFor(String mainTopic, String consumerGroup) {
+        String baseGroup = stripRetryOrDltSuffix(consumerGroup.trim());
         return new RetryTopicNames(
                 mainTopic,
-                consumerGroup,
-                retryTopicName(mainTopic, consumerGroup, 0),
-                retryTopicName(mainTopic, consumerGroup, 1),
-                dltTopicName(mainTopic, consumerGroup),
-                retryGroupId(consumerGroup, 0),
-                retryGroupId(consumerGroup, 1),
-                dltGroupId(consumerGroup)
+                baseGroup,
+                retryTopicName(mainTopic, baseGroup, 0),
+                retryTopicName(mainTopic, baseGroup, 1),
+                dltTopicName(mainTopic, baseGroup),
+                retryGroupId(baseGroup, 0),
+                retryGroupId(baseGroup, 1),
+                dltGroupId(baseGroup)
         );
     }
 
     /**
-     * Strips any {@code -retry-0}, {@code -retry-1}, or {@code -dlt} suffix from a consumer group ID.
+     * Strips any {@code -retry-0}, {@code -retry-1}, or {@code -dlt} suffix from a consumer group ID or topic name.
      */
-    public static String stripRetryOrDltSuffix(String groupId) {
-        if (groupId == null) {
+    public static String stripRetryOrDltSuffix(String value) {
+        if (value == null) {
             return null;
         }
-        if (groupId.endsWith(RETRY_0_SUFFIX)) {
-            return groupId.substring(0, groupId.length() - RETRY_0_SUFFIX.length());
+        if (value.endsWith(RETRY_0_SUFFIX)) {
+            return value.substring(0, value.length() - RETRY_0_SUFFIX.length());
         }
-        if (groupId.endsWith(RETRY_1_SUFFIX)) {
-            return groupId.substring(0, groupId.length() - RETRY_1_SUFFIX.length());
+        if (value.endsWith(RETRY_1_SUFFIX)) {
+            return value.substring(0, value.length() - RETRY_1_SUFFIX.length());
         }
-        if (groupId.endsWith(DLT_SUFFIX)) {
-            return groupId.substring(0, groupId.length() - DLT_SUFFIX.length());
+        if (value.endsWith(DLT_SUFFIX)) {
+            return value.substring(0, value.length() - DLT_SUFFIX.length());
         }
-        return groupId;
+        return value;
+    }
+
+    /**
+     * Returns {@code true} when {@code topic} is a primary domain topic (not a {@code -retry-N} or {@code -dlt} topic).
+     */
+    public static boolean isMainTopic(String topic) {
+        if (topic == null || topic.isBlank()) {
+            return false;
+        }
+        return !topic.endsWith(RETRY_0_SUFFIX)
+                && !topic.endsWith(RETRY_1_SUFFIX)
+                && !topic.endsWith(DLT_SUFFIX)
+                && !topic.contains("-retry-");
+    }
+
+    /**
+     * Derives the original main topic from trusted listener/destination topic names using suffix stripping,
+     * never consulting untrusted Kafka record headers.
+     */
+    public static String deriveTrustedOriginalTopic(String destinationTopic, String sourceTopic) {
+        if (isMainTopic(sourceTopic)) {
+            return sourceTopic;
+        }
+        String withoutSuffix = stripRetryOrDltSuffix(destinationTopic != null ? destinationTopic : sourceTopic);
+        if (withoutSuffix != null) {
+            for (String group : WHITELISTED_CONSUMER_GROUPS) {
+                String suffix = "-" + group;
+                if (withoutSuffix.endsWith(suffix) && withoutSuffix.length() > suffix.length()) {
+                    return withoutSuffix.substring(0, withoutSuffix.length() - suffix.length());
+                }
+            }
+            for (String knownTopic : WHITELISTED_TOPICS) {
+                if (withoutSuffix.startsWith(knownTopic + "-")) {
+                    return knownTopic;
+                }
+            }
+        }
+        return sourceTopic != null ? sourceTopic : ConsumerMetrics.UNKNOWN_TAG;
+    }
+
+    /**
+     * Derives the base consumer group from the trusted listener exception group ID or destination topic name
+     * using suffix stripping, never consulting untrusted Kafka record headers.
+     */
+    public static String deriveTrustedConsumerGroup(String listenerGroupId, String destinationTopic, String originalTopic) {
+        if (listenerGroupId != null && !listenerGroupId.isBlank()) {
+            return stripRetryOrDltSuffix(listenerGroupId.trim());
+        }
+        String withoutSuffix = stripRetryOrDltSuffix(destinationTopic);
+        if (withoutSuffix != null) {
+            for (String group : WHITELISTED_CONSUMER_GROUPS) {
+                if (withoutSuffix.endsWith("-" + group)) {
+                    return group;
+                }
+            }
+            if (originalTopic != null && withoutSuffix.startsWith(originalTopic + "-")
+                    && withoutSuffix.length() > originalTopic.length() + 1) {
+                return withoutSuffix.substring(originalTopic.length() + 1);
+            }
+        }
+        return ConsumerMetrics.UNKNOWN_TAG;
     }
 
     @Override
@@ -122,14 +228,14 @@ public class TicketingRetryTopicNamesProviderFactory implements RetryTopicNamesP
 
     private String resolveConsumerGroup(String candidate) {
         if (candidate != null && !candidate.isBlank()) {
-            return stripRetryOrDltSuffix(candidate);
+            return validateWhitelistedConsumerGroup(candidate);
         }
         String fromThreadLocal = ENDPOINT_CONSUMER_GROUP.get();
         if (fromThreadLocal != null && !fromThreadLocal.isBlank()) {
-            return stripRetryOrDltSuffix(fromThreadLocal);
+            return validateWhitelistedConsumerGroup(fromThreadLocal);
         }
         if (defaultConsumerGroup != null && !defaultConsumerGroup.isBlank()) {
-            return stripRetryOrDltSuffix(defaultConsumerGroup);
+            return validateWhitelistedConsumerGroup(defaultConsumerGroup);
         }
         return null;
     }
@@ -164,7 +270,7 @@ public class TicketingRetryTopicNamesProviderFactory implements RetryTopicNamesP
         public TicketingRetryTopicNamesProvider(DestinationTopic.Properties properties, String consumerGroup) {
             this.properties = Objects.requireNonNull(properties, "properties must not be null");
             this.suffixer = new Suffixer(properties.suffix());
-            this.consumerGroup = consumerGroup;
+            this.consumerGroup = consumerGroup != null ? validateWhitelistedConsumerGroup(consumerGroup) : null;
         }
 
         @Override
@@ -175,8 +281,8 @@ public class TicketingRetryTopicNamesProviderFactory implements RetryTopicNamesP
 
         @Override
         public String getGroupId(KafkaListenerEndpoint endpoint) {
-            captureConsumerGroup(endpoint);
-            return suffixer.maybeAddTo(endpoint.getGroupId());
+            String baseGroup = captureConsumerGroup(endpoint);
+            return suffixer.maybeAddTo(baseGroup);
         }
 
         @Override
@@ -193,37 +299,24 @@ public class TicketingRetryTopicNamesProviderFactory implements RetryTopicNamesP
 
         @Override
         public String getTopicName(String topic) {
-            if (properties.isMainEndpoint()) {
-                return topic;
-            }
             String resolvedGroup = this.consumerGroup;
             if (resolvedGroup == null || resolvedGroup.isBlank()) {
                 resolvedGroup = ENDPOINT_CONSUMER_GROUP.get();
             }
-            if (resolvedGroup == null || resolvedGroup.isBlank()) {
-                throw new IllegalStateException(
-                        "Cannot build retry/DLT topic name for topic '" + topic
-                                + "' without a non-blank consumer group ID on the @KafkaListener endpoint");
+            String baseGroup = validateWhitelistedConsumerGroup(resolvedGroup);
+            if (properties.isMainEndpoint()) {
+                return topic;
             }
-            String baseGroup = stripRetryOrDltSuffix(resolvedGroup);
             return suffixer.maybeAddTo(topic + "-" + baseGroup);
         }
 
-        private void captureConsumerGroup(KafkaListenerEndpoint endpoint) {
+        private String captureConsumerGroup(KafkaListenerEndpoint endpoint) {
             if (endpoint == null) {
-                return;
+                return validateWhitelistedConsumerGroup(this.consumerGroup);
             }
-            String groupId = endpoint.getGroupId();
-            if (groupId == null || groupId.isBlank()) {
-                groupId = endpoint.getGroup();
-            }
-            if (groupId == null || groupId.isBlank()) {
-                groupId = endpoint.getId();
-            }
-            if (groupId != null && !groupId.isBlank()) {
-                this.consumerGroup = stripRetryOrDltSuffix(groupId);
-            }
+            String baseGroup = validateWhitelistedConsumerGroup(endpoint.getGroupId());
+            this.consumerGroup = baseGroup;
+            return baseGroup;
         }
     }
 }
-

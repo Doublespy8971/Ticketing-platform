@@ -1,6 +1,7 @@
 package com.ticketing.consumer;
 
 import com.ticketing.common.messaging.EventTypes;
+import com.ticketing.common.messaging.Topics;
 import io.micrometer.core.instrument.Counter;
 import io.micrometer.core.instrument.Meter;
 import io.micrometer.core.instrument.MeterRegistry;
@@ -26,8 +27,8 @@ import java.util.concurrent.TimeUnit;
  * </ul>
  * <p>
  * The {@code service} tag is never added manually on individual meters; it comes from the registry's common tags.
- * All {@code event_type} tag values are whitelisted against {@link EventTypes} constants, with any other or
- * unparseable value mapped to {@code "unknown"} to prevent tag cardinality explosion.
+ * All {@code event_type}, {@code topic}, and {@code consumer_group} tag values are whitelisted against known
+ * architecture constants, with any unrecognized value mapped to {@code "unknown"} to prevent tag cardinality explosion.
  */
 public class ConsumerMetrics {
 
@@ -37,7 +38,8 @@ public class ConsumerMetrics {
     public static final String RETRIED_TOTAL_METRIC = "consumer_events_retried_total";
     public static final String PROCESSING_SECONDS_METRIC = "consumer_event_processing_seconds";
 
-    public static final String UNKNOWN_EVENT_TYPE = "unknown";
+    public static final String UNKNOWN_TAG = "unknown";
+    public static final String UNKNOWN_EVENT_TYPE = UNKNOWN_TAG;
     public static final String DEFAULT_SERVICE_NAME = "unknown-service";
 
     public static final Set<String> WHITELISTED_EVENT_TYPES = Set.of(
@@ -54,6 +56,15 @@ public class ConsumerMetrics {
             EventTypes.PAYMENT_FAILED,
             EventTypes.PAYMENT_REFUNDED
     );
+
+    public static final Set<String> WHITELISTED_TOPICS = Set.of(
+            Topics.INVENTORY_EVENTS,
+            Topics.ORDER_EVENTS,
+            Topics.PAYMENT_EVENTS
+    );
+
+    public static final Set<String> WHITELISTED_CONSUMER_GROUPS =
+            TicketingRetryTopicNamesProviderFactory.WHITELISTED_CONSUMER_GROUPS;
 
     private record GroupEventKey(String consumerGroup, String eventType) {
     }
@@ -96,13 +107,40 @@ public class ConsumerMetrics {
         if (eventType != null && WHITELISTED_EVENT_TYPES.contains(eventType)) {
             return eventType;
         }
-        return UNKNOWN_EVENT_TYPE;
+        return UNKNOWN_TAG;
+    }
+
+    /**
+     * Whitelists {@code topic} against the three domain {@link Topics} constants, mapping {@code null},
+     * blank, or unrecognized values to {@code "unknown"}.
+     */
+    public static String sanitizeTopic(String topic) {
+        if (topic != null && WHITELISTED_TOPICS.contains(topic)) {
+            return topic;
+        }
+        return UNKNOWN_TAG;
+    }
+
+    /**
+     * Strips any retry/DLT suffix and whitelists {@code consumerGroup} against the consumer groups in
+     * {@code docs/arch/03-kafka.md}, mapping {@code null}, blank, or unrecognized values to {@code "unknown"}.
+     */
+    public static String sanitizeConsumerGroup(String consumerGroup) {
+        if (consumerGroup == null || consumerGroup.isBlank()) {
+            return UNKNOWN_TAG;
+        }
+        String stripped = TicketingRetryTopicNamesProviderFactory.stripRetryOrDltSuffix(consumerGroup.trim());
+        if (stripped != null && WHITELISTED_CONSUMER_GROUPS.contains(stripped)) {
+            return stripped;
+        }
+        return UNKNOWN_TAG;
     }
 
     public void recordProcessed(String consumerGroup, String eventType) {
         Objects.requireNonNull(consumerGroup, "consumerGroup must not be null");
+        String safeGroup = sanitizeConsumerGroup(consumerGroup);
         String safeEventType = sanitizeEventType(eventType);
-        processedCounters.computeIfAbsent(new GroupEventKey(consumerGroup, safeEventType), key ->
+        processedCounters.computeIfAbsent(new GroupEventKey(safeGroup, safeEventType), key ->
                 Counter.builder(PROCESSED_TOTAL_METRIC)
                         .tag("consumer_group", key.consumerGroup())
                         .tag("event_type", key.eventType())
@@ -113,8 +151,9 @@ public class ConsumerMetrics {
 
     public void recordDuplicate(String consumerGroup, String eventType) {
         Objects.requireNonNull(consumerGroup, "consumerGroup must not be null");
+        String safeGroup = sanitizeConsumerGroup(consumerGroup);
         String safeEventType = sanitizeEventType(eventType);
-        duplicateCounters.computeIfAbsent(new GroupEventKey(consumerGroup, safeEventType), key ->
+        duplicateCounters.computeIfAbsent(new GroupEventKey(safeGroup, safeEventType), key ->
                 Counter.builder(DUPLICATE_TOTAL_METRIC)
                         .tag("consumer_group", key.consumerGroup())
                         .tag("event_type", key.eventType())
@@ -125,8 +164,9 @@ public class ConsumerMetrics {
 
     public void recordRetried(String consumerGroup, String eventType) {
         Objects.requireNonNull(consumerGroup, "consumerGroup must not be null");
+        String safeGroup = sanitizeConsumerGroup(consumerGroup);
         String safeEventType = sanitizeEventType(eventType);
-        retriedCounters.computeIfAbsent(new GroupEventKey(consumerGroup, safeEventType), key ->
+        retriedCounters.computeIfAbsent(new GroupEventKey(safeGroup, safeEventType), key ->
                 Counter.builder(RETRIED_TOTAL_METRIC)
                         .tag("consumer_group", key.consumerGroup())
                         .tag("event_type", key.eventType())
@@ -137,9 +177,10 @@ public class ConsumerMetrics {
 
     public void recordProcessingDuration(String consumerGroup, String eventType, long durationNanos) {
         Objects.requireNonNull(consumerGroup, "consumerGroup must not be null");
+        String safeGroup = sanitizeConsumerGroup(consumerGroup);
         String safeEventType = sanitizeEventType(eventType);
         if (durationNanos >= 0L) {
-            processingTimers.computeIfAbsent(new GroupEventKey(consumerGroup, safeEventType), key ->
+            processingTimers.computeIfAbsent(new GroupEventKey(safeGroup, safeEventType), key ->
                     Timer.builder(PROCESSING_SECONDS_METRIC)
                             .tag("consumer_group", key.consumerGroup())
                             .tag("event_type", key.eventType())
@@ -157,7 +198,9 @@ public class ConsumerMetrics {
     public void recordDeadLetter(String originalTopic, String consumerGroup) {
         Objects.requireNonNull(originalTopic, "originalTopic must not be null");
         Objects.requireNonNull(consumerGroup, "consumerGroup must not be null");
-        dltCounters.computeIfAbsent(new TopicGroupKey(originalTopic, consumerGroup), key ->
+        String safeTopic = sanitizeTopic(originalTopic);
+        String safeGroup = sanitizeConsumerGroup(consumerGroup);
+        dltCounters.computeIfAbsent(new TopicGroupKey(safeTopic, safeGroup), key ->
                 Counter.builder(DLT_TOTAL_METRIC)
                         .tag("topic", key.topic())
                         .tag("consumer_group", key.consumerGroup())
@@ -170,4 +213,3 @@ public class ConsumerMetrics {
         return meterRegistry;
     }
 }
-

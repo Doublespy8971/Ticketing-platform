@@ -39,6 +39,8 @@ Every Spring Boot service under `com.ticketing.<service>` follows this exact pac
 - `com.ticketing.<service>.idempotency` — `IdempotencyKeyFilter`, `ProcessedEventRepository`.
 - `com.ticketing.<service>.config` — Redis Lua `DefaultRedisScript` beans, Kafka producer/consumer factories, Jackson `ObjectMapper`, Micrometer meters.
 
+> **Dedicated Scheduler Rule (`@Scheduled`)**: Every `@Scheduled` method in the platform must explicitly name its dedicated scheduler bean via `@Scheduled(..., scheduler = "<schedulerBeanName>")` (for example, `ticketingOutboxScheduler`, `expirySweeperScheduler`, or `ticketingConsumerCleanupScheduler`) so background tasks never share or hijack a default `TaskScheduler` thread.
+
 ---
 
 ### 10.2 Correlation-ID & Identity Propagation

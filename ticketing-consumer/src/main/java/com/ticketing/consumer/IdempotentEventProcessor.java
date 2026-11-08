@@ -5,12 +5,15 @@ import com.ticketing.common.events.EventEnvelope;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.jdbc.core.JdbcTemplate;
+import org.springframework.jdbc.datasource.DataSourceTransactionManager;
 import org.springframework.transaction.IllegalTransactionStateException;
 import org.springframework.transaction.PlatformTransactionManager;
 import org.springframework.transaction.TransactionDefinition;
+import org.springframework.transaction.UnexpectedRollbackException;
 import org.springframework.transaction.support.TransactionSynchronizationManager;
 import org.springframework.transaction.support.TransactionTemplate;
 
+import javax.sql.DataSource;
 import java.util.Objects;
 import java.util.UUID;
 import java.util.function.Consumer;
@@ -59,6 +62,7 @@ public class IdempotentEventProcessor {
         this.transactionTemplate = Objects.requireNonNull(transactionTemplate, "transactionTemplate must not be null");
         this.metrics = Objects.requireNonNull(metrics, "metrics must not be null");
         this.envelopeParser = Objects.requireNonNull(envelopeParser, "envelopeParser must not be null");
+        validateTransactionTemplate(this.jdbcTemplate, this.transactionTemplate);
     }
 
     private static TransactionTemplate createTransactionTemplate(PlatformTransactionManager transactionManager) {
@@ -68,20 +72,47 @@ public class IdempotentEventProcessor {
         return template;
     }
 
+    private static void validateTransactionTemplate(JdbcTemplate jdbcTemplate, TransactionTemplate transactionTemplate) {
+        int propagation = transactionTemplate.getPropagationBehavior();
+        if (propagation != TransactionDefinition.PROPAGATION_REQUIRED
+                && propagation != TransactionDefinition.PROPAGATION_REQUIRES_NEW) {
+            throw new IllegalArgumentException(
+                    "TransactionTemplate propagation must be PROPAGATION_REQUIRED or PROPAGATION_REQUIRES_NEW, but was: "
+                            + propagation);
+        }
+        if (transactionTemplate.isReadOnly()) {
+            throw new IllegalArgumentException("TransactionTemplate must not be read-only");
+        }
+        PlatformTransactionManager txManager = transactionTemplate.getTransactionManager();
+        if (txManager == null) {
+            throw new IllegalArgumentException("TransactionTemplate transactionManager must not be null");
+        }
+        if (txManager instanceof DataSourceTransactionManager dstm) {
+            DataSource txDataSource = dstm.getDataSource();
+            DataSource jdbcDataSource = jdbcTemplate.getDataSource();
+            if (txDataSource == null || txDataSource != jdbcDataSource) {
+                throw new IllegalArgumentException(
+                        "DataSourceTransactionManager DataSource must be the same instance as JdbcTemplate DataSource");
+            }
+        }
+    }
+
     /**
      * Runs the {@code processed_events} deduplication insert and {@code businessLogic} inside ONE database
      * transaction.
      *
      * @param eventId       unique event identifier from the {@link EventEnvelope}
-     * @param consumerGroup logical Kafka consumer group name
+     * @param consumerGroup logical Kafka consumer group name (any {@code -retry-0}, {@code -retry-1}, or
+     *                      {@code -dlt} suffix is stripped before deduplication and metric recording)
      * @param eventType     event type discriminator
      * @param businessLogic domain state mutations and outbox writes to execute if not a duplicate
      * @return {@code true} if the event was processed and committed, {@code false} if skipped as a duplicate
      * @throws IllegalTransactionStateException if called inside an already-active transaction
+     * @throws UnexpectedRollbackException      if {@code businessLogic} marks the transaction rollback-only
      */
     public boolean process(UUID eventId, String consumerGroup, String eventType, Runnable businessLogic) {
         Objects.requireNonNull(eventId, "eventId must not be null");
-        requireNonBlank(consumerGroup, "consumerGroup");
+        String normalizedGroup = normalizeConsumerGroup(consumerGroup);
         requireNonBlank(eventType, "eventType");
         Objects.requireNonNull(businessLogic, "businessLogic must not be null");
 
@@ -94,27 +125,32 @@ public class IdempotentEventProcessor {
                 int inserted = jdbcTemplate.update(
                         INSERT_PROCESSED_EVENT_SQL,
                         eventId,
-                        consumerGroup,
+                        normalizedGroup,
                         eventType
                 );
                 if (inserted == 0) {
                     log.debug("Skipping duplicate event eventId={} consumerGroup={} eventType={}",
-                            eventId, consumerGroup, eventType);
+                            eventId, normalizedGroup, eventType);
                     return Boolean.FALSE;
                 }
                 businessLogic.run();
+                if (status.isRollbackOnly()) {
+                    throw new UnexpectedRollbackException(
+                            "Transaction was marked rollback-only during businessLogic execution for eventId="
+                                    + eventId + ", consumerGroup=" + normalizedGroup);
+                }
                 return Boolean.TRUE;
             });
 
             if (Boolean.TRUE.equals(processed)) {
-                metrics.recordProcessed(consumerGroup, safeEventType);
+                metrics.recordProcessed(normalizedGroup, safeEventType);
                 return true;
             } else {
-                metrics.recordDuplicate(consumerGroup, safeEventType);
+                metrics.recordDuplicate(normalizedGroup, safeEventType);
                 return false;
             }
         } finally {
-            metrics.recordProcessingDuration(consumerGroup, safeEventType, System.nanoTime() - startNanos);
+            metrics.recordProcessingDuration(normalizedGroup, safeEventType, System.nanoTime() - startNanos);
         }
     }
 
@@ -127,7 +163,7 @@ public class IdempotentEventProcessor {
      * {@code eventType} if present).
      */
     public boolean process(String rawJson, String consumerGroup, Consumer<EventEnvelope<JsonNode>> handler) {
-        requireNonBlank(consumerGroup, "consumerGroup");
+        String normalizedGroup = normalizeConsumerGroup(consumerGroup);
         Objects.requireNonNull(handler, "handler must not be null");
         ensureNoActiveTransaction();
 
@@ -137,10 +173,10 @@ public class IdempotentEventProcessor {
             envelope = envelopeParser.parse(rawJson);
         } catch (RuntimeException ex) {
             String fallbackEventType = envelopeParser.extractWhitelistedEventTypeOrUnknown(rawJson);
-            metrics.recordProcessingDuration(consumerGroup, fallbackEventType, System.nanoTime() - parseStartNanos);
+            metrics.recordProcessingDuration(normalizedGroup, fallbackEventType, System.nanoTime() - parseStartNanos);
             throw ex;
         }
-        return process(envelope.eventId(), consumerGroup, envelope.eventType(), () -> handler.accept(envelope));
+        return process(envelope.eventId(), normalizedGroup, envelope.eventType(), () -> handler.accept(envelope));
     }
 
     /**
@@ -151,7 +187,7 @@ public class IdempotentEventProcessor {
                                String consumerGroup,
                                Class<T> payloadType,
                                Consumer<EventEnvelope<T>> handler) {
-        requireNonBlank(consumerGroup, "consumerGroup");
+        String normalizedGroup = normalizeConsumerGroup(consumerGroup);
         Objects.requireNonNull(payloadType, "payloadType must not be null");
         Objects.requireNonNull(handler, "handler must not be null");
         ensureNoActiveTransaction();
@@ -162,10 +198,17 @@ public class IdempotentEventProcessor {
             envelope = envelopeParser.parse(rawJson, payloadType);
         } catch (RuntimeException ex) {
             String fallbackEventType = envelopeParser.extractWhitelistedEventTypeOrUnknown(rawJson);
-            metrics.recordProcessingDuration(consumerGroup, fallbackEventType, System.nanoTime() - parseStartNanos);
+            metrics.recordProcessingDuration(normalizedGroup, fallbackEventType, System.nanoTime() - parseStartNanos);
             throw ex;
         }
-        return process(envelope.eventId(), consumerGroup, envelope.eventType(), () -> handler.accept(envelope));
+        return process(envelope.eventId(), normalizedGroup, envelope.eventType(), () -> handler.accept(envelope));
+    }
+
+    private static String normalizeConsumerGroup(String consumerGroup) {
+        requireNonBlank(consumerGroup, "consumerGroup");
+        String stripped = TicketingRetryTopicNamesProviderFactory.stripRetryOrDltSuffix(consumerGroup.trim());
+        requireNonBlank(stripped, "consumerGroup");
+        return stripped;
     }
 
     private static void ensureNoActiveTransaction() {
@@ -183,4 +226,3 @@ public class IdempotentEventProcessor {
         }
     }
 }
-

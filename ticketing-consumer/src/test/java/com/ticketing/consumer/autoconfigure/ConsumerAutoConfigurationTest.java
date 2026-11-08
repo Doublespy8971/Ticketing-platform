@@ -17,20 +17,32 @@ import io.micrometer.core.instrument.MeterRegistry;
 import io.micrometer.core.instrument.Tag;
 import io.micrometer.core.instrument.simple.SimpleMeterRegistry;
 import org.apache.kafka.clients.consumer.ConsumerConfig;
+import org.apache.kafka.clients.producer.ProducerConfig;
 import org.apache.kafka.common.serialization.StringDeserializer;
 import org.junit.jupiter.api.Test;
 import org.springframework.boot.autoconfigure.AutoConfigurations;
+import org.springframework.boot.autoconfigure.kafka.KafkaAutoConfiguration;
 import org.springframework.boot.test.context.runner.ApplicationContextRunner;
+import org.springframework.context.annotation.Configuration;
 import org.springframework.jdbc.core.JdbcTemplate;
+import org.springframework.jdbc.datasource.DataSourceTransactionManager;
 import org.springframework.jdbc.datasource.DriverManagerDataSource;
+import org.springframework.kafka.annotation.KafkaListener;
 import org.springframework.kafka.config.ConcurrentKafkaListenerContainerFactory;
 import org.springframework.kafka.config.MethodKafkaListenerEndpoint;
 import org.springframework.kafka.core.ConsumerFactory;
+import org.springframework.kafka.core.KafkaTemplate;
+import org.springframework.kafka.core.ProducerFactory;
 import org.springframework.kafka.listener.ContainerProperties;
 import org.springframework.kafka.retrytopic.DestinationTopic;
 import org.springframework.kafka.retrytopic.DltStrategy;
+import org.springframework.kafka.retrytopic.RetryTopicConfiguration;
 import org.springframework.kafka.retrytopic.RetryTopicNamesProviderFactory;
+import org.springframework.kafka.retrytopic.RetryTopicSchedulerWrapper;
 import org.springframework.scheduling.concurrent.ThreadPoolTaskScheduler;
+import org.springframework.test.util.ReflectionTestUtils;
+import org.springframework.transaction.TransactionDefinition;
+import org.springframework.transaction.support.TransactionTemplate;
 
 import javax.sql.DataSource;
 import java.nio.file.Files;
@@ -39,6 +51,8 @@ import java.time.Duration;
 import java.util.List;
 import java.util.Map;
 import java.util.UUID;
+import java.util.concurrent.ScheduledThreadPoolExecutor;
+import java.util.concurrent.atomic.AtomicReference;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
@@ -48,28 +62,32 @@ class ConsumerAutoConfigurationTest {
     private final DataSource dataSource = new DriverManagerDataSource("jdbc:postgresql://localhost:5432/test");
 
     private final ApplicationContextRunner contextRunner = new ApplicationContextRunner()
-            .withConfiguration(AutoConfigurations.of(ConsumerAutoConfiguration.class))
+            .withConfiguration(AutoConfigurations.of(KafkaAutoConfiguration.class, ConsumerAutoConfiguration.class))
             .withBean(DataSource.class, () -> dataSource)
             .withBean(JdbcTemplate.class, () -> new JdbcTemplate(dataSource))
             .withBean(MeterRegistry.class, SimpleMeterRegistry::new);
 
     @Test
-    void registersConsumerBeansContainerSettingsAndDedicatedCleanupScheduler() {
+    void takesPrecedenceOverKafkaAutoConfigurationForConsumerWhilePreservingDefaultKafkaTemplate() {
         contextRunner
-                .withPropertyValues("spring.application.name=order-service")
+                .withPropertyValues(
+                        "spring.application.name=order-service",
+                        "spring.kafka.bootstrap-servers=localhost:29092",
+                        "spring.kafka.producer.acks=1",
+                        "spring.kafka.producer.properties.linger.ms=17"
+                )
                 .run(context -> {
                     assertThat(context).hasSingleBean(IdempotentEventProcessor.class);
                     assertThat(context).hasSingleBean(ConsumerEnvelopeParser.class);
                     assertThat(context).hasSingleBean(ConsumerMetrics.class);
                     assertThat(context).hasSingleBean(ProcessedEventsRetentionCleaner.class);
                     assertThat(context).hasBean("ticketingConsumerCleanupScheduler");
-                    assertThat(context.getBean("ticketingConsumerCleanupScheduler"))
-                            .isInstanceOf(ThreadPoolTaskScheduler.class);
+                    assertThat(context).hasBean("ticketingRetryBackoffScheduler");
 
                     @SuppressWarnings("unchecked")
                     ConsumerFactory<String, String> consumerFactory = context.getBean(ConsumerFactory.class);
-                    Map<String, Object> props = consumerFactory.getConfigurationProperties();
-                    assertThat(props)
+                    Map<String, Object> consumerProps = consumerFactory.getConfigurationProperties();
+                    assertThat(consumerProps)
                             .containsEntry(ConsumerConfig.KEY_DESERIALIZER_CLASS_CONFIG, StringDeserializer.class)
                             .containsEntry(ConsumerConfig.VALUE_DESERIALIZER_CLASS_CONFIG, StringDeserializer.class)
                             .containsEntry(ConsumerConfig.ENABLE_AUTO_COMMIT_CONFIG, false)
@@ -83,7 +101,37 @@ class ConsumerAutoConfigurationTest {
                             context.getBean("kafkaListenerContainerFactory", ConcurrentKafkaListenerContainerFactory.class);
                     assertThat(containerFactory.getContainerProperties().getAckMode())
                             .isEqualTo(ContainerProperties.AckMode.RECORD);
+                    assertThat(containerFactory.getConsumerFactory()).isSameAs(consumerFactory);
                     assertThat(context).hasSingleBean(CorrelationRecordInterceptor.class);
+                    assertThat(ReflectionTestUtils.getField(containerFactory, "recordInterceptor"))
+                            .isSameAs(context.getBean(CorrelationRecordInterceptor.class));
+
+                    // Application's default KafkaTemplate and ProducerFactory from KafkaAutoConfiguration still exist
+                    // and are not replaced or modified by ticketing-consumer
+                    assertThat(context).hasSingleBean(KafkaTemplate.class);
+                    assertThat(context).hasSingleBean(ProducerFactory.class);
+                    KafkaTemplate<?, ?> defaultTemplate = context.getBean("kafkaTemplate", KafkaTemplate.class);
+                    ProducerFactory<?, ?> defaultProducerFactory = context.getBean("kafkaProducerFactory", ProducerFactory.class);
+                    assertThat(defaultTemplate.getProducerFactory()).isSameAs(defaultProducerFactory);
+                    assertThat(defaultProducerFactory.getConfigurationProperties())
+                            .containsEntry(ProducerConfig.ACKS_CONFIG, "1")
+                            .containsEntry(ProducerConfig.LINGER_MS_CONFIG, "17")
+                            .doesNotContainKey(ProducerConfig.ENABLE_IDEMPOTENCE_CONFIG);
+
+                    // Retry/DLT KafkaTemplate is dedicated, not the default template, and enforces acks=all + idempotence=true
+                    ConsumerAutoConfiguration.RetryKafkaTemplateHolder retryHolder =
+                            context.getBean(ConsumerAutoConfiguration.RetryKafkaTemplateHolder.class);
+                    KafkaTemplate<String, String> retryTemplate = retryHolder.kafkaTemplate();
+                    assertThat(retryTemplate).isNotSameAs(defaultTemplate);
+                    assertThat(retryTemplate.getProducerFactory()).isNotSameAs(defaultProducerFactory);
+                    assertThat(retryTemplate.getProducerFactory().getConfigurationProperties())
+                            .containsEntry(ProducerConfig.ACKS_CONFIG, "all")
+                            .containsEntry(ProducerConfig.ENABLE_IDEMPOTENCE_CONFIG, true);
+
+                    RetryTopicConfiguration retryTopicConfig = context.getBean(RetryTopicConfiguration.class);
+                    for (DestinationTopic.Properties destProps : retryTopicConfig.getDestinationTopicProperties()) {
+                        assertThat(ReflectionTestUtils.getField(destProps, "kafkaOperations")).isSameAs(retryTemplate);
+                    }
 
                     ConsumerCleanupProperties cleanupProps = context.getBean(ConsumerCleanupProperties.class);
                     assertThat(cleanupProps.isEnabled()).isTrue();
@@ -91,6 +139,76 @@ class ConsumerAutoConfigurationTest {
                     assertThat(cleanupProps.getBatchSize()).isEqualTo(5000);
                     assertThat(cleanupProps.getCron()).isEqualTo("0 0 * * * *");
                 });
+    }
+
+    @Test
+    void closingApplicationContextShutsDownRetryBackoffScheduler() {
+        AtomicReference<ScheduledThreadPoolExecutor> executorRef = new AtomicReference<>();
+        contextRunner.run(context -> {
+            ThreadPoolTaskScheduler retryScheduler =
+                    context.getBean("ticketingRetryBackoffScheduler", ThreadPoolTaskScheduler.class);
+            RetryTopicSchedulerWrapper wrapper = context.getBean(RetryTopicSchedulerWrapper.class);
+            assertThat(wrapper.getScheduler()).isSameAs(retryScheduler);
+
+            ScheduledThreadPoolExecutor executor = retryScheduler.getScheduledThreadPoolExecutor();
+            assertThat(executor.isShutdown()).isFalse();
+            executorRef.set(executor);
+        });
+        assertThat(executorRef.get()).isNotNull();
+        assertThat(executorRef.get().isShutdown()).isTrue();
+    }
+
+    @Test
+    void kafkaListenerWithoutExplicitGroupIdFailsContextStartupWithIllegalStateException() {
+        contextRunner
+                .withUserConfiguration(ListenerWithoutGroupIdConfig.class)
+                .run(context -> {
+                    assertThat(context).hasFailed();
+                    assertThat(context.getStartupFailure())
+                            .hasRootCauseInstanceOf(IllegalStateException.class)
+                            .rootCause()
+                            .hasMessageContaining("groupId");
+                });
+
+        contextRunner
+                .withUserConfiguration(ListenerWithUnwhitelistedGroupIdConfig.class)
+                .run(context -> {
+                    assertThat(context).hasFailed();
+                    assertThat(context.getStartupFailure())
+                            .hasRootCauseInstanceOf(IllegalStateException.class)
+                            .rootCause()
+                            .hasMessageContaining("whitelisted");
+                });
+    }
+
+    @Test
+    void idempotentEventProcessorConstructorValidatesTransactionTemplateSettingsAndDataSource() {
+        JdbcTemplate jdbcTemplate = new JdbcTemplate(dataSource);
+        DataSourceTransactionManager validTxManager = new DataSourceTransactionManager(dataSource);
+        ConsumerMetrics metrics = new ConsumerMetrics(new SimpleMeterRegistry());
+
+        TransactionTemplate badPropagation = new TransactionTemplate(validTxManager);
+        badPropagation.setPropagationBehavior(TransactionDefinition.PROPAGATION_SUPPORTS);
+        assertThatThrownBy(() -> new IdempotentEventProcessor(jdbcTemplate, badPropagation, metrics))
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessageContaining("propagation");
+
+        TransactionTemplate readOnlyTemplate = new TransactionTemplate(validTxManager);
+        readOnlyTemplate.setReadOnly(true);
+        assertThatThrownBy(() -> new IdempotentEventProcessor(jdbcTemplate, readOnlyTemplate, metrics))
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessageContaining("read-only");
+
+        DataSource otherDataSource = new DriverManagerDataSource("jdbc:postgresql://localhost:5432/other");
+        TransactionTemplate mismatchedDataSourceTemplate =
+                new TransactionTemplate(new DataSourceTransactionManager(otherDataSource));
+        assertThatThrownBy(() -> new IdempotentEventProcessor(jdbcTemplate, mismatchedDataSourceTemplate, metrics))
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessageContaining("DataSource");
+
+        TransactionTemplate requiresNewTemplate = new TransactionTemplate(validTxManager);
+        requiresNewTemplate.setPropagationBehavior(TransactionDefinition.PROPAGATION_REQUIRES_NEW);
+        assertThat(new IdempotentEventProcessor(jdbcTemplate, requiresNewTemplate, metrics)).isNotNull();
     }
 
     @Test
@@ -205,23 +323,29 @@ class ConsumerAutoConfigurationTest {
     }
 
     @Test
-    void metricTagsAreStrictlyBoundedAndUnknownEventTypesMapToUnknown() {
+    void metricTagsAreStrictlyBoundedAndUnknownValuesMapToUnknown() {
         SimpleMeterRegistry registry = new SimpleMeterRegistry();
         registry.config().commonTags("service", "order-service");
         ConsumerMetrics metrics = new ConsumerMetrics(registry, "order-service");
 
-        metrics.recordDeadLetter(Topics.PAYMENT_EVENTS, "order-service-payment-cg");
+        metrics.recordDeadLetter(Topics.PAYMENT_EVENTS, "order-service-payment-cg-retry-1");
+        metrics.recordDeadLetter("forged.evil.topic", "forged-evil-group");
         metrics.recordProcessed("order-service-payment-cg", EventTypes.PAYMENT_SUCCEEDED);
-        metrics.recordDuplicate("order-service-payment-cg", EventTypes.PAYMENT_SUCCEEDED);
-        metrics.recordRetried("order-service-payment-cg", "evil.unbounded.event.type");
+        metrics.recordDuplicate("order-service-payment-cg-retry-0", EventTypes.PAYMENT_SUCCEEDED);
+        metrics.recordRetried("forged-evil-group", "evil.unbounded.event.type");
         metrics.recordProcessingDuration("order-service-payment-cg", null, Duration.ofMillis(12));
 
-        Meter dltMeter = registry.get(ConsumerMetrics.DLT_TOTAL_METRIC).counter();
-        assertThat(dltMeter.getId().getTags().stream().map(Tag::getKey).toList())
+        Meter validDltMeter = registry.get(ConsumerMetrics.DLT_TOTAL_METRIC)
+                .tags("topic", Topics.PAYMENT_EVENTS, "consumer_group", "order-service-payment-cg")
+                .counter();
+        assertThat(validDltMeter.getId().getTags().stream().map(Tag::getKey).toList())
                 .containsExactlyInAnyOrder("service", "topic", "consumer_group");
-        assertThat(dltMeter.getId().getTag("service")).isEqualTo("order-service");
-        assertThat(dltMeter.getId().getTag("topic")).isEqualTo(Topics.PAYMENT_EVENTS);
-        assertThat(dltMeter.getId().getTag("consumer_group")).isEqualTo("order-service-payment-cg");
+        assertThat(validDltMeter.getId().getTag("service")).isEqualTo("order-service");
+
+        Meter unknownDltMeter = registry.get(ConsumerMetrics.DLT_TOTAL_METRIC)
+                .tags("topic", "unknown", "consumer_group", "unknown")
+                .counter();
+        assertThat(unknownDltMeter).isNotNull();
 
         for (String meterName : List.of(
                 ConsumerMetrics.PROCESSED_TOTAL_METRIC,
@@ -232,9 +356,10 @@ class ConsumerAutoConfigurationTest {
             assertThat(meter.getId().getTags().stream().map(Tag::getKey).toList())
                     .containsExactlyInAnyOrder("service", "consumer_group", "event_type");
             assertThat(meter.getId().getTag("service")).isEqualTo("order-service");
-            assertThat(meter.getId().getTag("consumer_group")).isEqualTo("order-service-payment-cg");
         }
 
+        assertThat(registry.get(ConsumerMetrics.RETRIED_TOTAL_METRIC).counter().getId().getTag("consumer_group"))
+                .isEqualTo("unknown");
         assertThat(registry.get(ConsumerMetrics.RETRIED_TOTAL_METRIC).counter().getId().getTag("event_type"))
                 .isEqualTo("unknown");
         assertThat(registry.get(ConsumerMetrics.PROCESSING_SECONDS_METRIC).timer().getId().getTag("event_type"))
@@ -289,5 +414,21 @@ class ConsumerAutoConfigurationTest {
         EventEnvelope<JsonNode> envelope = parser.parse(validJson);
         assertThat(envelope.eventType()).isEqualTo(EventTypes.PAYMENT_SUCCEEDED);
         assertThat(envelope.schemaVersion()).isEqualTo(1);
+    }
+
+    @Configuration(proxyBeanMethods = false)
+    static class ListenerWithoutGroupIdConfig {
+
+        @KafkaListener(topics = Topics.PAYMENT_EVENTS, autoStartup = "false")
+        public void onPayment(String value) {
+        }
+    }
+
+    @Configuration(proxyBeanMethods = false)
+    static class ListenerWithUnwhitelistedGroupIdConfig {
+
+        @KafkaListener(topics = Topics.PAYMENT_EVENTS, groupId = "rogue-unwhitelisted-cg", autoStartup = "false")
+        public void onPayment(String value) {
+        }
     }
 }

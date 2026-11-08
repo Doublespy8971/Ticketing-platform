@@ -29,6 +29,7 @@ import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.slf4j.MDC;
 import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.boot.autoconfigure.kafka.KafkaAutoConfiguration;
 import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.Configuration;
 import org.springframework.context.annotation.Import;
@@ -36,17 +37,14 @@ import org.springframework.core.io.ClassPathResource;
 import org.springframework.jdbc.core.JdbcTemplate;
 import org.springframework.jdbc.datasource.init.ResourceDatabasePopulator;
 import org.springframework.kafka.annotation.KafkaListener;
-import org.springframework.kafka.annotation.RetryableTopic;
 import org.springframework.kafka.core.KafkaTemplate;
-import org.springframework.kafka.retrytopic.DltStrategy;
-import org.springframework.kafka.retrytopic.TopicSuffixingStrategy;
 import org.springframework.kafka.support.KafkaHeaders;
-import org.springframework.retry.annotation.Backoff;
 import org.springframework.test.context.DynamicPropertyRegistry;
 import org.springframework.test.context.DynamicPropertySource;
 import org.springframework.test.context.junit.jupiter.SpringJUnitConfig;
 import org.springframework.transaction.IllegalTransactionStateException;
 import org.springframework.transaction.PlatformTransactionManager;
+import org.springframework.transaction.UnexpectedRollbackException;
 import org.springframework.transaction.support.TransactionTemplate;
 import org.testcontainers.containers.KafkaContainer;
 import org.testcontainers.containers.PostgreSQLContainer;
@@ -123,9 +121,10 @@ class ConsumerIntegrationTest {
         String scriptContent = Files.readString(Path.of("../infra/kafka/create-topics.sh"));
         List<NewTopic> topicsToCreate = new ArrayList<>();
 
+        // Match infra/kafka/create-topics.sh: 12 partitions for main and retry topics, 3 partitions for DLT topics
         for (String primary : List.of(Topics.INVENTORY_EVENTS, Topics.ORDER_EVENTS, Topics.PAYMENT_EVENTS)) {
             assertThat(scriptContent).contains(primary);
-            topicsToCreate.add(new NewTopic(primary, 3, (short) 1));
+            topicsToCreate.add(new NewTopic(primary, 12, (short) 1));
         }
 
         Matcher matcher = Pattern.compile("\"([a-z0-9.\\-]+-cg)\"").matcher(scriptContent);
@@ -133,8 +132,8 @@ class ConsumerIntegrationTest {
         while (matcher.find()) {
             String base = matcher.group(1);
             retryBases.add(base);
-            topicsToCreate.add(new NewTopic(base + "-retry-0", 3, (short) 1));
-            topicsToCreate.add(new NewTopic(base + "-retry-1", 3, (short) 1));
+            topicsToCreate.add(new NewTopic(base + "-retry-0", 12, (short) 1));
+            topicsToCreate.add(new NewTopic(base + "-retry-1", 12, (short) 1));
             topicsToCreate.add(new NewTopic(base + "-dlt", 3, (short) 1));
         }
         assertThat(retryBases).containsExactly(
@@ -239,6 +238,76 @@ class ConsumerIntegrationTest {
     }
 
     @Test
+    void duplicateAcrossMainGroupAndRetry0GroupRunsLogicOnceWithMetricsUnderMainGroup() throws Exception {
+        UUID eventId = UUID.randomUUID();
+        String mainGroup = "order-service-payment-cg";
+        String retry0Group = "order-service-payment-cg-retry-0";
+        AtomicInteger runs = new AtomicInteger();
+
+        double beforeProcessed = counterValue(ConsumerMetrics.PROCESSED_TOTAL_METRIC, mainGroup, EventTypes.PAYMENT_SUCCEEDED);
+        double beforeDuplicate = counterValue(ConsumerMetrics.DUPLICATE_TOTAL_METRIC, mainGroup, EventTypes.PAYMENT_SUCCEEDED);
+
+        String json = buildEnvelopeJson(eventId, EventTypes.PAYMENT_SUCCEEDED, "corr-retry-group-dedup", 1, Map.of("k", "v"));
+        boolean first = processor.process(json, mainGroup, (EventEnvelope<JsonNode> env) -> {
+            runs.incrementAndGet();
+            jdbcTemplate.update("INSERT INTO test_domain_events (event_id, note) VALUES (?, ?)", eventId, "main");
+        });
+        boolean second = processor.process(json, retry0Group, (EventEnvelope<JsonNode> env) -> {
+            runs.incrementAndGet();
+            jdbcTemplate.update("INSERT INTO test_domain_events (event_id, note) VALUES (?, ?)", eventId, "retry-0");
+        });
+
+        assertThat(first).isTrue();
+        assertThat(second).isFalse();
+        assertThat(runs.get()).isEqualTo(1);
+        assertThat(countProcessedEvents(eventId, mainGroup)).isEqualTo(1);
+        assertThat(countProcessedEvents(eventId, retry0Group)).isZero();
+        assertThat(countDomainRows(eventId)).isEqualTo(1);
+        assertThat(counterValue(ConsumerMetrics.PROCESSED_TOTAL_METRIC, mainGroup, EventTypes.PAYMENT_SUCCEEDED))
+                .isEqualTo(beforeProcessed + 1.0);
+        assertThat(counterValue(ConsumerMetrics.DUPLICATE_TOTAL_METRIC, mainGroup, EventTypes.PAYMENT_SUCCEEDED))
+                .isEqualTo(beforeDuplicate + 1.0);
+        assertThat(metrics.getMeterRegistry().find(ConsumerMetrics.DUPLICATE_TOTAL_METRIC)
+                .tag("consumer_group", retry0Group)
+                .counter()).isNull();
+    }
+
+    @Test
+    void businessLogicMarkingTransactionRollbackOnlyThrowsUnexpectedRollbackExceptionWithEmptyTableAndUnchangedCounter() {
+        UUID eventId = UUID.randomUUID();
+        String group = "order-service-payment-cg";
+        double beforeProcessed = counterValue(ConsumerMetrics.PROCESSED_TOTAL_METRIC, group, EventTypes.PAYMENT_SUCCEEDED);
+
+        assertThatThrownBy(() -> processor.process(eventId, group, EventTypes.PAYMENT_SUCCEEDED, () -> {
+            jdbcTemplate.update("INSERT INTO test_domain_events (event_id, note) VALUES (?, ?)", eventId, "rollback-only");
+            new TransactionTemplate(transactionManager).executeWithoutResult(status -> status.setRollbackOnly());
+        })).isInstanceOf(UnexpectedRollbackException.class);
+
+        assertThat(countProcessedEvents(eventId, group)).isZero();
+        assertThat(countDomainRows(eventId)).isZero();
+        assertThat(counterValue(ConsumerMetrics.PROCESSED_TOTAL_METRIC, group, EventTypes.PAYMENT_SUCCEEDED))
+                .isEqualTo(beforeProcessed);
+    }
+
+    @Test
+    void hundredCharacterConsumerGroupWorksAgainstProcessedEventsTableFromSqlFile() {
+        UUID eventId = UUID.randomUUID();
+        String group100 = "cg-" + "a".repeat(97);
+        assertThat(group100).hasSize(100);
+
+        double unknownBefore = counterValue(ConsumerMetrics.PROCESSED_TOTAL_METRIC, "unknown", EventTypes.PAYMENT_SUCCEEDED);
+
+        boolean processed = processor.process(eventId, group100, EventTypes.PAYMENT_SUCCEEDED, () ->
+                jdbcTemplate.update("INSERT INTO test_domain_events (event_id, note) VALUES (?, ?)", eventId, "len-100"));
+
+        assertThat(processed).isTrue();
+        assertThat(countProcessedEvents(eventId, group100)).isEqualTo(1);
+        assertThat(countDomainRows(eventId)).isEqualTo(1);
+        assertThat(counterValue(ConsumerMetrics.PROCESSED_TOTAL_METRIC, "unknown", EventTypes.PAYMENT_SUCCEEDED))
+                .isEqualTo(unknownBefore + 1.0);
+    }
+
+    @Test
     void sameEventIdUnderTwoDifferentConsumerGroupsRunsOncePerGroup() {
         UUID eventId = UUID.randomUUID();
         AtomicInteger runs = new AtomicInteger();
@@ -329,7 +398,7 @@ class ConsumerIntegrationTest {
     void handlerFailingOnceIsRetriedViaRetry0AndSucceedsWithOneProcessedRow() throws Exception {
         UUID eventId = UUID.randomUUID();
         String group = TestKafkaListeners.ORDER_PAYMENT_GROUP;
-        testListeners.configureFailuresFor(eventId, 1, false);
+        testListeners.configureFailuresFor(eventId, 1, FailureMode.TRANSIENT);
 
         double retriedBefore = counterValue(ConsumerMetrics.RETRIED_TOTAL_METRIC, group, EventTypes.PAYMENT_SUCCEEDED);
         double processedBefore = counterValue(ConsumerMetrics.PROCESSED_TOTAL_METRIC, group, EventTypes.PAYMENT_SUCCEEDED);
@@ -352,19 +421,21 @@ class ConsumerIntegrationTest {
     }
 
     @Test
-    void handlerAlwaysFailingEndsInDltAfterThreeAttemptsWithOriginalMainTopicHeadersAndDltMetric() throws Exception {
+    void handlerAlwaysFailingOnPartition9EndsInDltPartition0To2AfterThreeAttemptsWithOriginalPartition9() throws Exception {
         UUID eventId = UUID.randomUUID();
         String group = TestKafkaListeners.ORDER_PAYMENT_GROUP;
-        testListeners.configureFailuresFor(eventId, 10, false);
+        int sourcePartition = 9;
+        testListeners.configureFailuresFor(eventId, 10, FailureMode.TRANSIENT);
 
         double dltBefore = dltCounterValue(Topics.PAYMENT_EVENTS, group);
         double retriedBefore = counterValue(ConsumerMetrics.RETRIED_TOTAL_METRIC, group, EventTypes.PAYMENT_SUCCEEDED);
 
         String json = buildEnvelopeJson(eventId, EventTypes.PAYMENT_SUCCEEDED, "corr-always-fail", 1, Map.of("note", "fail"));
         RecordMetadata mainMetadata = kafkaTemplate
-                .send(new ProducerRecord<>(Topics.PAYMENT_EVENTS, eventId.toString(), json))
+                .send(new ProducerRecord<>(Topics.PAYMENT_EVENTS, sourcePartition, eventId.toString(), json))
                 .get(10, TimeUnit.SECONDS)
                 .getRecordMetadata();
+        assertThat(mainMetadata.partition()).isEqualTo(sourcePartition);
 
         ConsumerRecord<String, String> dltRecord = pollDltRecordByKey(
                 Topics.PAYMENT_EVENTS_ORDER_SERVICE_DLT, eventId.toString(), Duration.ofSeconds(25));
@@ -373,8 +444,9 @@ class ConsumerIntegrationTest {
         assertThat(countProcessedEvents(eventId, group)).isZero();
         assertThat(countDomainRows(eventId)).isZero();
 
+        assertThat(dltRecord.partition()).isBetween(0, 2);
         assertThat(headerString(dltRecord, KafkaHeaders.DLT_ORIGINAL_TOPIC)).isEqualTo(Topics.PAYMENT_EVENTS);
-        assertThat(headerInt(dltRecord, KafkaHeaders.DLT_ORIGINAL_PARTITION)).isEqualTo(mainMetadata.partition());
+        assertThat(headerInt(dltRecord, KafkaHeaders.DLT_ORIGINAL_PARTITION)).isEqualTo(sourcePartition);
         assertThat(headerLong(dltRecord, KafkaHeaders.DLT_ORIGINAL_OFFSET)).isEqualTo(mainMetadata.offset());
         assertThat(headerLong(dltRecord, KafkaHeaders.DLT_ORIGINAL_TIMESTAMP)).isPositive();
         assertThat(headerString(dltRecord, KafkaHeaders.DLT_EXCEPTION_FQCN))
@@ -393,7 +465,7 @@ class ConsumerIntegrationTest {
     void nonRetryableEventExceptionGoesStraightToDltWithoutHittingRetry0() throws Exception {
         UUID eventId = UUID.randomUUID();
         String group = TestKafkaListeners.ORDER_PAYMENT_GROUP;
-        testListeners.configureFailuresFor(eventId, 10, true);
+        testListeners.configureFailuresFor(eventId, 10, FailureMode.NON_RETRYABLE);
 
         double dltBefore = dltCounterValue(Topics.PAYMENT_EVENTS, group);
         double retriedBefore = counterValue(ConsumerMetrics.RETRIED_TOTAL_METRIC, group, EventTypes.PAYMENT_SUCCEEDED);
@@ -412,6 +484,70 @@ class ConsumerIntegrationTest {
         assertThat(dltCounterValue(Topics.PAYMENT_EVENTS, group)).isEqualTo(dltBefore + 1.0);
         assertThat(counterValue(ConsumerMetrics.RETRIED_TOTAL_METRIC, group, EventTypes.PAYMENT_SUCCEEDED))
                 .isEqualTo(retriedBefore);
+    }
+
+    @Test
+    void nonRetryableEventExceptionWrappedInRuntimeExceptionGoesStraightToDltWithNothingOnRetryTopics() throws Exception {
+        UUID eventId = UUID.randomUUID();
+        String group = TestKafkaListeners.ORDER_PAYMENT_GROUP;
+        testListeners.configureFailuresFor(eventId, 10, FailureMode.WRAPPED_NON_RETRYABLE);
+
+        double dltBefore = dltCounterValue(Topics.PAYMENT_EVENTS, group);
+        double retriedBefore = counterValue(ConsumerMetrics.RETRIED_TOTAL_METRIC, group, EventTypes.PAYMENT_SUCCEEDED);
+
+        String json = buildEnvelopeJson(eventId, EventTypes.PAYMENT_SUCCEEDED, "corr-wrapped-non-retryable", 1, Map.of("note", "wrapped"));
+        kafkaTemplate.send(new ProducerRecord<>(Topics.PAYMENT_EVENTS, eventId.toString(), json))
+                .get(10, TimeUnit.SECONDS);
+
+        ConsumerRecord<String, String> dltRecord = pollDltRecordByKey(
+                Topics.PAYMENT_EVENTS_ORDER_SERVICE_DLT, eventId.toString(), Duration.ofSeconds(10));
+
+        assertThat(dltRecord.value()).isEqualTo(json);
+        assertThat(testListeners.attemptsFor(eventId)).isEqualTo(1);
+        assertThat(headerString(dltRecord, KafkaHeaders.DLT_EXCEPTION_FQCN))
+                .isEqualTo(NonRetryableEventException.class.getName());
+        assertThat(headerString(dltRecord, KafkaHeaders.DLT_EXCEPTION_MESSAGE))
+                .contains("Wrapped non-retryable rejection for " + eventId);
+        assertThat(dltCounterValue(Topics.PAYMENT_EVENTS, group)).isEqualTo(dltBefore + 1.0);
+        assertThat(counterValue(ConsumerMetrics.RETRIED_TOTAL_METRIC, group, EventTypes.PAYMENT_SUCCEEDED))
+                .isEqualTo(retriedBefore);
+        assertThat(hasRecordWithKeyOnTopic(Topics.PAYMENT_EVENTS_ORDER_SERVICE_RETRY_0, eventId.toString())).isFalse();
+        assertThat(hasRecordWithKeyOnTopic(Topics.PAYMENT_EVENTS_ORDER_SERVICE_RETRY_1, eventId.toString())).isFalse();
+    }
+
+    @Test
+    void poisonRecordWithForgedDltHeadersEndsUpWithRealOriginalTopicAndOffsetAndWhitelistedMetricTags() throws Exception {
+        UUID eventId = UUID.randomUUID();
+        String group = TestKafkaListeners.ORDER_PAYMENT_GROUP;
+        testListeners.configureFailuresFor(eventId, 10, FailureMode.NON_RETRYABLE);
+
+        double dltBefore = dltCounterValue(Topics.PAYMENT_EVENTS, group);
+        String forgedTopic = "forged.evil.topic." + UUID.randomUUID();
+        String forgedGroup = "forged-evil-cg-" + UUID.randomUUID();
+        long forgedOffset = 999_999_999L;
+
+        String json = buildEnvelopeJson(eventId, EventTypes.PAYMENT_SUCCEEDED, "corr-forged-headers", 1, Map.of("note", "forged"));
+        ProducerRecord<String, String> record = new ProducerRecord<>(Topics.PAYMENT_EVENTS, 4, eventId.toString(), json);
+        record.headers().add(KafkaHeaders.DLT_ORIGINAL_TOPIC, forgedTopic.getBytes(StandardCharsets.UTF_8));
+        record.headers().add(KafkaHeaders.DLT_ORIGINAL_OFFSET, ByteBuffer.allocate(8).putLong(forgedOffset).array());
+        record.headers().add(KafkaHeaders.DLT_ORIGINAL_PARTITION, ByteBuffer.allocate(4).putInt(99).array());
+        record.headers().add(KafkaHeaders.DLT_ORIGINAL_CONSUMER_GROUP, forgedGroup.getBytes(StandardCharsets.UTF_8));
+
+        RecordMetadata mainMetadata = kafkaTemplate.send(record).get(10, TimeUnit.SECONDS).getRecordMetadata();
+
+        ConsumerRecord<String, String> dltRecord = pollDltRecordByKey(
+                Topics.PAYMENT_EVENTS_ORDER_SERVICE_DLT, eventId.toString(), Duration.ofSeconds(10));
+
+        assertThat(headerString(dltRecord, KafkaHeaders.DLT_ORIGINAL_TOPIC)).isEqualTo(Topics.PAYMENT_EVENTS);
+        assertThat(headerLong(dltRecord, KafkaHeaders.DLT_ORIGINAL_OFFSET)).isEqualTo(mainMetadata.offset());
+        assertThat(headerInt(dltRecord, KafkaHeaders.DLT_ORIGINAL_PARTITION)).isEqualTo(mainMetadata.partition());
+        assertThat(dltCounterValue(Topics.PAYMENT_EVENTS, group)).isEqualTo(dltBefore + 1.0);
+        assertThat(metrics.getMeterRegistry().find(ConsumerMetrics.DLT_TOTAL_METRIC)
+                .tag("topic", forgedTopic)
+                .counter()).isNull();
+        assertThat(metrics.getMeterRegistry().find(ConsumerMetrics.DLT_TOTAL_METRIC)
+                .tag("consumer_group", forgedGroup)
+                .counter()).isNull();
     }
 
     @Test
@@ -471,7 +607,7 @@ class ConsumerIntegrationTest {
     }
 
     @Test
-    void cleanupDeletesOnlyRowsOlderThan192HoursAcrossMultipleBatches() {
+    void cleanupDeletesOnlyRowsOlderThan192HoursAcrossMultipleBatchesAndStopsWhenInterrupted() {
         String group = "order-service-inventory-cg";
         List<UUID> expiredIds = List.of(
                 UUID.randomUUID(), UUID.randomUUID(), UUID.randomUUID(), UUID.randomUUID(), UUID.randomUUID());
@@ -488,6 +624,14 @@ class ConsumerIntegrationTest {
                     INSERT INTO processed_events (event_id, consumer_group, event_type, processed_at)
                     VALUES (?, ?, ?, clock_timestamp() - INTERVAL '191 hours')
                     """, id, group, EventTypes.INVENTORY_SEAT_RESERVED);
+        }
+
+        // When current thread is interrupted, cleaner stops immediately before issuing batch deletes
+        Thread.currentThread().interrupt();
+        try {
+            assertThat(cleaner.purgeExpired()).isZero();
+        } finally {
+            Thread.interrupted();
         }
 
         // Configured batch-size is 2, so deleting 5 expired rows requires 3 batch iterations (2 + 2 + 1)
@@ -579,6 +723,36 @@ class ConsumerIntegrationTest {
         throw new AssertionError("Timed out waiting for DLT record with key " + expectedKey + " on " + dltTopic);
     }
 
+    private static boolean hasRecordWithKeyOnTopic(String topic, String expectedKey) {
+        Map<String, Object> props = Map.of(
+                ConsumerConfig.BOOTSTRAP_SERVERS_CONFIG, KAFKA.getBootstrapServers(),
+                ConsumerConfig.GROUP_ID_CONFIG, "retry-verifier-" + UUID.randomUUID(),
+                ConsumerConfig.KEY_DESERIALIZER_CLASS_CONFIG, StringDeserializer.class,
+                ConsumerConfig.VALUE_DESERIALIZER_CLASS_CONFIG, StringDeserializer.class,
+                ConsumerConfig.AUTO_OFFSET_RESET_CONFIG, "earliest",
+                ConsumerConfig.ENABLE_AUTO_COMMIT_CONFIG, false
+        );
+        try (KafkaConsumer<String, String> consumer = new KafkaConsumer<>(props)) {
+            var partitions = consumer.partitionsFor(topic).stream()
+                    .map(info -> new org.apache.kafka.common.TopicPartition(topic, info.partition()))
+                    .toList();
+            consumer.assign(partitions);
+            consumer.seekToBeginning(partitions);
+            Map<org.apache.kafka.common.TopicPartition, Long> endOffsets = consumer.endOffsets(partitions);
+            boolean hasAnyData = endOffsets.values().stream().anyMatch(offset -> offset > 0L);
+            if (!hasAnyData) {
+                return false;
+            }
+            ConsumerRecords<String, String> records = consumer.poll(Duration.ofMillis(300));
+            for (ConsumerRecord<String, String> record : records) {
+                if (expectedKey.equals(record.key())) {
+                    return true;
+                }
+            }
+            return false;
+        }
+    }
+
     private static String headerString(ConsumerRecord<?, ?> record, String key) {
         Header header = record.headers().lastHeader(key);
         assertThat(header).as("Header %s must be present", key).isNotNull();
@@ -597,8 +771,14 @@ class ConsumerIntegrationTest {
         return ByteBuffer.wrap(header.value()).getLong();
     }
 
+    enum FailureMode {
+        TRANSIENT,
+        NON_RETRYABLE,
+        WRAPPED_NON_RETRYABLE
+    }
+
     @Configuration
-    @Import(ConsumerAutoConfiguration.class)
+    @Import({ConsumerAutoConfiguration.class, KafkaAutoConfiguration.class})
     static class TestConfig {
 
         @Bean
@@ -645,7 +825,7 @@ class ConsumerIntegrationTest {
         static final String ORDER_PAYMENT_GROUP = "order-service-payment-cg";
         static final String ORDER_INVENTORY_GROUP = "order-service-inventory-cg";
 
-        private record FailurePlan(int failuresToThrow, boolean nonRetryable) {
+        private record FailurePlan(int failuresToThrow, FailureMode mode) {
         }
 
         private final IdempotentEventProcessor processor;
@@ -669,8 +849,8 @@ class ConsumerIntegrationTest {
             orderedProcessedIds.clear();
         }
 
-        void configureFailuresFor(UUID eventId, int failuresToThrow, boolean nonRetryable) {
-            failurePlans.put(eventId, new FailurePlan(failuresToThrow, nonRetryable));
+        void configureFailuresFor(UUID eventId, int failuresToThrow, FailureMode mode) {
+            failurePlans.put(eventId, new FailurePlan(failuresToThrow, mode));
         }
 
         int attemptsFor(UUID eventId) {
@@ -712,10 +892,17 @@ class ConsumerIntegrationTest {
                 int attempt = attemptCounts.computeIfAbsent(eventId, k -> new AtomicInteger()).incrementAndGet();
                 FailurePlan plan = failurePlans.get(eventId);
                 if (plan != null && attempt <= plan.failuresToThrow()) {
-                    if (plan.nonRetryable()) {
-                        throw new NonRetryableEventException("Explicit non-retryable rejection for " + eventId);
+                    switch (plan.mode()) {
+                        case NON_RETRYABLE ->
+                                throw new NonRetryableEventException("Explicit non-retryable rejection for " + eventId);
+                        case WRAPPED_NON_RETRYABLE ->
+                                throw new RuntimeException(
+                                        "Wrapper runtime exception",
+                                        new NonRetryableEventException("Wrapped non-retryable rejection for " + eventId)
+                                );
+                        case TRANSIENT ->
+                                throw new IllegalStateException("Simulated transient failure for " + eventId + " on attempt " + attempt);
                     }
-                    throw new IllegalStateException("Simulated transient failure for " + eventId + " on attempt " + attempt);
                 }
 
                 jdbcTemplate.update(

@@ -51,6 +51,10 @@ public class ProcessedEventsRetentionCleaner {
         int totalDeleted = 0;
 
         for (int i = 0; i < MAX_CLEANUP_ITERATIONS; i++) {
+            if (Thread.currentThread().isInterrupted()) {
+                log.debug("Stopping processed_events retention cleanup early because thread is interrupted");
+                break;
+            }
             int deleted = jdbcTemplate.update(DELETE_EXPIRED_SQL, retentionHours, batchSize);
             totalDeleted += deleted;
             if (deleted < batchSize) {
@@ -63,4 +67,3 @@ public class ProcessedEventsRetentionCleaner {
         return totalDeleted;
     }
 }
-
