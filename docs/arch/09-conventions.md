@@ -108,6 +108,7 @@ All custom metrics use the `ticketing_` prefix, lowercase `snake_case`, and base
 | `inventory_payment_events_handled_total` | `Counter` | `service`, `event_type`, `outcome` (`confirmed`, `rejected`, `released`, `noop`, `ignored`) | `inventory-service` | Total payment events handled by inventory-service partitioned by event type and outcome. |
 | `inventory_redis_confirm_failures_total` | `Counter` | `service` | `inventory-service` | Total Redis confirm failures after retries in inventory-service. |
 | `inventory_redis_release_failures_total` | `Counter` | `service` | `inventory-service` | Total Redis release failures after retries in inventory-service. |
+| `order_saga_events_handled_total` | `Counter` | `service`, `event_type`, `outcome` (`applied`, `noop`, `ignored`, `refund_requested`) | `order-service` | Total saga events handled by order-service partitioned by event type and outcome. |
 | `ticketing_notifications_sent_total` | `Counter` | `service`, `event_type`, `status` (`SENT`, `DEDUPLICATED`, `FAILED`) | `notification-service` | Total notifications dispatched or deduplicated via Redis. |
 
 > **Consumer meter tag rules**: the `service` tag on every meter comes from the registry's common tags and is never added per meter. The `event_type` tag of the `consumer_*` meters is restricted to the `EventTypes` constants of `ticketing-common`; any other value, including a missing or unparseable event type, is tagged `unknown`.

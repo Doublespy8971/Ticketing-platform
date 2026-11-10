@@ -29,6 +29,17 @@ public class OrderRepository {
             ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """;
 
+    private static final String INSERT_ORDER_IF_ABSENT_SQL = """
+            INSERT INTO orders (
+                order_id, reservation_id, user_id, event_id, status, total_amount_cents,
+                currency, payment_method_token, payment_id, cancellation_reason, version,
+                reserved_at, expires_at, checkout_at, paid_at, confirmed_at, cancelled_at,
+                refunded_at, created_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, clock_timestamp(), clock_timestamp())
+            ON CONFLICT (order_id) DO NOTHING
+            RETURNING created_at
+            """;
+
     private static final String INSERT_ITEM_SQL = """
             INSERT INTO order_items (
                 order_item_id, order_id, seat_id, section_code, row_label, seat_number, price_cents
@@ -84,6 +95,103 @@ public class OrderRepository {
             RETURNING checkout_at, version, updated_at
             """;
 
+    private static final String CANCEL_EXPIRED_FROM_RESERVED_SQL = """
+            UPDATE orders
+            SET status = 'CANCELLED_EXPIRED',
+                cancellation_reason = 'RESERVATION_EXPIRED',
+                cancelled_at = clock_timestamp(),
+                version = version + 1,
+                updated_at = clock_timestamp()
+            WHERE order_id = ?
+              AND status = 'RESERVED'
+            RETURNING cancelled_at
+            """;
+
+    private static final String CANCEL_EXPIRED_FROM_PAYMENT_PENDING_NO_PAYMENT_SQL = """
+            UPDATE orders
+            SET status = 'CANCELLED_EXPIRED',
+                cancellation_reason = 'RESERVATION_EXPIRED',
+                cancelled_at = clock_timestamp(),
+                version = version + 1,
+                updated_at = clock_timestamp()
+            WHERE order_id = ?
+              AND status = 'PAYMENT_PENDING'
+              AND payment_id IS NULL
+            RETURNING cancelled_at
+            """;
+
+    private static final String CONFIRM_FROM_PAYMENT_PENDING_SQL = """
+            UPDATE orders
+            SET status = 'CONFIRMED',
+                payment_id = COALESCE(payment_id, ?),
+                paid_at = COALESCE(paid_at, clock_timestamp()),
+                confirmed_at = clock_timestamp(),
+                version = version + 1,
+                updated_at = clock_timestamp()
+            WHERE order_id = ?
+              AND status = 'PAYMENT_PENDING'
+            RETURNING payment_id, confirmed_at
+            """;
+
+    private static final String TRANSITION_TO_REFUND_PENDING_SQL = """
+            UPDATE orders
+            SET status = 'REFUND_PENDING',
+                payment_id = COALESCE(?, payment_id),
+                paid_at = COALESCE(paid_at, ?),
+                cancellation_reason = ?,
+                version = version + 1,
+                updated_at = clock_timestamp()
+            WHERE order_id = ?
+              AND status = ?
+            RETURNING updated_at
+            """;
+
+    private static final String RECORD_PAYMENT_IN_PAYMENT_PENDING_SQL = """
+            UPDATE orders
+            SET payment_id = ?,
+                paid_at = COALESCE(?, clock_timestamp()),
+                version = version + 1,
+                updated_at = clock_timestamp()
+            WHERE order_id = ?
+              AND status = 'PAYMENT_PENDING'
+            """;
+
+    private static final String BACKFILL_PAYMENT_IN_CONFIRMED_SQL = """
+            UPDATE orders
+            SET payment_id = COALESCE(payment_id, ?),
+                paid_at = COALESCE(paid_at, ?, clock_timestamp()),
+                version = version + 1,
+                updated_at = clock_timestamp()
+            WHERE order_id = ?
+              AND status = 'CONFIRMED'
+            """;
+
+    private static final String CANCEL_PAYMENT_FAILED_FROM_PAYMENT_PENDING_SQL = """
+            UPDATE orders
+            SET status = 'CANCELLED_PAYMENT_FAILED',
+                payment_id = COALESCE(payment_id, ?),
+                cancellation_reason = 'PAYMENT_FAILED',
+                cancelled_at = clock_timestamp(),
+                version = version + 1,
+                updated_at = clock_timestamp()
+            WHERE order_id = ?
+              AND status = 'PAYMENT_PENDING'
+            RETURNING cancelled_at
+            """;
+
+    private static final String CANCEL_REFUNDED_FROM_REFUND_PENDING_SQL = """
+            UPDATE orders
+            SET status = 'CANCELLED_REFUNDED',
+                payment_id = COALESCE(payment_id, ?),
+                refunded_at = clock_timestamp(),
+                cancelled_at = COALESCE(cancelled_at, clock_timestamp()),
+                version = version + 1,
+                updated_at = clock_timestamp()
+            WHERE order_id = ?
+              AND status = 'REFUND_PENDING'
+            RETURNING refunded_at
+            """;
+
     public record OrderCheckoutLockResult(
             OrderRecord order,
             Instant dbClock,
@@ -94,6 +202,11 @@ public class OrderRepository {
             Instant checkoutAt,
             long version,
             Instant updatedAt
+    ) {}
+
+    public record OrderConfirmedUpdateResult(
+            UUID paymentId,
+            Instant confirmedAt
     ) {}
 
     private static final RowMapper<OrderRecord> ORDER_ROW_MAPPER = (rs, rowNum) -> new OrderRecord(
@@ -171,25 +284,69 @@ public class OrderRepository {
         });
 
         if (!items.isEmpty()) {
-            jdbcTemplate.batchUpdate(INSERT_ITEM_SQL, new BatchPreparedStatementSetter() {
-                @Override
-                public void setValues(PreparedStatement ps, int i) throws SQLException {
-                    OrderItemRecord item = items.get(i);
-                    ps.setObject(1, item.orderItemId());
-                    ps.setObject(2, item.orderId());
-                    ps.setObject(3, item.seatId());
-                    ps.setString(4, item.sectionCode());
-                    ps.setString(5, item.rowLabel());
-                    ps.setString(6, item.seatNumber());
-                    ps.setLong(7, item.priceCents());
-                }
-
-                @Override
-                public int getBatchSize() {
-                    return items.size();
-                }
-            });
+            insertItems(items);
         }
+    }
+
+    @Transactional(propagation = Propagation.MANDATORY)
+    public Optional<Instant> insertIfAbsent(OrderRecord order, List<OrderItemRecord> items) {
+        Objects.requireNonNull(order, "order must not be null");
+        Objects.requireNonNull(items, "items must not be null");
+
+        List<Instant> results = jdbcTemplate.query(
+                INSERT_ORDER_IF_ABSENT_SQL,
+                ps -> {
+                    ps.setObject(1, order.orderId());
+                    ps.setObject(2, order.reservationId());
+                    ps.setObject(3, order.userId());
+                    ps.setObject(4, order.eventId());
+                    ps.setString(5, order.status());
+                    ps.setLong(6, order.totalAmountCents());
+                    ps.setString(7, order.currency());
+                    ps.setString(8, order.paymentMethodToken());
+                    setUuid(ps, 9, order.paymentId());
+                    ps.setString(10, order.cancellationReason());
+                    ps.setLong(11, order.version());
+                    setTimestamp(ps, 12, order.reservedAt());
+                    setTimestamp(ps, 13, order.expiresAt());
+                    setTimestamp(ps, 14, order.checkoutAt());
+                    setTimestamp(ps, 15, order.paidAt());
+                    setTimestamp(ps, 16, order.confirmedAt());
+                    setTimestamp(ps, 17, order.cancelledAt());
+                    setTimestamp(ps, 18, order.refundedAt());
+                },
+                (rs, rowNum) -> toInstant(rs.getTimestamp("created_at"))
+        );
+
+        if (results.isEmpty()) {
+            return Optional.empty();
+        }
+
+        if (!items.isEmpty()) {
+            insertItems(items);
+        }
+        return Optional.of(results.get(0));
+    }
+
+    private void insertItems(List<OrderItemRecord> items) {
+        jdbcTemplate.batchUpdate(INSERT_ITEM_SQL, new BatchPreparedStatementSetter() {
+            @Override
+            public void setValues(PreparedStatement ps, int i) throws SQLException {
+                OrderItemRecord item = items.get(i);
+                ps.setObject(1, item.orderItemId());
+                ps.setObject(2, item.orderId());
+                ps.setObject(3, item.seatId());
+                ps.setString(4, item.sectionCode());
+                ps.setString(5, item.rowLabel());
+                ps.setString(6, item.seatNumber());
+                ps.setLong(7, item.priceCents());
+            }
+
+            @Override
+            public int getBatchSize() {
+                return items.size();
+            }
+        });
     }
 
     public Optional<OrderRecord> findById(UUID orderId) {
@@ -202,6 +359,7 @@ public class OrderRepository {
         return results.stream().findFirst();
     }
 
+    @Transactional(propagation = Propagation.MANDATORY)
     public Optional<OrderRecord> findByIdForUpdate(UUID orderId) {
         Objects.requireNonNull(orderId, "orderId must not be null");
         List<OrderRecord> results = jdbcTemplate.query(
@@ -255,8 +413,152 @@ public class OrderRepository {
         return results.get(0);
     }
 
+    @Transactional(propagation = Propagation.MANDATORY)
+    public Instant cancelExpiredFromReserved(UUID orderId) {
+        Objects.requireNonNull(orderId, "orderId must not be null");
+        List<Instant> results = jdbcTemplate.query(
+                CANCEL_EXPIRED_FROM_RESERVED_SQL,
+                ps -> ps.setObject(1, orderId),
+                (rs, rowNum) -> toInstant(rs.getTimestamp("cancelled_at"))
+        );
+        if (results.isEmpty()) {
+            throw new IllegalStateException("Failed to transition order " + orderId + " from RESERVED to CANCELLED_EXPIRED");
+        }
+        return results.get(0);
+    }
+
+    @Transactional(propagation = Propagation.MANDATORY)
+    public Instant cancelExpiredFromPaymentPendingWithoutPayment(UUID orderId) {
+        Objects.requireNonNull(orderId, "orderId must not be null");
+        List<Instant> results = jdbcTemplate.query(
+                CANCEL_EXPIRED_FROM_PAYMENT_PENDING_NO_PAYMENT_SQL,
+                ps -> ps.setObject(1, orderId),
+                (rs, rowNum) -> toInstant(rs.getTimestamp("cancelled_at"))
+        );
+        if (results.isEmpty()) {
+            throw new IllegalStateException("Failed to transition order " + orderId + " from PAYMENT_PENDING (payment_id IS NULL) to CANCELLED_EXPIRED");
+        }
+        return results.get(0);
+    }
+
+    @Transactional(propagation = Propagation.MANDATORY)
+    public OrderConfirmedUpdateResult confirmFromPaymentPending(UUID orderId, UUID paymentId) {
+        Objects.requireNonNull(orderId, "orderId must not be null");
+        List<OrderConfirmedUpdateResult> results = jdbcTemplate.query(
+                CONFIRM_FROM_PAYMENT_PENDING_SQL,
+                ps -> {
+                    setUuid(ps, 1, paymentId);
+                    ps.setObject(2, orderId);
+                },
+                (rs, rowNum) -> new OrderConfirmedUpdateResult(
+                        rs.getObject("payment_id", UUID.class),
+                        toInstant(rs.getTimestamp("confirmed_at"))
+                )
+        );
+        if (results.isEmpty()) {
+            throw new IllegalStateException("Failed to transition order " + orderId + " from PAYMENT_PENDING to CONFIRMED");
+        }
+        return results.get(0);
+    }
+
+    @Transactional(propagation = Propagation.MANDATORY)
+    public Instant transitionToRefundPending(
+            UUID orderId,
+            String expectedStatus,
+            UUID paymentId,
+            Instant paidAt,
+            String cancellationReason
+    ) {
+        Objects.requireNonNull(orderId, "orderId must not be null");
+        Objects.requireNonNull(expectedStatus, "expectedStatus must not be null");
+        List<Instant> results = jdbcTemplate.query(
+                TRANSITION_TO_REFUND_PENDING_SQL,
+                ps -> {
+                    setUuid(ps, 1, paymentId);
+                    setTimestamp(ps, 2, paidAt);
+                    ps.setString(3, cancellationReason);
+                    ps.setObject(4, orderId);
+                    ps.setString(5, expectedStatus);
+                },
+                (rs, rowNum) -> toInstant(rs.getTimestamp("updated_at"))
+        );
+        if (results.isEmpty()) {
+            throw new IllegalStateException("Failed to transition order " + orderId + " from " + expectedStatus + " to REFUND_PENDING");
+        }
+        return results.get(0);
+    }
+
+    @Transactional(propagation = Propagation.MANDATORY)
+    public void recordPaymentInPaymentPending(UUID orderId, UUID paymentId, Instant paidAt) {
+        Objects.requireNonNull(orderId, "orderId must not be null");
+        Objects.requireNonNull(paymentId, "paymentId must not be null");
+        int updated = jdbcTemplate.update(RECORD_PAYMENT_IN_PAYMENT_PENDING_SQL, ps -> {
+            ps.setObject(1, paymentId);
+            setTimestamp(ps, 2, paidAt);
+            ps.setObject(3, orderId);
+        });
+        if (updated != 1) {
+            throw new IllegalStateException("Failed to record payment in PAYMENT_PENDING for order " + orderId);
+        }
+    }
+
+    @Transactional(propagation = Propagation.MANDATORY)
+    public void backfillPaymentInConfirmed(UUID orderId, UUID paymentId, Instant paidAt) {
+        Objects.requireNonNull(orderId, "orderId must not be null");
+        int updated = jdbcTemplate.update(BACKFILL_PAYMENT_IN_CONFIRMED_SQL, ps -> {
+            setUuid(ps, 1, paymentId);
+            setTimestamp(ps, 2, paidAt);
+            ps.setObject(3, orderId);
+        });
+        if (updated != 1) {
+            throw new IllegalStateException("Failed to backfill payment in CONFIRMED for order " + orderId);
+        }
+    }
+
+    @Transactional(propagation = Propagation.MANDATORY)
+    public Instant cancelPaymentFailedFromPaymentPending(UUID orderId, UUID paymentId) {
+        Objects.requireNonNull(orderId, "orderId must not be null");
+        List<Instant> results = jdbcTemplate.query(
+                CANCEL_PAYMENT_FAILED_FROM_PAYMENT_PENDING_SQL,
+                ps -> {
+                    setUuid(ps, 1, paymentId);
+                    ps.setObject(2, orderId);
+                },
+                (rs, rowNum) -> toInstant(rs.getTimestamp("cancelled_at"))
+        );
+        if (results.isEmpty()) {
+            throw new IllegalStateException("Failed to transition order " + orderId + " from PAYMENT_PENDING to CANCELLED_PAYMENT_FAILED");
+        }
+        return results.get(0);
+    }
+
+    @Transactional(propagation = Propagation.MANDATORY)
+    public Instant cancelRefundedFromRefundPending(UUID orderId, UUID paymentId) {
+        Objects.requireNonNull(orderId, "orderId must not be null");
+        List<Instant> results = jdbcTemplate.query(
+                CANCEL_REFUNDED_FROM_REFUND_PENDING_SQL,
+                ps -> {
+                    setUuid(ps, 1, paymentId);
+                    ps.setObject(2, orderId);
+                },
+                (rs, rowNum) -> toInstant(rs.getTimestamp("refunded_at"))
+        );
+        if (results.isEmpty()) {
+            throw new IllegalStateException("Failed to transition order " + orderId + " from REFUND_PENDING to CANCELLED_REFUNDED");
+        }
+        return results.get(0);
+    }
+
     private static Instant toInstant(Timestamp ts) {
         return ts != null ? ts.toInstant() : null;
+    }
+
+    private static void setUuid(PreparedStatement ps, int paramIndex, UUID uuid) throws SQLException {
+        if (uuid != null) {
+            ps.setObject(paramIndex, uuid);
+        } else {
+            ps.setNull(paramIndex, Types.OTHER);
+        }
     }
 
     private static void setTimestamp(PreparedStatement ps, int paramIndex, Instant instant) throws SQLException {

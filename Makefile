@@ -1,7 +1,7 @@
 COMPOSE := docker compose -f infra/docker-compose.yml
 HEALTHY_SERVICES := kafka postgres-inventory postgres-order postgres-payment redis
 
-.PHONY: infra-up infra-down infra-reset infra-topics infra-psql-inventory infra-psql-order infra-psql-payment infra-redis-cli smoke-inventory
+.PHONY: infra-up infra-down infra-reset infra-topics infra-psql-inventory infra-psql-order infra-psql-payment infra-redis-cli smoke-inventory smoke-order
 
 infra-up:
 	@test -f infra/.env || cp infra/.env.example infra/.env
@@ -32,3 +32,6 @@ infra-redis-cli:
 
 smoke-inventory:
 	bash scripts/smoke-inventory.sh
+
+smoke-order:
+	bash scripts/smoke-order.sh

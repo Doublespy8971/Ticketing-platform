@@ -24,7 +24,7 @@ server:
 
 ticketing:
   outbox:
-    enabled: ${OUTBOX_ENABLED:false}
+    enabled: ${OUTBOX_ENABLED:true}
     advisory-lock-id: 71002
     poll-interval-ms: ${OUTBOX_POLL_INTERVAL_MS:200}
     batch-size: ${OUTBOX_BATCH_SIZE:100}
