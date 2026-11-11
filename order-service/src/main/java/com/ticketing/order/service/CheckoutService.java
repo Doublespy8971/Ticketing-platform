@@ -69,6 +69,7 @@ public class CheckoutService {
 
     // Test hooks for concurrency verification
     private volatile Runnable afterIdempotencyClaimHook;
+    private volatile Runnable beforeOrderLockHook;
     private volatile Runnable inTransactionHook;
 
     public CheckoutService(
@@ -89,6 +90,10 @@ public class CheckoutService {
 
     public void setAfterIdempotencyClaimHook(Runnable hook) {
         this.afterIdempotencyClaimHook = hook;
+    }
+
+    public void setBeforeOrderLockHook(Runnable hook) {
+        this.beforeOrderLockHook = hook;
     }
 
     public void setInTransactionHook(Runnable hook) {
@@ -136,6 +141,11 @@ public class CheckoutService {
                 }
 
                 CheckoutResponse createdResponse = transactionTemplate.execute(status -> {
+                    Runnable beforeLock = this.beforeOrderLockHook;
+                    if (beforeLock != null) {
+                        beforeLock.run();
+                    }
+
                     // 1. Lock the order and verify DB clock (order_id = ? AND user_id = ?)
                     Optional<OrderRepository.OrderCheckoutLockResult> lockResultOpt =
                             orderRepository.findByIdAndUserIdForCheckout(orderId, userId);

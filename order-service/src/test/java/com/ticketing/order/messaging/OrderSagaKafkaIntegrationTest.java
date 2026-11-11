@@ -26,6 +26,7 @@ import com.ticketing.order.domain.OrderItemRecord;
 import com.ticketing.order.domain.OrderRecord;
 import com.ticketing.order.domain.OrderRepository;
 import com.ticketing.order.idempotency.IdempotencyKeyRepository;
+import com.ticketing.order.service.CheckoutService;
 import com.ticketing.order.service.OrderSagaService;
 import io.micrometer.core.instrument.Counter;
 import io.micrometer.core.instrument.MeterRegistry;
@@ -189,6 +190,9 @@ class OrderSagaKafkaIntegrationTest {
     private OrderSagaService orderSagaService;
 
     @Autowired
+    private CheckoutService checkoutService;
+
+    @Autowired
     private KafkaTemplate<String, String> kafkaTemplate;
 
     @Autowired
@@ -217,7 +221,11 @@ class OrderSagaKafkaIntegrationTest {
                     .load();
             flyway.migrate();
         }
+        orderSagaService.setBeforeOrderLockHook(null);
         orderSagaService.setAfterOrderLockHook(null);
+        checkoutService.setBeforeOrderLockHook(null);
+        checkoutService.setAfterIdempotencyClaimHook(null);
+        checkoutService.setInTransactionHook(null);
         waitForListenerContainersAssignment();
     }
 
@@ -240,9 +248,10 @@ class OrderSagaKafkaIntegrationTest {
 
     static Stream<Arguments> stateTransitionMatrix() {
         // Order state descriptors:
-        // "RESERVED", "PAYMENT_PENDING", "PAYMENT_PENDING_PAID", "CONFIRMED",
+        // "NONE", "RESERVED", "PAYMENT_PENDING", "PAYMENT_PENDING_PAID", "CONFIRMED",
         // "CANCELLED_PAYMENT_FAILED", "CANCELLED_EXPIRED", "REFUND_PENDING", "CANCELLED_REFUNDED"
         List<String> states = List.of(
+                "NONE",
                 OrderSagaService.STATUS_RESERVED,
                 OrderSagaService.STATUS_PAYMENT_PENDING,
                 "PAYMENT_PENDING_PAID",
@@ -269,13 +278,46 @@ class OrderSagaKafkaIntegrationTest {
         for (String state : states) {
             String initialDbStatus = "PAYMENT_PENDING_PAID".equals(state)
                     ? OrderSagaService.STATUS_PAYMENT_PENDING
-                    : state;
+                    : ("NONE".equals(state) ? null : state);
             boolean presetPaymentId = "PAYMENT_PENDING_PAID".equals(state)
                     || OrderSagaService.STATUS_CONFIRMED.equals(state)
                     || OrderSagaService.STATUS_REFUND_PENDING.equals(state)
                     || OrderSagaService.STATUS_CANCELLED_REFUNDED.equals(state);
 
             for (String eventType : events) {
+                if ("NONE".equals(state)) {
+                    String expectedStatus;
+                    String expectedOutboxEventType = null;
+                    String expectedOutcome;
+                    if (EventTypes.INVENTORY_SEAT_RESERVED.equals(eventType)) {
+                        expectedStatus = OrderSagaService.STATUS_RESERVED;
+                        expectedOutcome = OrderSagaService.OUTCOME_APPLIED;
+                    } else if (EventTypes.INVENTORY_RESERVATION_EXPIRED.equals(eventType)
+                            || EventTypes.INVENTORY_SEAT_CONFIRMED.equals(eventType)
+                            || EventTypes.INVENTORY_SEAT_CONFIRMATION_REJECTED.equals(eventType)) {
+                        expectedStatus = "NONE";
+                        expectedOutcome = "retried";
+                    } else if (EventTypes.PAYMENT_SUCCEEDED.equals(eventType)
+                            || EventTypes.PAYMENT_FAILED.equals(eventType)
+                            || EventTypes.PAYMENT_REFUNDED.equals(eventType)) {
+                        expectedStatus = "NONE";
+                        expectedOutcome = "dlt";
+                    } else {
+                        expectedStatus = "NONE";
+                        expectedOutcome = OrderSagaService.OUTCOME_IGNORED;
+                    }
+                    args.add(Arguments.of(
+                            state,
+                            initialDbStatus,
+                            presetPaymentId,
+                            eventType,
+                            expectedStatus,
+                            expectedOutboxEventType,
+                            expectedOutcome
+                    ));
+                    continue;
+                }
+
                 String expectedStatus = initialDbStatus;
                 String expectedOutboxEventType = null;
                 String expectedOutcome = OrderSagaService.OUTCOME_NOOP;
@@ -309,7 +351,8 @@ class OrderSagaKafkaIntegrationTest {
                 } else if (EventTypes.PAYMENT_SUCCEEDED.equals(eventType)) {
                     if (OrderSagaService.STATUS_PAYMENT_PENDING.equals(state)
                             || "PAYMENT_PENDING_PAID".equals(state)
-                            || OrderSagaService.STATUS_CONFIRMED.equals(state)) {
+                            || OrderSagaService.STATUS_CONFIRMED.equals(state)
+                            || OrderSagaService.STATUS_REFUND_PENDING.equals(state)) {
                         expectedStatus = initialDbStatus;
                         expectedOutboxEventType = null;
                         expectedOutcome = OrderSagaService.OUTCOME_APPLIED;
@@ -366,6 +409,11 @@ class OrderSagaKafkaIntegrationTest {
         UUID seatId = UUID.randomUUID();
         UUID paymentId = presetPaymentId ? UUID.randomUUID() : null;
 
+        if ("NONE".equals(stateLabel)) {
+            handleNoneStateMatrixCase(orderId, userId, concertEventId, seatId, eventType);
+            return;
+        }
+
         insertOrderInStatus(orderId, userId, concertEventId, seatId, initialDbStatus, paymentId);
 
         double beforeMetric = sagaMetricCount(eventType, expectedOutcome);
@@ -389,6 +437,77 @@ class OrderSagaKafkaIntegrationTest {
         waitForCondition(() -> sagaMetricCount(eventType, expectedOutcome) >= beforeMetric + 1.0,
                 Duration.ofSeconds(5),
                 "Expected metric order_saga_events_handled_total for " + eventType + " / " + expectedOutcome);
+    }
+
+    private void handleNoneStateMatrixCase(
+            UUID orderId,
+            UUID userId,
+            UUID concertEventId,
+            UUID seatId,
+            String eventType
+    ) throws Exception {
+        if (EventTypes.INVENTORY_SEAT_RESERVED.equals(eventType)) {
+            double beforeMetric = sagaMetricCount(eventType, OrderSagaService.OUTCOME_APPLIED);
+            UUID kafkaEventId = publishSeatReserved(orderId, userId, concertEventId, seatId);
+            waitForCondition(() -> isEventProcessed(kafkaEventId), Duration.ofSeconds(10), "seat.reserved on NONE");
+
+            OrderRecord created = orderRepository.findById(orderId).orElseThrow();
+            assertThat(created.status()).isEqualTo(OrderSagaService.STATUS_RESERVED);
+            assertThat(findOutboxRowsForAggregate(orderId)).isEmpty();
+            waitForCondition(() -> sagaMetricCount(eventType, OrderSagaService.OUTCOME_APPLIED) >= beforeMetric + 1.0,
+                    Duration.ofSeconds(5), "metric applied for seat.reserved on NONE");
+        } else if (EventTypes.INVENTORY_RESERVATION_EXPIRED.equals(eventType)
+                || EventTypes.INVENTORY_SEAT_CONFIRMED.equals(eventType)
+                || EventTypes.INVENTORY_SEAT_CONFIRMATION_REJECTED.equals(eventType)) {
+            UUID paymentId = UUID.randomUUID();
+            UUID kafkaEventId = publishEventForOrder(eventType, orderId, userId, concertEventId, seatId, paymentId);
+
+            ConsumerRecord<String, String> retryRecord = pollSingleRecordFromTopic(
+                    INVENTORY_RETRY_0,
+                    orderId.toString(),
+                    Duration.ofSeconds(10)
+            );
+            assertThat(retryRecord).as("Event %s on unknown order must appear on first retry topic", eventType).isNotNull();
+
+            ConsumerRecord<String, String> dltRecord = pollSingleRecordFromTopic(
+                    INVENTORY_DLT,
+                    orderId.toString(),
+                    Duration.ofMillis(500)
+            );
+            assertThat(dltRecord).as("Event %s on unknown order must not appear in DLT at first", eventType).isNull();
+            assertThat(orderRepository.findById(orderId)).isEmpty();
+            assertThat(isEventProcessed(kafkaEventId)).isFalse();
+        } else if (EventTypes.PAYMENT_SUCCEEDED.equals(eventType)
+                || EventTypes.PAYMENT_FAILED.equals(eventType)
+                || EventTypes.PAYMENT_REFUNDED.equals(eventType)) {
+            UUID paymentId = UUID.randomUUID();
+            UUID kafkaEventId = publishEventForOrder(eventType, orderId, userId, concertEventId, seatId, paymentId);
+
+            ConsumerRecord<String, String> dltRecord = pollSingleRecordFromTopic(
+                    PAYMENT_DLT,
+                    orderId.toString(),
+                    Duration.ofSeconds(10)
+            );
+            assertThat(dltRecord).as("Event %s on unknown order must appear directly in DLT", eventType).isNotNull();
+
+            ConsumerRecord<String, String> retryRecord = pollSingleRecordFromTopics(
+                    List.of(PAYMENT_RETRY_0, PAYMENT_RETRY_1),
+                    orderId.toString(),
+                    Duration.ofMillis(500)
+            );
+            assertThat(retryRecord).as("Event %s on unknown order must not appear on retry topics", eventType).isNull();
+            assertThat(orderRepository.findById(orderId)).isEmpty();
+            assertThat(isEventProcessed(kafkaEventId)).isFalse();
+        } else {
+            // Unrelated event type
+            double beforeMetric = sagaMetricCount(eventType, OrderSagaService.OUTCOME_IGNORED);
+            UUID kafkaEventId = publishEventForOrder(eventType, orderId, userId, concertEventId, seatId, UUID.randomUUID());
+            waitForCondition(() -> isEventProcessed(kafkaEventId), Duration.ofSeconds(10), "unrelated event processed on NONE");
+            assertThat(orderRepository.findById(orderId)).isEmpty();
+            assertThat(findOutboxRowsForAggregate(orderId)).isEmpty();
+            waitForCondition(() -> sagaMetricCount(eventType, OrderSagaService.OUTCOME_IGNORED) >= beforeMetric + 1.0,
+                    Duration.ofSeconds(5), "metric ignored for unrelated event on NONE");
+        }
     }
 
     // =========================================================================
@@ -480,21 +599,40 @@ class OrderSagaKafkaIntegrationTest {
         OrderRecord afterConfirm = orderRepository.findById(orderId).orElseThrow();
         assertThat(afterConfirm.status()).isEqualTo(OrderSagaService.STATUS_CONFIRMED);
         assertThat(afterConfirm.paymentId()).isEqualTo(paymentId);
-        assertThat(afterConfirm.paidAt()).isNotNull();
+        assertThat(afterConfirm.paidAt()).isNull();
         assertThat(afterConfirm.confirmedAt()).isNotNull();
 
+        List<Map<String, Object>> confirmedOutboxAfterConfirm = findOutboxRowsByType(orderId, EventTypes.ORDER_CONFIRMED);
+        assertThat(confirmedOutboxAfterConfirm).hasSize(1);
+        long versionAfterConfirm = afterConfirm.version();
+
         // 4. payment.succeeded arrives SECOND
-        UUID paidEventId = publishPaymentSucceeded(orderId, userId, paymentId);
+        Instant paymentPaidAt = Instant.now().minus(3, ChronoUnit.SECONDS).truncatedTo(ChronoUnit.MICROS);
+        UUID paidEventId = publishPaymentSucceeded(orderId, userId, paymentId, paymentPaidAt);
         waitForCondition(() -> isEventProcessed(paidEventId), Duration.ofSeconds(10), "payment.succeeded processed");
 
         OrderRecord finalOrder = orderRepository.findById(orderId).orElseThrow();
         assertThat(finalOrder.status()).isEqualTo(OrderSagaService.STATUS_CONFIRMED);
         assertThat(finalOrder.paymentId()).isEqualTo(paymentId);
         assertThat(finalOrder.paidAt()).isNotNull();
-        assertThat(finalOrder.confirmedAt()).isNotNull();
+        assertThat(finalOrder.paidAt().truncatedTo(ChronoUnit.MICROS)).isEqualTo(paymentPaidAt);
+        assertThat(finalOrder.confirmedAt()).isEqualTo(afterConfirm.confirmedAt());
 
         List<Map<String, Object>> confirmedOutbox = findOutboxRowsByType(orderId, EventTypes.ORDER_CONFIRMED);
         assertThat(confirmedOutbox).hasSize(1);
+        assertThat(finalOrder.version()).isEqualTo(versionAfterConfirm + 1);
+
+        // 5. A second payment.succeeded with a different eventId and a different paidAt does not change recorded paid_at
+        Instant secondPaidAt = paymentPaidAt.plus(10, ChronoUnit.SECONDS);
+        long versionBeforeSecond = finalOrder.version();
+        UUID secondPaidEventId = publishPaymentSucceeded(orderId, userId, paymentId, secondPaidAt);
+        waitForCondition(() -> isEventProcessed(secondPaidEventId), Duration.ofSeconds(10), "second payment.succeeded processed");
+
+        OrderRecord afterSecondPayment = orderRepository.findById(orderId).orElseThrow();
+        assertThat(afterSecondPayment.status()).isEqualTo(OrderSagaService.STATUS_CONFIRMED);
+        assertThat(afterSecondPayment.paidAt().truncatedTo(ChronoUnit.MICROS)).isEqualTo(paymentPaidAt);
+        assertThat(afterSecondPayment.version()).isEqualTo(versionBeforeSecond);
+        assertThat(findOutboxRowsByType(orderId, EventTypes.ORDER_CONFIRMED)).hasSize(1);
     }
 
     // =========================================================================
@@ -660,14 +798,33 @@ class OrderSagaKafkaIntegrationTest {
         OrderRecord refundPendingOrder = orderRepository.findById(orderId).orElseThrow();
         assertThat(refundPendingOrder.status()).isEqualTo(OrderSagaService.STATUS_REFUND_PENDING);
         assertThat(refundPendingOrder.paymentId()).isEqualTo(paymentId);
+        assertThat(refundPendingOrder.paidAt()).isNull();
         assertThat(findOutboxRowsByType(orderId, EventTypes.ORDER_REFUND_REQUESTED)).hasSize(1);
+        long versionAfterReject = refundPendingOrder.version();
 
-        // 3. payment.succeeded arrives SECOND -> no-op in REFUND_PENDING, still 1 order.refund.requested
-        UUID paidEventId = publishPaymentSucceeded(orderId, userId, paymentId);
+        // 3. payment.succeeded arrives SECOND -> backfills paid_at in REFUND_PENDING, still 1 order.refund.requested
+        Instant paymentPaidAt = Instant.now().minus(2, ChronoUnit.SECONDS).truncatedTo(ChronoUnit.MICROS);
+        UUID paidEventId = publishPaymentSucceeded(orderId, userId, paymentId, paymentPaidAt);
         waitForCondition(() -> isEventProcessed(paidEventId), Duration.ofSeconds(10), "payment.succeeded processed");
 
-        assertThat(orderRepository.findById(orderId).orElseThrow().status())
-                .isEqualTo(OrderSagaService.STATUS_REFUND_PENDING);
+        OrderRecord afterPayment = orderRepository.findById(orderId).orElseThrow();
+        assertThat(afterPayment.status()).isEqualTo(OrderSagaService.STATUS_REFUND_PENDING);
+        assertThat(afterPayment.paymentId()).isEqualTo(paymentId);
+        assertThat(afterPayment.paidAt()).isNotNull();
+        assertThat(afterPayment.paidAt().truncatedTo(ChronoUnit.MICROS)).isEqualTo(paymentPaidAt);
+        assertThat(findOutboxRowsByType(orderId, EventTypes.ORDER_REFUND_REQUESTED)).hasSize(1);
+        assertThat(afterPayment.version()).isEqualTo(versionAfterReject + 1);
+
+        // 3b. A second payment.succeeded with a different eventId and different paidAt does not change recorded paid_at
+        Instant secondPaidAt = paymentPaidAt.plus(5, ChronoUnit.SECONDS);
+        long versionBeforeSecond = afterPayment.version();
+        UUID secondPaidEventId = publishPaymentSucceeded(orderId, userId, paymentId, secondPaidAt);
+        waitForCondition(() -> isEventProcessed(secondPaidEventId), Duration.ofSeconds(10), "second payment.succeeded processed");
+
+        OrderRecord afterSecondPayment = orderRepository.findById(orderId).orElseThrow();
+        assertThat(afterSecondPayment.status()).isEqualTo(OrderSagaService.STATUS_REFUND_PENDING);
+        assertThat(afterSecondPayment.paidAt().truncatedTo(ChronoUnit.MICROS)).isEqualTo(paymentPaidAt);
+        assertThat(afterSecondPayment.version()).isEqualTo(versionBeforeSecond);
         assertThat(findOutboxRowsByType(orderId, EventTypes.ORDER_REFUND_REQUESTED)).hasSize(1);
 
         // 4. payment.refunded -> moves to CANCELLED_REFUNDED
@@ -768,61 +925,135 @@ class OrderSagaKafkaIntegrationTest {
     // =========================================================================
 
     @Test
-    @DisplayName("10. Checkout racing reservation.expired on the same order ends with 1 winner, consistent state, and at most one transition outbox row")
+    @DisplayName("10. Checkout racing reservation.expired on the same order ends with 1 winner, consistent state, and deterministic coordination for both orderings")
     void checkoutRacingReservationExpiredEndsWithOneWinner() throws Exception {
-        UUID orderId = UUID.randomUUID();
-        UUID userId = UUID.randomUUID();
-        UUID concertEventId = UUID.randomUUID();
-        UUID seatId = UUID.randomUUID();
-        UUID idempotencyKey = UUID.randomUUID();
+        // ---------------------------------------------------------------------
+        // Ordering 1: Expiry wins the lock first
+        // ---------------------------------------------------------------------
+        UUID orderIdA = UUID.randomUUID();
+        UUID userIdA = UUID.randomUUID();
+        UUID concertEventIdA = UUID.randomUUID();
+        UUID seatIdA = UUID.randomUUID();
+        UUID idempotencyKeyA = UUID.randomUUID();
 
-        UUID reservedEventId = publishSeatReserved(orderId, userId, concertEventId, seatId);
-        waitForCondition(() -> isEventProcessed(reservedEventId), Duration.ofSeconds(10), "seat.reserved processed");
+        UUID resA = publishSeatReserved(orderIdA, userIdA, concertEventIdA, seatIdA);
+        waitForCondition(() -> isEventProcessed(resA), Duration.ofSeconds(10), "orderA reserved");
 
-        CountDownLatch expiredLockedLatch = new CountDownLatch(1);
-        CountDownLatch releaseExpiredLatch = new CountDownLatch(1);
+        CountDownLatch expiryLockedLatch = new CountDownLatch(1);
+        CountDownLatch releaseExpiryLatch = new CountDownLatch(1);
+        CountDownLatch checkoutAboutToLockLatch = new CountDownLatch(1);
 
         orderSagaService.setAfterOrderLockHook(() -> {
-            expiredLockedLatch.countDown();
+            expiryLockedLatch.countDown();
             try {
-                releaseExpiredLatch.await(5, TimeUnit.SECONDS);
+                releaseExpiryLatch.await(10, TimeUnit.SECONDS);
             } catch (InterruptedException e) {
                 Thread.currentThread().interrupt();
             }
         });
 
-        ExecutorService executor = Executors.newSingleThreadExecutor();
-        try {
-            // Publish reservation.expired; consumer acquires SELECT ... FOR UPDATE on orderId and pauses
-            UUID expiredEventId = publishReservationExpired(orderId, concertEventId, seatId);
-            assertThat(expiredLockedLatch.await(10, TimeUnit.SECONDS)).isTrue();
+        checkoutService.setBeforeOrderLockHook(() -> {
+            checkoutAboutToLockLatch.countDown();
+        });
 
-            // Start HTTP checkout concurrently; it will block waiting for the row lock on orderId
-            Future<MvcResult> checkoutFuture = executor.submit(() ->
-                    performCheckout(orderId, userId, idempotencyKey).andReturn()
+        ExecutorService executorA = Executors.newSingleThreadExecutor();
+        try {
+            // 1. Publish reservation.expired; consumer acquires SELECT ... FOR UPDATE on orderIdA and pauses
+            UUID expA = publishReservationExpired(orderIdA, concertEventIdA, seatIdA);
+            assertThat(expiryLockedLatch.await(10, TimeUnit.SECONDS)).isTrue();
+
+            // 2. Start HTTP checkout concurrently; it will block waiting for row lock
+            Future<MvcResult> checkoutFutureA = executorA.submit(() ->
+                    performCheckout(orderIdA, userIdA, idempotencyKeyA).andReturn()
             );
 
-            // Give checkout a moment to reach SELECT ... FOR UPDATE, then release reservation.expired
-            Thread.sleep(100L);
-            releaseExpiredLatch.countDown();
+            // 3. Wait until checkout reaches the locking read (it signals before taking the lock, then blocks on it)
+            assertThat(checkoutAboutToLockLatch.await(10, TimeUnit.SECONDS)).isTrue();
 
-            waitForCondition(() -> isEventProcessed(expiredEventId), Duration.ofSeconds(10), "reservation.expired finished");
-            MvcResult checkoutResult = checkoutFuture.get(10, TimeUnit.SECONDS);
+            // 4. Release expiry handler only after checkout signaled it is about to take the lock
+            releaseExpiryLatch.countDown();
 
-            // reservation.expired won the lock -> checkout must fail with 409 RESERVATION_EXPIRED
-            assertThat(checkoutResult.getResponse().getStatus()).isEqualTo(409);
-            JsonNode errBody = objectMapper.readTree(checkoutResult.getResponse().getContentAsString());
+            waitForCondition(() -> isEventProcessed(expA), Duration.ofSeconds(10), "orderA expired finished");
+            MvcResult checkoutResultA = checkoutFutureA.get(10, TimeUnit.SECONDS);
+
+            // Expiry won the lock -> checkout must fail with 409 RESERVATION_EXPIRED
+            assertThat(checkoutResultA.getResponse().getStatus()).isEqualTo(409);
+            JsonNode errBody = objectMapper.readTree(checkoutResultA.getResponse().getContentAsString());
             assertThat(errBody.get("errorCode").asText()).isEqualTo(ErrorCode.RESERVATION_EXPIRED.name());
 
             // Consistent state: CANCELLED_EXPIRED, 1 order.cancelled, 0 order.payment.requested, idempotency claim cleaned up
-            OrderRecord finalOrder = orderRepository.findById(orderId).orElseThrow();
-            assertThat(finalOrder.status()).isEqualTo(OrderSagaService.STATUS_CANCELLED_EXPIRED);
-            assertThat(findOutboxRowsByType(orderId, EventTypes.ORDER_CANCELLED)).hasSize(1);
-            assertThat(findOutboxRowsByType(orderId, EventTypes.ORDER_PAYMENT_REQUESTED)).isEmpty();
-            assertThat(idempotencyKeyRepository.findByUserAndKey(userId, idempotencyKey)).isEmpty();
+            OrderRecord finalOrderA = orderRepository.findById(orderIdA).orElseThrow();
+            assertThat(finalOrderA.status()).isEqualTo(OrderSagaService.STATUS_CANCELLED_EXPIRED);
+            assertThat(findOutboxRowsByType(orderIdA, EventTypes.ORDER_CANCELLED)).hasSize(1);
+            assertThat(findOutboxRowsByType(orderIdA, EventTypes.ORDER_PAYMENT_REQUESTED)).isEmpty();
+            assertThat(idempotencyKeyRepository.findByUserAndKey(userIdA, idempotencyKeyA)).isEmpty();
         } finally {
             orderSagaService.setAfterOrderLockHook(null);
-            executor.shutdownNow();
+            checkoutService.setBeforeOrderLockHook(null);
+            executorA.shutdownNow();
+        }
+
+        // ---------------------------------------------------------------------
+        // Ordering 2: Checkout wins the lock first
+        // ---------------------------------------------------------------------
+        UUID orderIdB = UUID.randomUUID();
+        UUID userIdB = UUID.randomUUID();
+        UUID concertEventIdB = UUID.randomUUID();
+        UUID seatIdB = UUID.randomUUID();
+        UUID idempotencyKeyB = UUID.randomUUID();
+
+        UUID resB = publishSeatReserved(orderIdB, userIdB, concertEventIdB, seatIdB);
+        waitForCondition(() -> isEventProcessed(resB), Duration.ofSeconds(10), "orderB reserved");
+
+        CountDownLatch checkoutLockedLatch = new CountDownLatch(1);
+        CountDownLatch releaseCheckoutLatch = new CountDownLatch(1);
+        CountDownLatch expiryAboutToLockLatch = new CountDownLatch(1);
+
+        checkoutService.setInTransactionHook(() -> {
+            checkoutLockedLatch.countDown();
+            try {
+                releaseCheckoutLatch.await(10, TimeUnit.SECONDS);
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+            }
+        });
+
+        orderSagaService.setBeforeOrderLockHook(() -> {
+            expiryAboutToLockLatch.countDown();
+        });
+
+        ExecutorService executorB = Executors.newSingleThreadExecutor();
+        try {
+            // 1. Start checkout; it acquires row lock in RESERVED and pauses in tx hook
+            Future<MvcResult> checkoutFutureB = executorB.submit(() ->
+                    performCheckout(orderIdB, userIdB, idempotencyKeyB).andReturn()
+            );
+            assertThat(checkoutLockedLatch.await(10, TimeUnit.SECONDS)).isTrue();
+
+            // 2. Publish reservation.expired; consumer reaches findByIdForUpdate and signals before taking lock
+            UUID expB = publishReservationExpired(orderIdB, concertEventIdB, seatIdB);
+            assertThat(expiryAboutToLockLatch.await(10, TimeUnit.SECONDS)).isTrue();
+
+            // 3. Release checkout to finish and commit
+            releaseCheckoutLatch.countDown();
+
+            MvcResult checkoutResultB = checkoutFutureB.get(10, TimeUnit.SECONDS);
+            assertThat(checkoutResultB.getResponse().getStatus()).isEqualTo(202);
+
+            // 4. Wait for expiry to process after checkout released lock
+            waitForCondition(() -> isEventProcessed(expB), Duration.ofSeconds(10), "orderB expired processed");
+
+            // Checkout won first -> order transitioned to PAYMENT_PENDING (emitted order.payment.requested),
+            // then expiry processed PAYMENT_PENDING without payment -> CANCELLED_EXPIRED (emitted order.cancelled).
+            OrderRecord finalOrderB = orderRepository.findById(orderIdB).orElseThrow();
+            assertThat(finalOrderB.status()).isEqualTo(OrderSagaService.STATUS_CANCELLED_EXPIRED);
+            assertThat(findOutboxRowsByType(orderIdB, EventTypes.ORDER_PAYMENT_REQUESTED)).hasSize(1);
+            assertThat(findOutboxRowsByType(orderIdB, EventTypes.ORDER_CANCELLED)).hasSize(1);
+            assertThat(idempotencyKeyRepository.findByUserAndKey(userIdB, idempotencyKeyB)).isPresent();
+        } finally {
+            checkoutService.setInTransactionHook(null);
+            orderSagaService.setBeforeOrderLockHook(null);
+            executorB.shutdownNow();
         }
     }
 
@@ -848,6 +1079,13 @@ class OrderSagaKafkaIntegrationTest {
         JsonNode envelope = objectMapper.readTree(dltRecord.value());
         assertThat(envelope.get("eventId").asText()).isEqualTo(eventId.toString());
         assertThat(isEventProcessed(eventId)).isFalse();
+
+        ConsumerRecord<String, String> retryRecord = pollSingleRecordFromTopics(
+                List.of(PAYMENT_RETRY_0, PAYMENT_RETRY_1),
+                unknownOrderId.toString(),
+                Duration.ofMillis(500)
+        );
+        assertThat(retryRecord).isNull();
     }
 
     // =========================================================================
@@ -1164,6 +1402,10 @@ class OrderSagaKafkaIntegrationTest {
     }
 
     private UUID publishPaymentSucceeded(UUID orderId, UUID userId, UUID paymentId) throws Exception {
+        return publishPaymentSucceeded(orderId, userId, paymentId, Instant.now());
+    }
+
+    private UUID publishPaymentSucceeded(UUID orderId, UUID userId, UUID paymentId, Instant paidAt) throws Exception {
         UUID kafkaEventId = UUID.randomUUID();
         PaymentSucceededPayload payload = new PaymentSucceededPayload(
                 paymentId,
@@ -1173,7 +1415,7 @@ class OrderSagaKafkaIntegrationTest {
                 15000L,
                 "USD",
                 "psp_ref_" + paymentId,
-                Instant.now()
+                paidAt
         );
         sendEnvelope(Topics.PAYMENT_EVENTS, orderId.toString(),
                 createEnvelope(kafkaEventId, EventTypes.PAYMENT_SUCCEEDED, UUID.randomUUID().toString(), payload));
@@ -1318,7 +1560,16 @@ class OrderSagaKafkaIntegrationTest {
         return records.isEmpty() ? null : records.get(0);
     }
 
+    private ConsumerRecord<String, String> pollSingleRecordFromTopics(List<String> topics, String expectedKey, Duration timeout) {
+        List<ConsumerRecord<String, String>> records = pollRecordsForTopics(topics, expectedKey, 1, timeout);
+        return records.isEmpty() ? null : records.get(0);
+    }
+
     private List<ConsumerRecord<String, String>> pollRecordsForKey(String topic, String expectedKey, int expectedCount, Duration timeout) {
+        return pollRecordsForTopics(List.of(topic), expectedKey, expectedCount, timeout);
+    }
+
+    private List<ConsumerRecord<String, String>> pollRecordsForTopics(List<String> topics, String expectedKey, int expectedCount, Duration timeout) {
         Properties props = new Properties();
         props.put(ConsumerConfig.BOOTSTRAP_SERVERS_CONFIG, KAFKA.getBootstrapServers());
         props.put(ConsumerConfig.GROUP_ID_CONFIG, "test-verifier-" + UUID.randomUUID());
@@ -1329,7 +1580,7 @@ class OrderSagaKafkaIntegrationTest {
 
         List<ConsumerRecord<String, String>> matched = new ArrayList<>();
         try (KafkaConsumer<String, String> consumer = new KafkaConsumer<>(props)) {
-            consumer.subscribe(List.of(topic));
+            consumer.subscribe(topics);
             long deadline = System.currentTimeMillis() + timeout.toMillis();
             while (System.currentTimeMillis() < deadline && matched.size() < expectedCount) {
                 ConsumerRecords<String, String> polled = consumer.poll(Duration.ofMillis(100));

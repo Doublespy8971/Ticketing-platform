@@ -48,7 +48,8 @@ import java.util.concurrent.ConcurrentMap;
 import java.util.concurrent.TimeUnit;
 
 /**
- * Handles the order saga state machine driven by {@code inventory.events} and {@code payment.events}.
+ * Handles the order saga state machine driven by {@code inventory.events} and
+ * {@code payment.events}.
  */
 @Service
 public class OrderSagaService {
@@ -89,6 +90,7 @@ public class OrderSagaService {
     private final ConcurrentMap<String, Counter> handledCounters = new ConcurrentHashMap<>();
     private final ConcurrentMap<String, Counter> terminalCounters = new ConcurrentHashMap<>();
 
+    private volatile Runnable beforeOrderLockHook;
     private volatile Runnable afterOrderLockHook;
 
     public OrderSagaService(
@@ -96,9 +98,9 @@ public class OrderSagaService {
             OrderRepository orderRepository,
             OutboxWriter outboxWriter,
             ObjectMapper objectMapper,
-            MeterRegistry meterRegistry
-    ) {
-        this.idempotentEventProcessor = Objects.requireNonNull(idempotentEventProcessor, "idempotentEventProcessor must not be null");
+            MeterRegistry meterRegistry) {
+        this.idempotentEventProcessor = Objects.requireNonNull(idempotentEventProcessor,
+                "idempotentEventProcessor must not be null");
         this.orderRepository = Objects.requireNonNull(orderRepository, "orderRepository must not be null");
         this.outboxWriter = Objects.requireNonNull(outboxWriter, "outboxWriter must not be null");
         this.objectMapper = Objects.requireNonNull(objectMapper, "objectMapper must not be null");
@@ -109,7 +111,16 @@ public class OrderSagaService {
     }
 
     /**
-     * Test hook invoked immediately after acquiring the {@code SELECT ... FOR UPDATE} lock on the order row.
+     * Test hook invoked immediately before acquiring the
+     * {@code SELECT ... FOR UPDATE} lock on the order row.
+     */
+    public void setBeforeOrderLockHook(Runnable beforeOrderLockHook) {
+        this.beforeOrderLockHook = beforeOrderLockHook;
+    }
+
+    /**
+     * Test hook invoked immediately after acquiring the
+     * {@code SELECT ... FOR UPDATE} lock on the order row.
      */
     public void setAfterOrderLockHook(Runnable afterOrderLockHook) {
         this.afterOrderLockHook = afterOrderLockHook;
@@ -139,8 +150,7 @@ public class OrderSagaService {
                     envelope.eventId(),
                     consumerGroup,
                     envelope.eventType(),
-                    () -> dispatchInsideTransaction(envelope)
-            );
+                    () -> dispatchInsideTransaction(envelope));
         } finally {
             if (previousCorrelationId != null) {
                 MDC.put(CorrelationConstants.MDC_KEY, previousCorrelationId);
@@ -197,8 +207,7 @@ public class OrderSagaService {
                 null,
                 null,
                 payload.reservedAt(),
-                payload.reservedAt()
-        );
+                payload.reservedAt());
 
         List<OrderItemRecord> items = new ArrayList<>(payload.seats().size());
         for (SeatLine seat : payload.seats()) {
@@ -209,8 +218,7 @@ public class OrderSagaService {
                     seat.sectionCode(),
                     seat.rowLabel(),
                     seat.seatNumber(),
-                    seat.priceCents()
-            ));
+                    seat.priceCents()));
         }
 
         Optional<Instant> createdAtOpt = orderRepository.insertIfAbsent(newOrder, items);
@@ -237,33 +245,40 @@ public class OrderSagaService {
         ReservationExpiredPayload payload = parseReservationExpiredPayload(envelope.payload());
         UUID orderId = payload.reservationId();
 
+        invokeBeforeOrderLockHook();
         Optional<OrderRecord> orderOpt = orderRepository.findByIdForUpdate(orderId);
         invokeAfterOrderLockHook();
 
         if (orderOpt.isEmpty()) {
             throw new IllegalStateException(
-                    "Order not yet materialized for reservationId=" + orderId + " on inventory.reservation.expired"
-            );
+                    "Order not yet materialized for reservationId=" + orderId + " on inventory.reservation.expired");
         }
 
         OrderRecord order = orderOpt.get();
         switch (order.status()) {
             case STATUS_RESERVED -> {
                 Instant cancelledAt = orderRepository.cancelExpiredFromReserved(orderId);
-                writeOrderCancelledOutbox(order, envelope.correlationId(), STATUS_CANCELLED_EXPIRED, REASON_RESERVATION_EXPIRED, cancelledAt);
-                log.info("Order {} transitioned from RESERVED to CANCELLED_EXPIRED on inventory.reservation.expired (eventId={})",
+                writeOrderCancelledOutbox(order, envelope.correlationId(), STATUS_CANCELLED_EXPIRED,
+                        REASON_RESERVATION_EXPIRED, cancelledAt);
+                log.info(
+                        "Order {} transitioned from RESERVED to CANCELLED_EXPIRED on inventory.reservation.expired (eventId={})",
                         orderId, envelope.eventId());
-                registerAfterCommitTerminalOutcome(EventTypes.INVENTORY_RESERVATION_EXPIRED, OUTCOME_APPLIED, STATUS_CANCELLED_EXPIRED);
+                registerAfterCommitTerminalOutcome(EventTypes.INVENTORY_RESERVATION_EXPIRED, OUTCOME_APPLIED,
+                        STATUS_CANCELLED_EXPIRED);
             }
             case STATUS_PAYMENT_PENDING -> {
                 if (order.paymentId() == null) {
                     Instant cancelledAt = orderRepository.cancelExpiredFromPaymentPendingWithoutPayment(orderId);
-                    writeOrderCancelledOutbox(order, envelope.correlationId(), STATUS_CANCELLED_EXPIRED, REASON_RESERVATION_EXPIRED, cancelledAt);
-                    log.info("Order {} transitioned from PAYMENT_PENDING (no payment) to CANCELLED_EXPIRED on inventory.reservation.expired (eventId={})",
+                    writeOrderCancelledOutbox(order, envelope.correlationId(), STATUS_CANCELLED_EXPIRED,
+                            REASON_RESERVATION_EXPIRED, cancelledAt);
+                    log.info(
+                            "Order {} transitioned from PAYMENT_PENDING (no payment) to CANCELLED_EXPIRED on inventory.reservation.expired (eventId={})",
                             orderId, envelope.eventId());
-                    registerAfterCommitTerminalOutcome(EventTypes.INVENTORY_RESERVATION_EXPIRED, OUTCOME_APPLIED, STATUS_CANCELLED_EXPIRED);
+                    registerAfterCommitTerminalOutcome(EventTypes.INVENTORY_RESERVATION_EXPIRED, OUTCOME_APPLIED,
+                            STATUS_CANCELLED_EXPIRED);
                 } else {
-                    log.info("Order {} in PAYMENT_PENDING already has paymentId={}; ignoring inventory.reservation.expired as no-op (eventId={})",
+                    log.info(
+                            "Order {} in PAYMENT_PENDING already has paymentId={}; ignoring inventory.reservation.expired as no-op (eventId={})",
                             orderId, order.paymentId(), envelope.eventId());
                     registerAfterCommitOutcome(EventTypes.INVENTORY_RESERVATION_EXPIRED, OUTCOME_NOOP);
                 }
@@ -285,14 +300,13 @@ public class OrderSagaService {
 
         if (orderOpt.isEmpty()) {
             throw new IllegalStateException(
-                    "Order not yet materialized for orderId=" + orderId + " on inventory.seat.confirmed"
-            );
+                    "Order not yet materialized for orderId=" + orderId + " on inventory.seat.confirmed");
         }
 
         OrderRecord order = orderOpt.get();
         if (STATUS_PAYMENT_PENDING.equals(order.status())) {
-            OrderRepository.OrderConfirmedUpdateResult updated =
-                    orderRepository.confirmFromPaymentPending(orderId, payload.paymentId());
+            OrderRepository.OrderConfirmedUpdateResult updated = orderRepository.confirmFromPaymentPending(orderId,
+                    payload.paymentId());
 
             List<OrderItemRecord> itemRecords = orderRepository.findItemsByOrderId(orderId);
             List<SeatLine> confirmedSeats = new ArrayList<>(itemRecords.size());
@@ -302,8 +316,7 @@ public class OrderSagaService {
                         item.sectionCode(),
                         item.rowLabel(),
                         item.seatNumber(),
-                        item.priceCents()
-                ));
+                        item.priceCents()));
             }
 
             OrderConfirmedPayload confirmedPayload = new OrderConfirmedPayload(
@@ -315,14 +328,12 @@ public class OrderSagaService {
                     confirmedSeats,
                     order.totalAmountCents(),
                     order.currency(),
-                    updated.confirmedAt()
-            );
+                    updated.confirmedAt());
 
             outboxWriter.append(
                     order.orderId(),
                     EventTypes.ORDER_CONFIRMED,
-                    confirmedPayload
-            );
+                    confirmedPayload);
 
             log.info("Order {} transitioned from PAYMENT_PENDING to CONFIRMED (paymentId={}, eventId={})",
                     orderId, updated.paymentId(), envelope.eventId());
@@ -343,8 +354,7 @@ public class OrderSagaService {
 
         if (orderOpt.isEmpty()) {
             throw new IllegalStateException(
-                    "Order not yet materialized for orderId=" + orderId + " on inventory.seat.confirmation_rejected"
-            );
+                    "Order not yet materialized for orderId=" + orderId + " on inventory.seat.confirmation_rejected");
         }
 
         OrderRecord order = orderOpt.get();
@@ -361,16 +371,17 @@ public class OrderSagaService {
                         order.status(),
                         payload.paymentId(),
                         null,
-                        dbCancellationReason
-                );
+                        dbCancellationReason);
 
                 writeRefundRequestedOutbox(order, payload.paymentId(), envelope.correlationId(), requestedAt);
-                log.info("Order {} transitioned from {} to REFUND_PENDING on inventory.seat.confirmation_rejected (paymentId={}, eventId={})",
+                log.info(
+                        "Order {} transitioned from {} to REFUND_PENDING on inventory.seat.confirmation_rejected (paymentId={}, eventId={})",
                         orderId, order.status(), payload.paymentId(), envelope.eventId());
                 registerAfterCommitOutcome(EventTypes.INVENTORY_SEAT_CONFIRMATION_REJECTED, OUTCOME_REFUND_REQUESTED);
             }
             default -> {
-                log.info("Order {} is in status {}; ignoring inventory.seat.confirmation_rejected as no-op (eventId={})",
+                log.info(
+                        "Order {} is in status {}; ignoring inventory.seat.confirmation_rejected as no-op (eventId={})",
                         orderId, order.status(), envelope.eventId());
                 registerAfterCommitOutcome(EventTypes.INVENTORY_SEAT_CONFIRMATION_REJECTED, OUTCOME_NOOP);
             }
@@ -386,22 +397,22 @@ public class OrderSagaService {
 
         if (orderOpt.isEmpty()) {
             throw new NonRetryableEventException(
-                    "Order not found for orderId=" + orderId + " on payment.succeeded"
-            );
+                    "Order not found for orderId=" + orderId + " on payment.succeeded");
         }
 
         OrderRecord order = orderOpt.get();
         switch (order.status()) {
             case STATUS_PAYMENT_PENDING -> {
                 orderRepository.recordPaymentInPaymentPending(orderId, payload.paymentId(), payload.paidAt());
-                log.info("Recorded payment.succeeded on order {} in PAYMENT_PENDING (paymentId={}, eventId={}); awaiting inventory confirmation",
+                log.info(
+                        "Recorded payment.succeeded on order {} in PAYMENT_PENDING (paymentId={}, eventId={}); awaiting inventory confirmation",
                         orderId, payload.paymentId(), envelope.eventId());
                 registerAfterCommitOutcome(EventTypes.PAYMENT_SUCCEEDED, OUTCOME_APPLIED);
             }
-            case STATUS_CONFIRMED -> {
-                orderRepository.backfillPaymentInConfirmed(orderId, payload.paymentId(), payload.paidAt());
-                log.info("Backfilled payment details on already CONFIRMED order {} (paymentId={}, eventId={})",
-                        orderId, payload.paymentId(), envelope.eventId());
+            case STATUS_CONFIRMED, STATUS_REFUND_PENDING -> {
+                orderRepository.backfillPayment(orderId, payload.paymentId(), payload.paidAt());
+                log.info("Backfilled payment details on order {} in status {} (paymentId={}, eventId={})",
+                        orderId, order.status(), payload.paymentId(), envelope.eventId());
                 registerAfterCommitOutcome(EventTypes.PAYMENT_SUCCEEDED, OUTCOME_APPLIED);
             }
             case STATUS_CANCELLED_EXPIRED, STATUS_CANCELLED_PAYMENT_FAILED -> {
@@ -410,10 +421,10 @@ public class OrderSagaService {
                         order.status(),
                         payload.paymentId(),
                         payload.paidAt(),
-                        REASON_LATE_PAYMENT_AFTER_CANCELLATION
-                );
+                        REASON_LATE_PAYMENT_AFTER_CANCELLATION);
                 writeRefundRequestedOutbox(order, payload.paymentId(), envelope.correlationId(), requestedAt);
-                log.info("Order {} transitioned from {} to REFUND_PENDING on late payment.succeeded (paymentId={}, eventId={})",
+                log.info(
+                        "Order {} transitioned from {} to REFUND_PENDING on late payment.succeeded (paymentId={}, eventId={})",
                         orderId, order.status(), payload.paymentId(), envelope.eventId());
                 registerAfterCommitOutcome(EventTypes.PAYMENT_SUCCEEDED, OUTCOME_REFUND_REQUESTED);
             }
@@ -434,17 +445,19 @@ public class OrderSagaService {
 
         if (orderOpt.isEmpty()) {
             throw new NonRetryableEventException(
-                    "Order not found for orderId=" + orderId + " on payment.failed"
-            );
+                    "Order not found for orderId=" + orderId + " on payment.failed");
         }
 
         OrderRecord order = orderOpt.get();
         if (STATUS_PAYMENT_PENDING.equals(order.status())) {
             Instant cancelledAt = orderRepository.cancelPaymentFailedFromPaymentPending(orderId, payload.paymentId());
-            writeOrderCancelledOutbox(order, envelope.correlationId(), STATUS_CANCELLED_PAYMENT_FAILED, REASON_PAYMENT_FAILED, cancelledAt);
-            log.info("Order {} transitioned from PAYMENT_PENDING to CANCELLED_PAYMENT_FAILED on payment.failed (paymentId={}, eventId={})",
+            writeOrderCancelledOutbox(order, envelope.correlationId(), STATUS_CANCELLED_PAYMENT_FAILED,
+                    REASON_PAYMENT_FAILED, cancelledAt);
+            log.info(
+                    "Order {} transitioned from PAYMENT_PENDING to CANCELLED_PAYMENT_FAILED on payment.failed (paymentId={}, eventId={})",
                     orderId, payload.paymentId(), envelope.eventId());
-            registerAfterCommitTerminalOutcome(EventTypes.PAYMENT_FAILED, OUTCOME_APPLIED, STATUS_CANCELLED_PAYMENT_FAILED);
+            registerAfterCommitTerminalOutcome(EventTypes.PAYMENT_FAILED, OUTCOME_APPLIED,
+                    STATUS_CANCELLED_PAYMENT_FAILED);
         } else {
             log.info("Order {} is in status {}; ignoring payment.failed as no-op (eventId={})",
                     orderId, order.status(), envelope.eventId());
@@ -461,15 +474,16 @@ public class OrderSagaService {
 
         if (orderOpt.isEmpty()) {
             throw new NonRetryableEventException(
-                    "Order not found for orderId=" + orderId + " on payment.refunded"
-            );
+                    "Order not found for orderId=" + orderId + " on payment.refunded");
         }
 
         OrderRecord order = orderOpt.get();
         if (STATUS_REFUND_PENDING.equals(order.status())) {
             Instant refundedAt = orderRepository.cancelRefundedFromRefundPending(orderId, payload.paymentId());
-            writeOrderCancelledOutbox(order, envelope.correlationId(), STATUS_CANCELLED_REFUNDED, REASON_LATE_PAYMENT_EXPIRED_HOLD, refundedAt);
-            log.info("Order {} transitioned from REFUND_PENDING to CANCELLED_REFUNDED on payment.refunded (paymentId={}, refundId={}, eventId={})",
+            writeOrderCancelledOutbox(order, envelope.correlationId(), STATUS_CANCELLED_REFUNDED,
+                    REASON_LATE_PAYMENT_EXPIRED_HOLD, refundedAt);
+            log.info(
+                    "Order {} transitioned from REFUND_PENDING to CANCELLED_REFUNDED on payment.refunded (paymentId={}, refundId={}, eventId={})",
                     orderId, payload.paymentId(), payload.refundId(), envelope.eventId());
             registerAfterCommitTerminalOutcome(EventTypes.PAYMENT_REFUNDED, OUTCOME_APPLIED, STATUS_CANCELLED_REFUNDED);
         } else {
@@ -489,8 +503,7 @@ public class OrderSagaService {
             UUID correlationId,
             String finalStatus,
             String cancellationReason,
-            Instant cancelledAt
-    ) {
+            Instant cancelledAt) {
         OrderCancelledPayload cancelledPayload = new OrderCancelledPayload(
                 order.orderId(),
                 order.reservationId(),
@@ -498,21 +511,18 @@ public class OrderSagaService {
                 order.eventId(),
                 finalStatus,
                 cancellationReason,
-                cancelledAt
-        );
+                cancelledAt);
         outboxWriter.append(
                 order.orderId(),
                 EventTypes.ORDER_CANCELLED,
-                cancelledPayload
-        );
+                cancelledPayload);
     }
 
     private void writeRefundRequestedOutbox(
             OrderRecord order,
             UUID paymentId,
             UUID correlationId,
-            Instant requestedAt
-    ) {
+            Instant requestedAt) {
         RefundRequestedPayload refundPayload = new RefundRequestedPayload(
                 order.orderId(),
                 order.reservationId(),
@@ -521,13 +531,18 @@ public class OrderSagaService {
                 order.totalAmountCents(),
                 order.currency(),
                 REASON_LATE_PAYMENT_EXPIRED_HOLD,
-                requestedAt
-        );
+                requestedAt);
         outboxWriter.append(
                 order.orderId(),
                 EventTypes.ORDER_REFUND_REQUESTED,
-                refundPayload
-        );
+                refundPayload);
+    }
+
+    private void invokeBeforeOrderLockHook() {
+        Runnable hook = this.beforeOrderLockHook;
+        if (hook != null) {
+            hook.run();
+        }
     }
 
     private void invokeAfterOrderLockHook() {
@@ -564,23 +579,20 @@ public class OrderSagaService {
     private void recordOutcome(String eventType, String outcome) {
         String safeEventType = ConsumerMetrics.sanitizeEventType(eventType);
         String key = safeEventType + ":" + outcome;
-        Counter counter = handledCounters.computeIfAbsent(key, k ->
-                Counter.builder(METRIC_SAGA_EVENTS_HANDLED)
-                        .description("Total Kafka events handled by order-service saga")
-                        .tag("event_type", safeEventType)
-                        .tag("outcome", outcome)
-                        .register(meterRegistry)
-        );
+        Counter counter = handledCounters.computeIfAbsent(key, k -> Counter.builder(METRIC_SAGA_EVENTS_HANDLED)
+                .description("Total Kafka events handled by order-service saga")
+                .tag("event_type", safeEventType)
+                .tag("outcome", outcome)
+                .register(meterRegistry));
         counter.increment();
     }
 
     private void recordTerminalOrder(String finalStatus) {
-        Counter counter = terminalCounters.computeIfAbsent(finalStatus, status ->
-                Counter.builder(METRIC_TERMINAL_ORDERS)
+        Counter counter = terminalCounters.computeIfAbsent(finalStatus,
+                status -> Counter.builder(METRIC_TERMINAL_ORDERS)
                         .description("Orders reaching a terminal state")
                         .tag("final_status", status)
-                        .register(meterRegistry)
-        );
+                        .register(meterRegistry));
         counter.increment();
     }
 
@@ -607,8 +619,7 @@ public class OrderSagaService {
         int schemaVersion = schemaNode.asInt();
         if (schemaVersion != SUPPORTED_SCHEMA_VERSION) {
             throw new NonRetryableEventException(
-                    "Unsupported schemaVersion=" + schemaVersion + " (expected " + SUPPORTED_SCHEMA_VERSION + ")"
-            );
+                    "Unsupported schemaVersion=" + schemaVersion + " (expected " + SUPPORTED_SCHEMA_VERSION + ")");
         }
 
         UUID eventId = parseRequiredUuid(root, "eventId");
@@ -705,7 +716,8 @@ public class OrderSagaService {
                 || payload.paymentId() == null
                 || payload.reason() == null || payload.reason().isBlank()
                 || payload.rejectedAt() == null) {
-            throw new NonRetryableEventException("Missing required fields in inventory.seat.confirmation_rejected payload");
+            throw new NonRetryableEventException(
+                    "Missing required fields in inventory.seat.confirmation_rejected payload");
         }
         return payload;
     }
@@ -807,6 +819,6 @@ public class OrderSagaService {
             Instant occurredAt,
             UUID correlationId,
             int schemaVersion,
-            JsonNode payload
-    ) {}
+            JsonNode payload) {
+    }
 }

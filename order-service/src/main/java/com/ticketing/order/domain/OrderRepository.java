@@ -124,7 +124,6 @@ public class OrderRepository {
             UPDATE orders
             SET status = 'CONFIRMED',
                 payment_id = COALESCE(payment_id, ?),
-                paid_at = COALESCE(paid_at, clock_timestamp()),
                 confirmed_at = clock_timestamp(),
                 version = version + 1,
                 updated_at = clock_timestamp()
@@ -136,7 +135,7 @@ public class OrderRepository {
     private static final String TRANSITION_TO_REFUND_PENDING_SQL = """
             UPDATE orders
             SET status = 'REFUND_PENDING',
-                payment_id = COALESCE(?, payment_id),
+                payment_id = COALESCE(payment_id, ?),
                 paid_at = COALESCE(paid_at, ?),
                 cancellation_reason = ?,
                 version = version + 1,
@@ -149,21 +148,31 @@ public class OrderRepository {
     private static final String RECORD_PAYMENT_IN_PAYMENT_PENDING_SQL = """
             UPDATE orders
             SET payment_id = ?,
-                paid_at = COALESCE(?, clock_timestamp()),
+                paid_at = ?,
                 version = version + 1,
                 updated_at = clock_timestamp()
             WHERE order_id = ?
               AND status = 'PAYMENT_PENDING'
             """;
 
-    private static final String BACKFILL_PAYMENT_IN_CONFIRMED_SQL = """
+    private static final String BACKFILL_PAYMENT_SQL = """
             UPDATE orders
             SET payment_id = COALESCE(payment_id, ?),
-                paid_at = COALESCE(paid_at, ?, clock_timestamp()),
-                version = version + 1,
-                updated_at = clock_timestamp()
+                paid_at = COALESCE(paid_at, ?),
+                version = CASE
+                    WHEN (payment_id IS NULL AND CAST(? AS uuid) IS NOT NULL)
+                      OR (paid_at IS NULL AND CAST(? AS timestamptz) IS NOT NULL)
+                    THEN version + 1
+                    ELSE version
+                END,
+                updated_at = CASE
+                    WHEN (payment_id IS NULL AND CAST(? AS uuid) IS NOT NULL)
+                      OR (paid_at IS NULL AND CAST(? AS timestamptz) IS NOT NULL)
+                    THEN clock_timestamp()
+                    ELSE updated_at
+                END
             WHERE order_id = ?
-              AND status = 'CONFIRMED'
+              AND status IN ('CONFIRMED', 'REFUND_PENDING')
             """;
 
     private static final String CANCEL_PAYMENT_FAILED_FROM_PAYMENT_PENDING_SQL = """
@@ -492,6 +501,7 @@ public class OrderRepository {
     public void recordPaymentInPaymentPending(UUID orderId, UUID paymentId, Instant paidAt) {
         Objects.requireNonNull(orderId, "orderId must not be null");
         Objects.requireNonNull(paymentId, "paymentId must not be null");
+        Objects.requireNonNull(paidAt, "paidAt must not be null");
         int updated = jdbcTemplate.update(RECORD_PAYMENT_IN_PAYMENT_PENDING_SQL, ps -> {
             ps.setObject(1, paymentId);
             setTimestamp(ps, 2, paidAt);
@@ -503,16 +513,25 @@ public class OrderRepository {
     }
 
     @Transactional(propagation = Propagation.MANDATORY)
-    public void backfillPaymentInConfirmed(UUID orderId, UUID paymentId, Instant paidAt) {
+    public void backfillPayment(UUID orderId, UUID paymentId, Instant paidAt) {
         Objects.requireNonNull(orderId, "orderId must not be null");
-        int updated = jdbcTemplate.update(BACKFILL_PAYMENT_IN_CONFIRMED_SQL, ps -> {
+        int updated = jdbcTemplate.update(BACKFILL_PAYMENT_SQL, ps -> {
             setUuid(ps, 1, paymentId);
             setTimestamp(ps, 2, paidAt);
-            ps.setObject(3, orderId);
+            setUuid(ps, 3, paymentId);
+            setTimestamp(ps, 4, paidAt);
+            setUuid(ps, 5, paymentId);
+            setTimestamp(ps, 6, paidAt);
+            ps.setObject(7, orderId);
         });
         if (updated != 1) {
-            throw new IllegalStateException("Failed to backfill payment in CONFIRMED for order " + orderId);
+            throw new IllegalStateException("Failed to backfill payment for order " + orderId);
         }
+    }
+
+    @Transactional(propagation = Propagation.MANDATORY)
+    public void backfillPaymentInConfirmed(UUID orderId, UUID paymentId, Instant paidAt) {
+        backfillPayment(orderId, paymentId, paidAt);
     }
 
     @Transactional(propagation = Propagation.MANDATORY)
