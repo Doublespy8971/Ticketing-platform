@@ -70,19 +70,32 @@ finish_check() {
 # -----------------------------------------------------------------------------
 # Timeout execution helper (15s for docker exec, 10s for curl)
 # -----------------------------------------------------------------------------
-run_with_timeout() {
+_run_with_timeout_impl() {
     local duration="$1"
-    shift
+    local stdin_file="$2"
+    shift 2
     if command -v timeout >/dev/null 2>&1; then
-        timeout "$duration" "$@"
+        if [ -n "$stdin_file" ]; then
+            timeout "$duration" "$@" <"$stdin_file"
+        else
+            timeout "$duration" "$@"
+        fi
         return $?
     elif command -v gtimeout >/dev/null 2>&1; then
-        gtimeout "$duration" "$@"
+        if [ -n "$stdin_file" ]; then
+            gtimeout "$duration" "$@" <"$stdin_file"
+        else
+            gtimeout "$duration" "$@"
+        fi
         return $?
     else
         local tmp_out
         tmp_out=$(mktemp "${TMPDIR:-/tmp}/smoke_timeout.XXXXXX") || return 1
-        "$@" >"$tmp_out" &
+        if [ -n "$stdin_file" ]; then
+            "$@" <"$stdin_file" >"$tmp_out" &
+        else
+            "$@" >"$tmp_out" &
+        fi
         local cmd_pid=$!
         local ticks=0
         local max_ticks=$((duration * 10))
@@ -110,6 +123,19 @@ run_with_timeout() {
     fi
 }
 
+run_with_timeout() {
+    local duration="$1"
+    shift
+    _run_with_timeout_impl "$duration" "" "$@"
+}
+
+run_with_timeout_stdin() {
+    local duration="$1"
+    local stdin_file="$2"
+    shift 2
+    _run_with_timeout_impl "$duration" "$stdin_file" "$@"
+}
+
 docker_exec_timed() {
     local check_name="$1"
     shift
@@ -127,9 +153,13 @@ docker_exec_stdin_timed() {
     local check_name="$1"
     local payload="$2"
     shift 2
+    local tmp_in
+    tmp_in=$(mktemp "${TMPDIR:-/tmp}/smoke_stdin.XXXXXX") || return 1
+    printf "%s\n" "$payload" >"$tmp_in"
     local out
-    out=$(printf "%s\n" "$payload" | run_with_timeout 15 docker exec -i "$@")
+    out=$(run_with_timeout_stdin 15 "$tmp_in" docker exec -i "$@")
     local rc=$?
+    rm -f "$tmp_in"
     if [ "$rc" -eq 124 ]; then
         fail "${check_name}: docker exec -i timed out after 15s (docker exec -i $*)" >&2
     fi
@@ -275,6 +305,29 @@ get_inventory_dlt_offsets() {
     echo "${offsets:-unknown}"
 }
 
+get_inventory_cg_lag() {
+    local check_name="$1"
+    local group="order-service-inventory-cg"
+    local desc
+    desc=$(docker_exec_timed "$check_name" "$KAFKA_CONTAINER" \
+        /opt/kafka/bin/kafka-consumer-groups.sh --bootstrap-server kafka:9092 --describe --group "$group" 2>/dev/null || true)
+    if [ -z "$desc" ]; then
+        echo "unknown"
+        return 0
+    fi
+    printf "%s\n" "$desc" | awk '
+        NR > 1 && $1 == "'"$group"'" {
+            part = $3; lag = $6;
+            if (lag ~ /^[0-9]+$/) total += lag;
+            entries = (entries == "" ? "" : entries " ") "p" part "=" lag;
+        }
+        END {
+            if (entries == "") print "unknown";
+            else printf "total=%d (%s)", total, entries;
+        }
+    '
+}
+
 format_materialization_failure() {
     local check_label="$1"
     local check_prefix="$2"
@@ -288,8 +341,25 @@ format_materialization_failure() {
     row_count=$(get_order_row_count "${check_label} (query orders count)" "$order_id")
     local dlt_offsets
     dlt_offsets=$(get_inventory_dlt_offsets "${check_label} (query DLT offsets)")
+    local cg_lag
+    cg_lag=$(get_inventory_cg_lag "${check_label} (query CG lag)")
 
-    echo "${check_prefix} did not materialize in ${expected_status} within ${timeout_secs}s (last HTTP status: ${last_status}, body: ${last_body}, orders table row count: ${row_count}, DLT end offsets: ${dlt_offsets})"
+    echo "${check_prefix} did not materialize in ${expected_status} within ${timeout_secs}s (last HTTP status: ${last_status}, body: ${last_body}, orders table row count: ${row_count}, DLT end offsets: ${dlt_offsets}, order-service-inventory-cg lag: ${cg_lag})"
+}
+
+get_topic_total_end_offset() {
+    local check_name="$1"
+    local topic="$2"
+    local out
+    out=$(docker_exec_timed "${check_name} (GetOffsetShell ${topic})" "$KAFKA_CONTAINER" \
+        /opt/kafka/bin/kafka-run-class.sh org.apache.kafka.tools.GetOffsetShell \
+        --bootstrap-server kafka:9092 \
+        --topic "$topic" \
+        --time -1 2>/dev/null) || return 1
+    if [ -z "$out" ]; then
+        return 1
+    fi
+    printf "%s\n" "$out" | awk -F: '{sum += $NF} END {print sum+0}'
 }
 
 produce_kafka_event() {
@@ -297,11 +367,37 @@ produce_kafka_event() {
     local topic="$2"
     local key="$3"
     local json_line="$4"
-    docker_exec_stdin_timed "$check_name" "${key}:${json_line}" "$KAFKA_CONTAINER" /opt/kafka/bin/kafka-console-producer.sh \
+    local event_type
+    event_type=$(json_field "$json_line" "data.get('eventType','')")
+    event_type="${event_type:-unknown}"
+
+    local before_offset
+    if ! before_offset=$(get_topic_total_end_offset "$check_name" "$topic"); then
+        fail "${check_name}: failed to read end offsets before producing (topic=${topic}, key=${key}, eventType=${event_type})"
+        return 1
+    fi
+
+    if ! docker_exec_stdin_timed "$check_name" "${key}:${json_line}" "$KAFKA_CONTAINER" /opt/kafka/bin/kafka-console-producer.sh \
         --bootstrap-server kafka:9092 \
         --topic "$topic" \
         --property "parse.key=true" \
-        --property "key.separator=:" >/dev/null
+        --property "key.separator=:" >/dev/null; then
+        fail "${check_name}: kafka-console-producer failed (topic=${topic}, key=${key}, eventType=${event_type})"
+        return 1
+    fi
+
+    local after_offset
+    if ! after_offset=$(get_topic_total_end_offset "$check_name" "$topic"); then
+        fail "${check_name}: failed to read end offsets after producing (topic=${topic}, key=${key}, eventType=${event_type})"
+        return 1
+    fi
+
+    local delta=$((after_offset - before_offset))
+    if [ "$delta" -ne 1 ]; then
+        fail "${check_name}: produced event not reflected in topic end offsets (topic=${topic}, key=${key}, eventType=${event_type}, expected delta=1, got delta=${delta}, before=${before_offset}, after=${after_offset})"
+        return 1
+    fi
+    return 0
 }
 
 build_seat_reserved_envelope() {
@@ -317,22 +413,23 @@ build_seat_reserved_envelope() {
     now_ts=$(iso_now)
     local exp_ts
     exp_ts=$(iso_plus_seconds 600)
-    printf '{"eventId":"%s","eventType":"inventory.seat.reserved","occurredAt":"%s","correlationId":"%s","schemaVersion":1,"payload":{"reservationId":"%s","userId":"%s","eventId":"%s","seats":[{"seatId":"%s","sectionCode":"FLOOR-A","rowLabel":"1","seatNumber":"10","priceCents":15000}],"totalAmountCents":15000,"currency":"USD","reservedAt":"%s","expiresAt":"%s"}}' \
-        "$evt_id" "$now_ts" "$corr_id" "$order_id" "$user_id" "$event_id" "$seat_id" "$now_ts" "$exp_ts"
+    printf '{"eventId":"%s","eventType":"inventory.seat.reserved","occurredAt":"%s","correlationId":"%s","schemaVersion":1,"payload":{"reservationId":"%s","orderId":"%s","userId":"%s","eventId":"%s","seats":[{"seatId":"%s","sectionCode":"FLOOR-A","rowLabel":"1","seatNumber":"10","priceCents":15000}],"totalAmountCents":15000,"currency":"USD","reservedAt":"%s","expiresAt":"%s"}}' \
+        "$evt_id" "$now_ts" "$corr_id" "$order_id" "$order_id" "$user_id" "$event_id" "$seat_id" "$now_ts" "$exp_ts"
 }
 
 build_reservation_expired_envelope() {
     local order_id="$1"
-    local event_id="$2"
-    local seat_id="$3"
+    local user_id="$2"
+    local event_id="$3"
+    local seat_id="$4"
     local evt_id
     evt_id=$(uuid_v4)
     local corr_id
     corr_id=$(uuid_v4)
     local now_ts
     now_ts=$(iso_now)
-    printf '{"eventId":"%s","eventType":"inventory.reservation.expired","occurredAt":"%s","correlationId":"%s","schemaVersion":1,"payload":{"reservationId":"%s","eventId":"%s","seatIds":["%s"],"expiredAt":"%s"}}' \
-        "$evt_id" "$now_ts" "$corr_id" "$order_id" "$event_id" "$seat_id" "$now_ts"
+    printf '{"eventId":"%s","eventType":"inventory.reservation.expired","occurredAt":"%s","correlationId":"%s","schemaVersion":1,"payload":{"reservationId":"%s","orderId":"%s","userId":"%s","eventId":"%s","seatIds":["%s"],"expiredAt":"%s"}}' \
+        "$evt_id" "$now_ts" "$corr_id" "$order_id" "$order_id" "$user_id" "$event_id" "$seat_id" "$now_ts"
 }
 
 build_seat_confirmed_envelope() {
@@ -353,14 +450,16 @@ build_seat_confirmed_envelope() {
 build_seat_confirmation_rejected_envelope() {
     local order_id="$1"
     local payment_id="$2"
+    local user_id="$3"
+    local event_id="$4"
     local evt_id
     evt_id=$(uuid_v4)
     local corr_id
     corr_id=$(uuid_v4)
     local now_ts
     now_ts=$(iso_now)
-    printf '{"eventId":"%s","eventType":"inventory.seat.confirmation_rejected","occurredAt":"%s","correlationId":"%s","schemaVersion":1,"payload":{"reservationId":"%s","orderId":"%s","paymentId":"%s","reason":"RESERVATION_ALREADY_EXPIRED","rejectedAt":"%s"}}' \
-        "$evt_id" "$now_ts" "$corr_id" "$order_id" "$order_id" "$payment_id" "$now_ts"
+    printf '{"eventId":"%s","eventType":"inventory.seat.confirmation_rejected","occurredAt":"%s","correlationId":"%s","schemaVersion":1,"payload":{"reservationId":"%s","orderId":"%s","paymentId":"%s","userId":"%s","eventId":"%s","reason":"RESERVATION_ALREADY_EXPIRED","rejectedAt":"%s"}}' \
+        "$evt_id" "$now_ts" "$corr_id" "$order_id" "$order_id" "$payment_id" "$user_id" "$event_id" "$now_ts"
 }
 
 build_payment_succeeded_envelope() {
@@ -403,8 +502,8 @@ build_payment_refunded_envelope() {
     refund_id=$(uuid_v4)
     local now_ts
     now_ts=$(iso_now)
-    printf '{"eventId":"%s","eventType":"payment.refunded","occurredAt":"%s","correlationId":"%s","schemaVersion":1,"payload":{"paymentId":"%s","refundId":"%s","orderId":"%s","reservationId":"%s","userId":"%s","amountCents":15000,"currency":"USD","providerReference":"psp_refund_%s","refundedAt":"%s"}}' \
-        "$evt_id" "$now_ts" "$corr_id" "$payment_id" "$refund_id" "$order_id" "$order_id" "$user_id" "$refund_id" "$now_ts"
+    printf '{"eventId":"%s","eventType":"payment.refunded","occurredAt":"%s","correlationId":"%s","schemaVersion":1,"payload":{"refundId":"%s","paymentId":"%s","orderId":"%s","reservationId":"%s","userId":"%s","amountCents":15000,"currency":"USD","reason":"LATE_PAYMENT_EXPIRED_HOLD","refundedAt":"%s"}}' \
+        "$evt_id" "$now_ts" "$corr_id" "$refund_id" "$payment_id" "$order_id" "$order_id" "$user_id" "$now_ts"
 }
 
 poll_order_status() {
@@ -530,36 +629,37 @@ PAYMENT1_ID=$(uuid_v4)
 IDEMP1_KEY=$(uuid_v4)
 
 RESERVED1_JSON=$(build_seat_reserved_envelope "$ORDER1_ID" "$USER1_ID" "$EVENT1_ID" "$SEAT1_ID")
-produce_kafka_event "Check 3 (Order 1 seat.reserved)" "inventory.events" "$ORDER1_ID" "$RESERVED1_JSON"
+if produce_kafka_event "Check 3 (Order 1 seat.reserved)" "inventory.events" "$ORDER1_ID" "$RESERVED1_JSON"; then
+    if poll_order_status "Check 3 (Order 1 poll RESERVED)" "$ORDER1_ID" "$USER1_ID" "RESERVED" 20; then
+        if http_request "Check 3 (Order 1 POST /checkout)" POST "${BASE_URL}/api/v1/orders/${ORDER1_ID}/checkout" \
+            '{"paymentMethodToken":"pm_tok_visa_success"}' \
+            -H "X-User-Id: ${USER1_ID}" \
+            -H "Idempotency-Key: ${IDEMP1_KEY}"; then
+            CHK_STATUS=$(json_field "$HTTP_BODY" "data.get('status','')")
+            if [ "$HTTP_STATUS" = "202" ] && [ "$CHK_STATUS" = "PAYMENT_PENDING" ]; then
+                PAID1_JSON=$(build_payment_succeeded_envelope "$ORDER1_ID" "$USER1_ID" "$PAYMENT1_ID")
+                CONF1_JSON=$(build_seat_confirmed_envelope "$ORDER1_ID" "$EVENT1_ID" "$SEAT1_ID" "$PAYMENT1_ID")
+                if produce_kafka_event "Check 3 (Order 1 payment.succeeded)" "payment.events" "$ORDER1_ID" "$PAID1_JSON" \
+                    && produce_kafka_event "Check 3 (Order 1 seat.confirmed)" "inventory.events" "$ORDER1_ID" "$CONF1_JSON"; then
 
-if poll_order_status "Check 3 (Order 1 poll RESERVED)" "$ORDER1_ID" "$USER1_ID" "RESERVED" 10; then
-    if http_request "Check 3 (Order 1 POST /checkout)" POST "${BASE_URL}/api/v1/orders/${ORDER1_ID}/checkout" \
-        '{"paymentMethodToken":"pm_tok_visa_success"}' \
-        -H "X-User-Id: ${USER1_ID}" \
-        -H "Idempotency-Key: ${IDEMP1_KEY}"; then
-        CHK_STATUS=$(json_field "$HTTP_BODY" "data.get('status','')")
-        if [ "$HTTP_STATUS" = "202" ] && [ "$CHK_STATUS" = "PAYMENT_PENDING" ]; then
-            PAID1_JSON=$(build_payment_succeeded_envelope "$ORDER1_ID" "$USER1_ID" "$PAYMENT1_ID")
-            CONF1_JSON=$(build_seat_confirmed_envelope "$ORDER1_ID" "$EVENT1_ID" "$SEAT1_ID" "$PAYMENT1_ID")
-            produce_kafka_event "Check 3 (Order 1 payment.succeeded)" "payment.events" "$ORDER1_ID" "$PAID1_JSON"
-            produce_kafka_event "Check 3 (Order 1 seat.confirmed)" "inventory.events" "$ORDER1_ID" "$CONF1_JSON"
-
-            if poll_order_status "Check 3 (Order 1 poll CONFIRMED)" "$ORDER1_ID" "$USER1_ID" "CONFIRMED" 10 \
-                && poll_outbox_published "Check 3 (Order 1 outbox order.payment.requested)" "$ORDER1_ID" "order.payment.requested" 10 \
-                && poll_outbox_published "Check 3 (Order 1 outbox order.confirmed)" "$ORDER1_ID" "order.confirmed" 10 \
-                && verify_order_event_on_kafka "Check 3 (Order 1 kafka order.payment.requested)" "$ORDER1_ID" "order.payment.requested" \
-                && verify_order_event_on_kafka "Check 3 (Order 1 kafka order.confirmed)" "$ORDER1_ID" "order.confirmed"; then
-                finish_check "Check 3 (Order 1 happy path)" "$CHECK3_START" "PASS" "3. Order 1 happy path: seat.reserved -> RESERVED -> checkout (202 PAYMENT_PENDING + order.payment.requested) -> payment.succeeded + seat.confirmed -> CONFIRMED + order.confirmed on order.events"
+                    if poll_order_status "Check 3 (Order 1 poll CONFIRMED)" "$ORDER1_ID" "$USER1_ID" "CONFIRMED" 10 \
+                        && poll_outbox_published "Check 3 (Order 1 outbox order.payment.requested)" "$ORDER1_ID" "order.payment.requested" 10 \
+                        && poll_outbox_published "Check 3 (Order 1 outbox order.confirmed)" "$ORDER1_ID" "order.confirmed" 10 \
+                        && verify_order_event_on_kafka "Check 3 (Order 1 kafka order.payment.requested)" "$ORDER1_ID" "order.payment.requested" \
+                        && verify_order_event_on_kafka "Check 3 (Order 1 kafka order.confirmed)" "$ORDER1_ID" "order.confirmed"; then
+                        finish_check "Check 3 (Order 1 happy path)" "$CHECK3_START" "PASS" "3. Order 1 happy path: seat.reserved -> RESERVED -> checkout (202 PAYMENT_PENDING + order.payment.requested) -> payment.succeeded + seat.confirmed -> CONFIRMED + order.confirmed on order.events"
+                    else
+                        finish_check "Check 3 (Order 1 happy path)" "$CHECK3_START" "FAIL" "3. Order 1 happy path did not reach CONFIRMED or publish order.payment.requested / order.confirmed on order.events"
+                    fi
+                fi
             else
-                finish_check "Check 3 (Order 1 happy path)" "$CHECK3_START" "FAIL" "3. Order 1 happy path did not reach CONFIRMED or publish order.payment.requested / order.confirmed on order.events"
+                finish_check "Check 3 (Order 1 happy path)" "$CHECK3_START" "FAIL" "3. Order 1 checkout expected 202 PAYMENT_PENDING, got HTTP ${HTTP_STATUS} status=${CHK_STATUS}"
             fi
-        else
-            finish_check "Check 3 (Order 1 happy path)" "$CHECK3_START" "FAIL" "3. Order 1 checkout expected 202 PAYMENT_PENDING, got HTTP ${HTTP_STATUS} status=${CHK_STATUS}"
         fi
+    else
+        finish_check "Check 3 (Order 1 happy path)" "$CHECK3_START" "FAIL" \
+            "$(format_materialization_failure "Check 3 (Order 1 happy path)" "3. Order 1" "$ORDER1_ID" "RESERVED" 20)"
     fi
-else
-    finish_check "Check 3 (Order 1 happy path)" "$CHECK3_START" "FAIL" \
-        "$(format_materialization_failure "Check 3 (Order 1 happy path)" "3. Order 1" "$ORDER1_ID" "RESERVED" 10)"
 fi
 
 # =============================================================================
@@ -574,28 +674,28 @@ PAYMENT2_ID=$(uuid_v4)
 IDEMP2_KEY=$(uuid_v4)
 
 RESERVED2_JSON=$(build_seat_reserved_envelope "$ORDER2_ID" "$USER2_ID" "$EVENT2_ID" "$SEAT2_ID")
-produce_kafka_event "Check 4 (Order 2 seat.reserved)" "inventory.events" "$ORDER2_ID" "$RESERVED2_JSON"
-
-if poll_order_status "Check 4 (Order 2 poll RESERVED)" "$ORDER2_ID" "$USER2_ID" "RESERVED" 10; then
-    if http_request "Check 4 (Order 2 POST /checkout)" POST "${BASE_URL}/api/v1/orders/${ORDER2_ID}/checkout" \
-        '{"paymentMethodToken":"pm_tok_visa_declined"}' \
-        -H "X-User-Id: ${USER2_ID}" \
-        -H "Idempotency-Key: ${IDEMP2_KEY}" && [ "$HTTP_STATUS" = "202" ]; then
-        FAIL2_JSON=$(build_payment_failed_envelope "$ORDER2_ID" "$USER2_ID" "$PAYMENT2_ID")
-        produce_kafka_event "Check 4 (Order 2 payment.failed)" "payment.events" "$ORDER2_ID" "$FAIL2_JSON"
-
-        if poll_order_status "Check 4 (Order 2 poll CANCELLED_PAYMENT_FAILED)" "$ORDER2_ID" "$USER2_ID" "CANCELLED_PAYMENT_FAILED" 10 \
-            && poll_outbox_published "Check 4 (Order 2 outbox order.cancelled)" "$ORDER2_ID" "order.cancelled" 10; then
-            finish_check "Check 4 (Order 2 payment.failed)" "$CHECK4_START" "PASS" "4. Order 2 payment.failed path transitioned to CANCELLED_PAYMENT_FAILED and published order.cancelled"
+if produce_kafka_event "Check 4 (Order 2 seat.reserved)" "inventory.events" "$ORDER2_ID" "$RESERVED2_JSON"; then
+    if poll_order_status "Check 4 (Order 2 poll RESERVED)" "$ORDER2_ID" "$USER2_ID" "RESERVED" 20; then
+        if http_request "Check 4 (Order 2 POST /checkout)" POST "${BASE_URL}/api/v1/orders/${ORDER2_ID}/checkout" \
+            '{"paymentMethodToken":"pm_tok_visa_declined"}' \
+            -H "X-User-Id: ${USER2_ID}" \
+            -H "Idempotency-Key: ${IDEMP2_KEY}" && [ "$HTTP_STATUS" = "202" ]; then
+            FAIL2_JSON=$(build_payment_failed_envelope "$ORDER2_ID" "$USER2_ID" "$PAYMENT2_ID")
+            if produce_kafka_event "Check 4 (Order 2 payment.failed)" "payment.events" "$ORDER2_ID" "$FAIL2_JSON"; then
+                if poll_order_status "Check 4 (Order 2 poll CANCELLED_PAYMENT_FAILED)" "$ORDER2_ID" "$USER2_ID" "CANCELLED_PAYMENT_FAILED" 10 \
+                    && poll_outbox_published "Check 4 (Order 2 outbox order.cancelled)" "$ORDER2_ID" "order.cancelled" 10; then
+                    finish_check "Check 4 (Order 2 payment.failed)" "$CHECK4_START" "PASS" "4. Order 2 payment.failed path transitioned to CANCELLED_PAYMENT_FAILED and published order.cancelled"
+                else
+                    finish_check "Check 4 (Order 2 payment.failed)" "$CHECK4_START" "FAIL" "4. Order 2 did not reach CANCELLED_PAYMENT_FAILED or publish order.cancelled"
+                fi
+            fi
         else
-            finish_check "Check 4 (Order 2 payment.failed)" "$CHECK4_START" "FAIL" "4. Order 2 did not reach CANCELLED_PAYMENT_FAILED or publish order.cancelled"
+            finish_check "Check 4 (Order 2 payment.failed)" "$CHECK4_START" "FAIL" "4. Order 2 checkout failed with HTTP ${HTTP_STATUS}"
         fi
     else
-        finish_check "Check 4 (Order 2 payment.failed)" "$CHECK4_START" "FAIL" "4. Order 2 checkout failed with HTTP ${HTTP_STATUS}"
+        finish_check "Check 4 (Order 2 payment.failed)" "$CHECK4_START" "FAIL" \
+            "$(format_materialization_failure "Check 4 (Order 2 payment.failed)" "4. Order 2" "$ORDER2_ID" "RESERVED" 20)"
     fi
-else
-    finish_check "Check 4 (Order 2 payment.failed)" "$CHECK4_START" "FAIL" \
-        "$(format_materialization_failure "Check 4 (Order 2 payment.failed)" "4. Order 2" "$ORDER2_ID" "RESERVED" 10)"
 fi
 
 # =============================================================================
@@ -609,44 +709,45 @@ SEAT3_ID=$(uuid_v4)
 PAYMENT3_ID=$(uuid_v4)
 
 RESERVED3_JSON=$(build_seat_reserved_envelope "$ORDER3_ID" "$USER3_ID" "$EVENT3_ID" "$SEAT3_ID")
-produce_kafka_event "Check 5 (Order 3 seat.reserved)" "inventory.events" "$ORDER3_ID" "$RESERVED3_JSON"
+if produce_kafka_event "Check 5 (Order 3 seat.reserved)" "inventory.events" "$ORDER3_ID" "$RESERVED3_JSON"; then
+    if poll_order_status "Check 5 (Order 3 poll RESERVED)" "$ORDER3_ID" "$USER3_ID" "RESERVED" 20; then
+        EXPIRED3_JSON=$(build_reservation_expired_envelope "$ORDER3_ID" "$USER3_ID" "$EVENT3_ID" "$SEAT3_ID")
+        if produce_kafka_event "Check 5 (Order 3 reservation.expired)" "inventory.events" "$ORDER3_ID" "$EXPIRED3_JSON"; then
+            if poll_order_status "Check 5 (Order 3 poll CANCELLED_EXPIRED)" "$ORDER3_ID" "$USER3_ID" "CANCELLED_EXPIRED" 10; then
+                PAID3_JSON=$(build_payment_succeeded_envelope "$ORDER3_ID" "$USER3_ID" "$PAYMENT3_ID")
+                REJ3_JSON=$(build_seat_confirmation_rejected_envelope "$ORDER3_ID" "$PAYMENT3_ID" "$USER3_ID" "$EVENT3_ID")
+                if produce_kafka_event "Check 5 (Order 3 payment.succeeded)" "payment.events" "$ORDER3_ID" "$PAID3_JSON" \
+                    && produce_kafka_event "Check 5 (Order 3 confirmation_rejected)" "inventory.events" "$ORDER3_ID" "$REJ3_JSON"; then
 
-if poll_order_status "Check 5 (Order 3 poll RESERVED)" "$ORDER3_ID" "$USER3_ID" "RESERVED" 10; then
-    EXPIRED3_JSON=$(build_reservation_expired_envelope "$ORDER3_ID" "$EVENT3_ID" "$SEAT3_ID")
-    produce_kafka_event "Check 5 (Order 3 reservation.expired)" "inventory.events" "$ORDER3_ID" "$EXPIRED3_JSON"
+                    if poll_order_status "Check 5 (Order 3 poll REFUND_PENDING)" "$ORDER3_ID" "$USER3_ID" "REFUND_PENDING" 10 \
+                        && poll_outbox_published "Check 5 (Order 3 outbox order.refund.requested)" "$ORDER3_ID" "order.refund.requested" 10; then
+                        # Wait briefly to ensure both payment.succeeded and confirmation_rejected were processed
+                        sleep 0.5
+                        REFUND_REQ_COUNT=$(psql_query "Check 5 (Order 3 count order.refund.requested)" \
+                            "SELECT COUNT(*) FROM outbox_events WHERE aggregate_id = '${ORDER3_ID}' AND event_type = 'order.refund.requested';")
 
-    if poll_order_status "Check 5 (Order 3 poll CANCELLED_EXPIRED)" "$ORDER3_ID" "$USER3_ID" "CANCELLED_EXPIRED" 10; then
-        PAID3_JSON=$(build_payment_succeeded_envelope "$ORDER3_ID" "$USER3_ID" "$PAYMENT3_ID")
-        REJ3_JSON=$(build_seat_confirmation_rejected_envelope "$ORDER3_ID" "$PAYMENT3_ID")
-        produce_kafka_event "Check 5 (Order 3 payment.succeeded)" "payment.events" "$ORDER3_ID" "$PAID3_JSON"
-        produce_kafka_event "Check 5 (Order 3 confirmation_rejected)" "inventory.events" "$ORDER3_ID" "$REJ3_JSON"
-
-        if poll_order_status "Check 5 (Order 3 poll REFUND_PENDING)" "$ORDER3_ID" "$USER3_ID" "REFUND_PENDING" 10 \
-            && poll_outbox_published "Check 5 (Order 3 outbox order.refund.requested)" "$ORDER3_ID" "order.refund.requested" 10; then
-            # Wait briefly to ensure both payment.succeeded and confirmation_rejected were processed
-            sleep 0.5
-            REFUND_REQ_COUNT=$(psql_query "Check 5 (Order 3 count order.refund.requested)" \
-                "SELECT COUNT(*) FROM outbox_events WHERE aggregate_id = '${ORDER3_ID}' AND event_type = 'order.refund.requested';")
-
-            REFUNDED3_JSON=$(build_payment_refunded_envelope "$ORDER3_ID" "$USER3_ID" "$PAYMENT3_ID")
-            produce_kafka_event "Check 5 (Order 3 payment.refunded)" "payment.events" "$ORDER3_ID" "$REFUNDED3_JSON"
-
-            if [ "$REFUND_REQ_COUNT" = "1" ] \
-                && poll_order_status "Check 5 (Order 3 poll CANCELLED_REFUNDED)" "$ORDER3_ID" "$USER3_ID" "CANCELLED_REFUNDED" 10 \
-                && verify_order_event_on_kafka "Check 5 (Order 3 kafka order.refund.requested)" "$ORDER3_ID" "order.refund.requested"; then
-                finish_check "Check 5 (Order 3 late payment & refund)" "$CHECK5_START" "PASS" "5. Order 3 late payment path: reservation.expired -> payment.succeeded -> confirmation_rejected -> REFUND_PENDING (1 order.refund.requested) -> payment.refunded -> CANCELLED_REFUNDED"
+                        REFUNDED3_JSON=$(build_payment_refunded_envelope "$ORDER3_ID" "$USER3_ID" "$PAYMENT3_ID")
+                        if produce_kafka_event "Check 5 (Order 3 payment.refunded)" "payment.events" "$ORDER3_ID" "$REFUNDED3_JSON"; then
+                            if [ "$REFUND_REQ_COUNT" = "1" ] \
+                                && poll_order_status "Check 5 (Order 3 poll CANCELLED_REFUNDED)" "$ORDER3_ID" "$USER3_ID" "CANCELLED_REFUNDED" 10 \
+                                && verify_order_event_on_kafka "Check 5 (Order 3 kafka order.refund.requested)" "$ORDER3_ID" "order.refund.requested"; then
+                                finish_check "Check 5 (Order 3 late payment & refund)" "$CHECK5_START" "PASS" "5. Order 3 late payment path: reservation.expired -> payment.succeeded -> confirmation_rejected -> REFUND_PENDING (1 order.refund.requested) -> payment.refunded -> CANCELLED_REFUNDED"
+                            else
+                                finish_check "Check 5 (Order 3 late payment & refund)" "$CHECK5_START" "FAIL" "5. Order 3 expected 1 order.refund.requested (got ${REFUND_REQ_COUNT}) and final status CANCELLED_REFUNDED"
+                            fi
+                        fi
+                    else
+                        finish_check "Check 5 (Order 3 late payment & refund)" "$CHECK5_START" "FAIL" "5. Order 3 did not reach REFUND_PENDING or publish order.refund.requested"
+                    fi
+                fi
             else
-                finish_check "Check 5 (Order 3 late payment & refund)" "$CHECK5_START" "FAIL" "5. Order 3 expected 1 order.refund.requested (got ${REFUND_REQ_COUNT}) and final status CANCELLED_REFUNDED"
+                finish_check "Check 5 (Order 3 late payment & refund)" "$CHECK5_START" "FAIL" "5. Order 3 did not transition to CANCELLED_EXPIRED"
             fi
-        else
-            finish_check "Check 5 (Order 3 late payment & refund)" "$CHECK5_START" "FAIL" "5. Order 3 did not reach REFUND_PENDING or publish order.refund.requested"
         fi
     else
-        finish_check "Check 5 (Order 3 late payment & refund)" "$CHECK5_START" "FAIL" "5. Order 3 did not transition to CANCELLED_EXPIRED"
+        finish_check "Check 5 (Order 3 late payment & refund)" "$CHECK5_START" "FAIL" \
+            "$(format_materialization_failure "Check 5 (Order 3 late payment & refund)" "5. Order 3" "$ORDER3_ID" "RESERVED" 20)"
     fi
-else
-    finish_check "Check 5 (Order 3 late payment & refund)" "$CHECK5_START" "FAIL" \
-        "$(format_materialization_failure "Check 5 (Order 3 late payment & refund)" "5. Order 3" "$ORDER3_ID" "RESERVED" 10)"
 fi
 
 # =============================================================================
