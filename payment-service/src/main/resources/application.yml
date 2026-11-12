@@ -1,10 +1,42 @@
 spring:
   application:
     name: payment-service
+  datasource:
+    url: ${POSTGRES_URL:jdbc:postgresql://localhost:5435/payment_db}
+    username: ${POSTGRES_USER:ticketing}
+    password: ${POSTGRES_PASSWORD:ticketing_secret}
+    driver-class-name: org.postgresql.Driver
+    hikari:
+      pool-name: payment-service-hikari
+      maximum-pool-size: 10
+      minimum-idle: 2
+  flyway:
+    enabled: true
+    locations: classpath:db/migration
+  jackson:
+    serialization:
+      write-dates-as-timestamps: false
+  kafka:
+    bootstrap-servers: ${KAFKA_BOOTSTRAP_SERVERS:localhost:29092}
+
 server:
-  port: 8083
+  port: ${SERVER_PORT:8083}
+
+ticketing:
+  outbox:
+    enabled: ${OUTBOX_ENABLED:true}
+    advisory-lock-id: 71003
+    poll-interval-ms: ${OUTBOX_POLL_INTERVAL_MS:200}
+    batch-size: ${OUTBOX_BATCH_SIZE:100}
+  payment:
+    provider:
+      mock:
+        decline-rate: ${MOCK_PAYMENT_FAILURE_RATE:0.05}
+        min-latency-ms: ${MOCK_PAYMENT_MIN_LATENCY_MS:50}
+        max-latency-ms: ${MOCK_PAYMENT_MAX_LATENCY_MS:300}
+
 management:
   endpoints:
     web:
       exposure:
-        include: health
+        include: health,info,prometheus
