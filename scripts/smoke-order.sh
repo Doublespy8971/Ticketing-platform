@@ -175,26 +175,57 @@ HTTP_STATUS=""
 HTTP_BODY=""
 HTTP_HEADERS=""
 HTTP_TIMED_OUT=0
+LAST_POLL_STATUS=""
+LAST_POLL_BODY=""
 
 http_request() {
     local check_name="$1"
     local method="$2"
     local url="$3"
-    local body="${4:-}"
-    shift 4 || true
+    shift 3
+
+    local body=""
+    if [ "$#" -gt 0 ]; then
+        case "$1" in
+            -*)
+                # Option or header argument (e.g. -H)
+                ;;
+            *)
+                body="$1"
+                shift
+                ;;
+        esac
+    fi
 
     local tmp_body
     local tmp_headers
-    tmp_body=$(mktemp)
-    tmp_headers=$(mktemp)
+    tmp_body=$(mktemp "${TMPDIR:-/tmp}/smoke_body.XXXXXX") || return 1
+    tmp_headers=$(mktemp "${TMPDIR:-/tmp}/smoke_headers.XXXXXX") || { rm -f "$tmp_body"; return 1; }
+
     HTTP_TIMED_OUT=0
+    HTTP_STATUS=""
+    HTTP_BODY=""
+    HTTP_HEADERS=""
 
     local curl_rc=0
     if [ -n "$body" ]; then
-        HTTP_STATUS=$(curl -sS --connect-timeout 3 --max-time 10 -D "$tmp_headers" -o "$tmp_body" -w "%{http_code}" -X "$method" "$url" \
-            -H "Content-Type: application/json" "$@" -d "$body") || curl_rc=$?
+        HTTP_STATUS=$(curl -sS --connect-timeout 3 --max-time 10 \
+            -D "$tmp_headers" \
+            -o "$tmp_body" \
+            -w "%{http_code}" \
+            -X "$method" \
+            "$url" \
+            -H "Content-Type: application/json" \
+            "$@" \
+            --data "$body") || curl_rc=$?
     else
-        HTTP_STATUS=$(curl -sS --connect-timeout 3 --max-time 10 -D "$tmp_headers" -o "$tmp_body" -w "%{http_code}" -X "$method" "$url" "$@") || curl_rc=$?
+        HTTP_STATUS=$(curl -sS --connect-timeout 3 --max-time 10 \
+            -D "$tmp_headers" \
+            -o "$tmp_body" \
+            -w "%{http_code}" \
+            -X "$method" \
+            "$url" \
+            "$@") || curl_rc=$?
     fi
 
     HTTP_BODY=$(cat "$tmp_body" 2>/dev/null || echo "")
@@ -203,8 +234,7 @@ http_request() {
 
     if [ "$curl_rc" -ne 0 ]; then
         HTTP_TIMED_OUT=1
-        HTTP_STATUS="000"
-        fail "${check_name}: curl ${method} ${url} failed or timed out (exit ${curl_rc})"
+        HTTP_STATUS="${HTTP_STATUS:-000}"
         return 1
     fi
     return 0
@@ -213,7 +243,53 @@ http_request() {
 psql_query() {
     local check_name="$1"
     local sql="$2"
-    docker_exec_timed "$check_name" "$POSTGRES_CONTAINER" psql -U "$POSTGRES_USER" -d "$POSTGRES_DB" -t -A -c "$sql" | tr -d '[:space:]'
+    docker_exec_timed "$check_name" "$POSTGRES_CONTAINER" sh -c "psql -U \"\${POSTGRES_USER:-${POSTGRES_USER}}\" -d \"${POSTGRES_DB}\" -t -A -c \"$sql\"" | tr -d '[:space:]'
+}
+
+get_order_row_count() {
+    local check_name="$1"
+    local order_id="$2"
+    local count
+    count=$(docker_exec_timed "$check_name" "$POSTGRES_CONTAINER" sh -c \
+        "psql -U \"\${POSTGRES_USER:-${POSTGRES_USER}}\" -d \"${POSTGRES_DB}\" -t -A -c \"SELECT COUNT(*) FROM orders WHERE order_id = '${order_id}';\"" 2>/dev/null | tr -d '[:space:]' || true)
+    echo "${count:-0}"
+}
+
+get_inventory_dlt_offsets() {
+    local check_name="$1"
+    local topic="inventory.events-order-service-inventory-cg-dlt"
+    local offsets
+    offsets=$(docker_exec_timed "$check_name" "$KAFKA_CONTAINER" sh -c "
+        if [ -x /opt/kafka/bin/kafka-get-offsets.sh ]; then
+            /opt/kafka/bin/kafka-get-offsets.sh --bootstrap-server kafka:9092 --topic '${topic}' --time -1 2>/dev/null
+        elif command -v kafka-get-offsets >/dev/null 2>&1; then
+            kafka-get-offsets --bootstrap-server kafka:9092 --topic '${topic}' --time -1 2>/dev/null
+        elif [ -x /opt/kafka/bin/kafka-run-class.sh ]; then
+            /opt/kafka/bin/kafka-run-class.sh org.apache.kafka.tools.GetOffsetShell --bootstrap-server kafka:9092 --topic '${topic}' --time -1 2>/dev/null || \
+            /opt/kafka/bin/kafka-run-class.sh kafka.tools.GetOffsetShell --bootstrap-server kafka:9092 --topic '${topic}' --time -1 2>/dev/null
+        elif command -v kafka-run-class >/dev/null 2>&1; then
+            kafka-run-class org.apache.kafka.tools.GetOffsetShell --bootstrap-server kafka:9092 --topic '${topic}' --time -1 2>/dev/null || \
+            kafka-run-class kafka.tools.GetOffsetShell --bootstrap-server kafka:9092 --topic '${topic}' --time -1 2>/dev/null
+        fi
+    " 2>/dev/null | tr '\n' ' ' | sed 's/[[:space:]]*$//' || true)
+    echo "${offsets:-unknown}"
+}
+
+format_materialization_failure() {
+    local check_label="$1"
+    local check_prefix="$2"
+    local order_id="$3"
+    local expected_status="$4"
+    local timeout_secs="$5"
+
+    local last_status="${LAST_POLL_STATUS:-${HTTP_STATUS:-none}}"
+    local last_body="${LAST_POLL_BODY:-${HTTP_BODY:-none}}"
+    local row_count
+    row_count=$(get_order_row_count "${check_label} (query orders count)" "$order_id")
+    local dlt_offsets
+    dlt_offsets=$(get_inventory_dlt_offsets "${check_label} (query DLT offsets)")
+
+    echo "${check_prefix} did not materialize in ${expected_status} within ${timeout_secs}s (last HTTP status: ${last_status}, body: ${last_body}, orders table row count: ${row_count}, DLT end offsets: ${dlt_offsets})"
 }
 
 produce_kafka_event() {
@@ -342,12 +418,13 @@ poll_order_status() {
     start_ts=$(date +%s)
     local current_status=""
     while true; do
-        if http_request "$check_name" GET "${BASE_URL}/api/v1/orders/${order_id}" "" -H "X-User-Id: ${user_id}"; then
-            if [ "$HTTP_STATUS" = "200" ]; then
-                current_status=$(json_field "$HTTP_BODY" "data.get('status','')")
-                if [ "$current_status" = "$expected_status" ]; then
-                    return 0
-                fi
+        http_request "$check_name" GET "${BASE_URL}/api/v1/orders/${order_id}" "" -H "X-User-Id: ${user_id}" || true
+        LAST_POLL_STATUS="$HTTP_STATUS"
+        LAST_POLL_BODY="$HTTP_BODY"
+        if [ "$HTTP_STATUS" = "200" ]; then
+            current_status=$(json_field "$HTTP_BODY" "data.get('status','')")
+            if [ "$current_status" = "$expected_status" ]; then
+                return 0
             fi
         fi
         local now_ts
@@ -411,13 +488,12 @@ info "Using containers: postgres=${POSTGRES_CONTAINER}, kafka=${KAFKA_CONTAINER}
 # 1. Health Check
 # =============================================================================
 CHECK1_START=$(date +%s)
-if http_request "Check 1 (GET /actuator/health)" GET "${BASE_URL}/actuator/health"; then
-    HEALTH_STATUS=$(json_field "$HTTP_BODY" "data.get('status','')")
-    if [ "$HTTP_STATUS" = "200" ] && [ "$HEALTH_STATUS" = "UP" ]; then
-        finish_check "Check 1 (GET /actuator/health)" "$CHECK1_START" "PASS" "1. GET /actuator/health returned 200 UP"
-    else
-        finish_check "Check 1 (GET /actuator/health)" "$CHECK1_START" "FAIL" "1. GET /actuator/health expected 200 UP, got status=${HTTP_STATUS} body=${HTTP_BODY}"
-    fi
+http_request "Check 1 (GET /actuator/health)" GET "${BASE_URL}/actuator/health" || true
+HEALTH_STATUS=$(json_field "$HTTP_BODY" "data.get('status','')")
+if [ "$HTTP_STATUS" = "200" ] && [ "$HEALTH_STATUS" = "UP" ]; then
+    finish_check "Check 1 (GET /actuator/health)" "$CHECK1_START" "PASS" "1. GET /actuator/health returned 200 UP"
+else
+    finish_check "Check 1 (GET /actuator/health)" "$CHECK1_START" "FAIL" "1. GET /actuator/health expected 200 UP, got status=${HTTP_STATUS} body=${HTTP_BODY}"
 fi
 
 # =============================================================================
@@ -438,6 +514,8 @@ if http_request "Check 2 (Early checkout unknown order)" POST "${BASE_URL}/api/v
     else
         finish_check "Check 2 (Early checkout unknown order)" "$CHECK2_START" "FAIL" "2. Early checkout expected 409 ORDER_NOT_READY + Retry-After: 1, got status=${HTTP_STATUS} errorCode=${ERR_CODE} Retry-After=${RETRY_AFTER_HDR}"
     fi
+else
+    finish_check "Check 2 (Early checkout unknown order)" "$CHECK2_START" "FAIL" "2. Early checkout expected 409 ORDER_NOT_READY + Retry-After: 1, got status=${HTTP_STATUS} body=${HTTP_BODY}"
 fi
 
 # =============================================================================
@@ -480,7 +558,8 @@ if poll_order_status "Check 3 (Order 1 poll RESERVED)" "$ORDER1_ID" "$USER1_ID" 
         fi
     fi
 else
-    finish_check "Check 3 (Order 1 happy path)" "$CHECK3_START" "FAIL" "3. Order 1 did not materialize in RESERVED within 10s"
+    finish_check "Check 3 (Order 1 happy path)" "$CHECK3_START" "FAIL" \
+        "$(format_materialization_failure "Check 3 (Order 1 happy path)" "3. Order 1" "$ORDER1_ID" "RESERVED" 10)"
 fi
 
 # =============================================================================
@@ -515,7 +594,8 @@ if poll_order_status "Check 4 (Order 2 poll RESERVED)" "$ORDER2_ID" "$USER2_ID" 
         finish_check "Check 4 (Order 2 payment.failed)" "$CHECK4_START" "FAIL" "4. Order 2 checkout failed with HTTP ${HTTP_STATUS}"
     fi
 else
-    finish_check "Check 4 (Order 2 payment.failed)" "$CHECK4_START" "FAIL" "4. Order 2 did not materialize in RESERVED within 10s"
+    finish_check "Check 4 (Order 2 payment.failed)" "$CHECK4_START" "FAIL" \
+        "$(format_materialization_failure "Check 4 (Order 2 payment.failed)" "4. Order 2" "$ORDER2_ID" "RESERVED" 10)"
 fi
 
 # =============================================================================
@@ -565,7 +645,8 @@ if poll_order_status "Check 5 (Order 3 poll RESERVED)" "$ORDER3_ID" "$USER3_ID" 
         finish_check "Check 5 (Order 3 late payment & refund)" "$CHECK5_START" "FAIL" "5. Order 3 did not transition to CANCELLED_EXPIRED"
     fi
 else
-    finish_check "Check 5 (Order 3 late payment & refund)" "$CHECK5_START" "FAIL" "5. Order 3 did not materialize in RESERVED within 10s"
+    finish_check "Check 5 (Order 3 late payment & refund)" "$CHECK5_START" "FAIL" \
+        "$(format_materialization_failure "Check 5 (Order 3 late payment & refund)" "5. Order 3" "$ORDER3_ID" "RESERVED" 10)"
 fi
 
 # =============================================================================
