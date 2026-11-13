@@ -24,10 +24,16 @@
 
 `MockPaymentProvider` implements `PaymentProvider` and simulates external gateway behavior:
 - **Idempotency Guarantee**: Real gateways (Stripe, Adyen) deduplicate requests natively by idempotency key. `MockPaymentProvider` maintains in-memory maps keyed by `idempotencyKey` returning cached results on repeat invocations without counting as duplicate charges or refunds.
-- **Magic Tokens**:
-  - `tok_decline`: Deterministically declines with failure code `CARD_DECLINED`.
-  - `tok_error`: Throws `ProviderUnavailableException` on the first delivery attempt for an idempotency key, allowing Spring Kafka retry topics to redeliver and succeed on the next attempt.
-  - Any other token succeeds (subject to configurable random decline rate).
+- **Magic Tokens Table**:
+
+| Magic Token | Operation | Behavior | Failure Code / Outcome |
+| :--- | :--- | :--- | :--- |
+| `tok_success` | Charge | Always succeeds immediately regardless of configured decline rate or Random seed. | Outcome `SUCCEEDED`, provider reference `mock_ch_*` |
+| `tok_decline` | Charge | Deterministically declined by card issuer regardless of decline rate. | Outcome `DECLINED`, failure code `CARD_DECLINED`, message `Payment declined by card issuer` |
+| `tok_error` | Charge | Throws `ProviderUnavailableException` on the first delivery attempt per idempotency key; succeeds on subsequent retry attempts. | Transient exception, routed to Kafka retry topics (`-retry-0`, `-retry-1`) |
+
+Non-magic tokens (any arbitrary token string such as `"pm_tok_visa"`) succeed or decline based on the configured random decline rate (`ticketing.payment.provider.mock.decline-rate`, default `0.05`).
+
 - **Latency & Failure Configuration**:
   - `ticketing.payment.provider.mock.decline-rate`: default `0.05`
   - `ticketing.payment.provider.mock.min-latency-ms`: default `50`

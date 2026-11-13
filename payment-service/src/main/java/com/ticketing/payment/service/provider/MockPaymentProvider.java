@@ -27,6 +27,7 @@ public class MockPaymentProvider implements PaymentProvider {
 
     private static final Logger log = LoggerFactory.getLogger(MockPaymentProvider.class);
 
+    public static final String MAGIC_TOKEN_SUCCESS = "tok_success";
     public static final String MAGIC_TOKEN_DECLINE = "tok_decline";
     public static final String MAGIC_TOKEN_ERROR = "tok_error";
 
@@ -84,8 +85,14 @@ public class MockPaymentProvider implements PaymentProvider {
         simulateLatency();
 
         final PaymentResult result;
-        if (MAGIC_TOKEN_DECLINE.equals(paymentMethodToken)) {
+        if (MAGIC_TOKEN_SUCCESS.equals(paymentMethodToken)) {
+            String reference = "mock_ch_" + UUID.randomUUID().toString().replace("-", "").substring(0, 16);
+            result = PaymentResult.succeeded(reference);
+        } else if (MAGIC_TOKEN_DECLINE.equals(paymentMethodToken)) {
             result = PaymentResult.declined(FAILURE_CODE_DECLINED, FAILURE_MESSAGE_DECLINED);
+        } else if (MAGIC_TOKEN_ERROR.equals(paymentMethodToken)) {
+            String reference = "mock_ch_" + UUID.randomUUID().toString().replace("-", "").substring(0, 16);
+            result = PaymentResult.succeeded(reference);
         } else if (declineRate > 0.0 && random.nextDouble() < declineRate) {
             result = PaymentResult.declined(FAILURE_CODE_DECLINED, FAILURE_MESSAGE_DECLINED);
         } else {

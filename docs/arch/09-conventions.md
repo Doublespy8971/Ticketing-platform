@@ -155,6 +155,18 @@ All custom metrics use the `ticketing_` prefix, lowercase `snake_case`, and base
 | `MOCK_PAYMENT_MAX_LATENCY_MS` | `payment-service` | `300` | Maximum simulated payment processing latency in milliseconds. |
 | `NOTIFICATION_DEDUP_TTL_SECONDS` | `notification-service` | `604800` | TTL in seconds (7 days) for `notif:dedup:{eventId}` keys in Redis. |
 
+#### Mock Payment Provider Configuration & Magic Tokens
+
+`payment-service` uses `MockPaymentProvider` simulating payment gateway operations. The random failure rate (`MOCK_PAYMENT_FAILURE_RATE`, default `0.05`) applies strictly to non-magic tokens. Deterministic magic tokens bypass random decline and produce predictable outcomes:
+
+| Magic Token | Operation | Behavior | Failure Code / Outcome |
+| :--- | :--- | :--- | :--- |
+| `tok_success` | Charge | Always succeeds immediately regardless of configured decline rate or Random seed. | `SUCCEEDED` (outcome `SUCCEEDED`, provider ref `mock_ch_*`) |
+| `tok_decline` | Charge | Deterministically declined by card issuer regardless of decline rate. | `DECLINED` (failure code `CARD_DECLINED`, `Payment declined by card issuer`) |
+| `tok_error` | Charge | Throws `ProviderUnavailableException` on the first delivery attempt per idempotency key; succeeds on subsequent retry attempts. | Transient exception, routed to Kafka retry topics (`-retry-0`, `-retry-1`) |
+
+Non-magic tokens (e.g. `"pm_tok_visa"`) succeed or decline based on the configured random decline rate.
+
 ---
 
 ### 10.7 Pinned Dependency & Infrastructure Versions

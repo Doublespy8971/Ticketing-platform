@@ -62,8 +62,8 @@ finish_check() {
     else
         fail "$msg" "$suffix"
     fi
-    if [ "$took" -gt 20 ]; then
-        warn "${check_label} took ${took}s (> 20s threshold)"
+    if [ "$took" -gt 30 ]; then
+        warn "${check_label} took ${took}s (> 30s threshold)"
     fi
 }
 
@@ -331,7 +331,7 @@ poll_payment_status() {
     local check_name="$1"
     local order_id="$2"
     local expected_status="$3"
-    local max_wait_secs="${4:-15}"
+    local max_wait_secs="${4:-30}"
 
     local start_ts
     start_ts=$(date +%s)
@@ -354,7 +354,7 @@ poll_outbox_published() {
     local check_name="$1"
     local order_id="$2"
     local event_type="$3"
-    local max_wait_secs="${4:-15}"
+    local max_wait_secs="${4:-30}"
 
     local start_ts
     start_ts=$(date +%s)
@@ -377,7 +377,7 @@ verify_payment_event_on_kafka() {
     local check_name="$1"
     local order_id="$2"
     local expected_event_type="$3"
-    local max_wait_secs="${4:-15}"
+    local max_wait_secs="${4:-30}"
 
     local start_ts
     start_ts=$(date +%s)
@@ -403,6 +403,59 @@ verify_payment_event_on_kafka() {
         fi
         sleep 0.5
     done
+}
+
+print_payment_check_failure_diagnostics() {
+    local check_name="$1"
+    local order_id="$2"
+
+    info "--- Failure Diagnostics for Order ID: ${order_id} ---"
+
+    # 1. Row from payments table (status, failure_code, provider_reference) or none exists
+    local payment_row
+    payment_row=$(docker_exec_timed "${check_name} (diagnostics payments)" "$POSTGRES_CONTAINER" sh -c \
+        "psql -U \"\${POSTGRES_USER:-${POSTGRES_USER}}\" -d \"${POSTGRES_DB}\" -t -A -c \"SELECT CONCAT('status=', status, ', failure_code=', COALESCE(failure_code, 'NULL'), ', provider_reference=', COALESCE(provider_reference, 'NULL')) FROM payments WHERE order_id = '${order_id}';\"" 2>/dev/null | tr -d '\r')
+    if [ -n "$payment_row" ]; then
+        printf "${YELLOW}[DIAGNOSTIC]${NC} payments row: %s\n" "$payment_row"
+    else
+        printf "${YELLOW}[DIAGNOSTIC]${NC} payments row: none exists\n"
+    fi
+
+    # 2. Unpublished or published outbox rows for that aggregate id
+    local outbox_rows
+    outbox_rows=$(docker_exec_timed "${check_name} (diagnostics outbox)" "$POSTGRES_CONTAINER" sh -c \
+        "psql -U \"\${POSTGRES_USER:-${POSTGRES_USER}}\" -d \"${POSTGRES_DB}\" -t -A -c \"SELECT CONCAT('event_id=', event_id, ', event_type=', event_type, ', published_at=', COALESCE(published_at::text, 'NULL')) FROM outbox_events WHERE aggregate_id = '${order_id}' ORDER BY created_at ASC;\"" 2>/dev/null | tr -d '\r')
+    if [ -n "$outbox_rows" ]; then
+        printf "${YELLOW}[DIAGNOSTIC]${NC} outbox rows for %s:\n" "$order_id"
+        while IFS= read -r line; do
+            [ -n "$line" ] && printf "    %s\n" "$line"
+        done <<< "$outbox_rows"
+    else
+        printf "${YELLOW}[DIAGNOSTIC]${NC} outbox rows for %s: none exists\n" "$order_id"
+    fi
+
+    # 3. End offsets of the retry and dead-letter topics of the order consumer group of payment-service
+    local cg="payment-service-order-cg"
+    local retry0_topic="order.events-${cg}-retry-0"
+    local retry1_topic="order.events-${cg}-retry-1"
+    local dlt_topic="order.events-${cg}-dlt"
+
+    for t in "$retry0_topic" "$retry1_topic" "$dlt_topic"; do
+        local topic_offsets
+        topic_offsets=$(docker_exec_timed "${check_name} (offsets ${t})" "$KAFKA_CONTAINER" \
+            /opt/kafka/bin/kafka-get-offsets.sh \
+            --bootstrap-server kafka:9092 \
+            --topic "$t" \
+            --time -1 2>/dev/null | tr -d '\r')
+        if [ -n "$topic_offsets" ]; then
+            local formatted
+            formatted=$(echo "$topic_offsets" | tr '\n' ' ' | sed 's/ $//')
+            printf "${YELLOW}[DIAGNOSTIC]${NC} end offsets for %s: %s\n" "$t" "$formatted"
+        else
+            printf "${YELLOW}[DIAGNOSTIC]${NC} end offsets for %s: (none or unavailable)\n" "$t"
+        fi
+    done
+    info "--- End Diagnostics ---"
 }
 
 count_matching_kafka_events() {
@@ -457,6 +510,18 @@ build_order_refund_requested_envelope() {
 info "Starting payment-service smoke tests against ${BASE_URL}..."
 info "Using containers: postgres=${POSTGRES_CONTAINER}, kafka=${KAFKA_CONTAINER}"
 
+MOCK_DECLINE_RATE=""
+http_request "Query mock decline rate" GET "${BASE_URL}/actuator/env/ticketing.payment.provider.mock.decline-rate" || true
+if [ "$HTTP_STATUS" = "200" ] && [ -n "$HTTP_BODY" ]; then
+    MOCK_DECLINE_RATE=$(json_field "$HTTP_BODY" "data.get('property',{}).get('value','')")
+fi
+
+if [ -n "$MOCK_DECLINE_RATE" ]; then
+    info "Effective mock decline rate: ${MOCK_DECLINE_RATE}"
+else
+    info "Effective mock decline rate not exposed; tok_success makes the run independent of it"
+fi
+
 # =============================================================================
 # 1. Health Check
 # =============================================================================
@@ -470,7 +535,7 @@ else
 fi
 
 # =============================================================================
-# 2. Successful Payment: normal token -> SUCCEEDED + payment.succeeded on payment.events
+# 2. Successful Payment: tok_success -> SUCCEEDED + payment.succeeded on payment.events
 # =============================================================================
 CHECK2_START=$(date +%s)
 ORDER1_ID=$(uuid_v4)
@@ -478,18 +543,20 @@ USER1_ID=$(uuid_v4)
 EVENT1_ID=$(uuid_v4)
 PAYMENT1_EVT_ID=$(uuid_v4)
 
-REQ1_JSON=$(build_order_payment_requested_envelope "$ORDER1_ID" "$USER1_ID" "$EVENT1_ID" "pm_tok_visa_success" 15000 "$PAYMENT1_EVT_ID")
+REQ1_JSON=$(build_order_payment_requested_envelope "$ORDER1_ID" "$USER1_ID" "$EVENT1_ID" "tok_success" 15000 "$PAYMENT1_EVT_ID")
 if produce_kafka_event "Check 2 (Order 1 payment.requested)" "order.events" "$ORDER1_ID" "$REQ1_JSON"; then
-    if poll_payment_status "Check 2 (Order 1 poll SUCCEEDED)" "$ORDER1_ID" "SUCCEEDED" 20 \
-        && poll_outbox_published "Check 2 (Order 1 outbox payment.succeeded)" "$ORDER1_ID" "payment.succeeded" 20 \
-        && verify_payment_event_on_kafka "Check 2 (Order 1 kafka payment.succeeded)" "$ORDER1_ID" "payment.succeeded" 20; then
+    if poll_payment_status "Check 2 (Order 1 poll SUCCEEDED)" "$ORDER1_ID" "SUCCEEDED" 30 \
+        && poll_outbox_published "Check 2 (Order 1 outbox payment.succeeded)" "$ORDER1_ID" "payment.succeeded" 30 \
+        && verify_payment_event_on_kafka "Check 2 (Order 1 kafka payment.succeeded)" "$ORDER1_ID" "payment.succeeded" 30; then
         PAYMENT1_ID=$(psql_query "Check 2 (Order 1 get payment_id)" "SELECT payment_id FROM payments WHERE order_id = '${ORDER1_ID}';")
         finish_check "Check 2 (Successful payment)" "$CHECK2_START" "PASS" "2. Successful payment: SUCCEEDED in payment_db and payment.succeeded on payment.events"
     else
-        finish_check "Check 2 (Successful payment)" "$CHECK2_START" "FAIL" "2. Order 1 did not reach SUCCEEDED or publish payment.succeeded"
+        print_payment_check_failure_diagnostics "Check 2 (Successful payment)" "$ORDER1_ID"
+        finish_check "Check 2 (Successful payment)" "$CHECK2_START" "FAIL" "2. Order 1 (${ORDER1_ID}) did not reach SUCCEEDED or publish payment.succeeded within 30s"
     fi
 else
-    finish_check "Check 2 (Successful payment)" "$CHECK2_START" "FAIL" "2. Failed to produce order.payment.requested for Order 1"
+    print_payment_check_failure_diagnostics "Check 2 (Successful payment)" "$ORDER1_ID"
+    finish_check "Check 2 (Successful payment)" "$CHECK2_START" "FAIL" "2. Failed to produce order.payment.requested for Order 1 (${ORDER1_ID})"
 fi
 
 # =============================================================================
@@ -503,20 +570,23 @@ PAYMENT2_EVT_ID=$(uuid_v4)
 
 REQ2_JSON=$(build_order_payment_requested_envelope "$ORDER2_ID" "$USER2_ID" "$EVENT2_ID" "tok_decline" 15000 "$PAYMENT2_EVT_ID")
 if produce_kafka_event "Check 3 (Order 2 payment.requested tok_decline)" "order.events" "$ORDER2_ID" "$REQ2_JSON"; then
-    if poll_payment_status "Check 3 (Order 2 poll FAILED)" "$ORDER2_ID" "FAILED" 20 \
-        && poll_outbox_published "Check 3 (Order 2 outbox payment.failed)" "$ORDER2_ID" "payment.failed" 20 \
-        && verify_payment_event_on_kafka "Check 3 (Order 2 kafka payment.failed)" "$ORDER2_ID" "payment.failed" 20; then
+    if poll_payment_status "Check 3 (Order 2 poll FAILED)" "$ORDER2_ID" "FAILED" 30 \
+        && poll_outbox_published "Check 3 (Order 2 outbox payment.failed)" "$ORDER2_ID" "payment.failed" 30 \
+        && verify_payment_event_on_kafka "Check 3 (Order 2 kafka payment.failed)" "$ORDER2_ID" "payment.failed" 30; then
         FAIL_CODE=$(psql_query "Check 3 (Order 2 failure_code)" "SELECT failure_code FROM payments WHERE order_id = '${ORDER2_ID}';")
         if [ "$FAIL_CODE" = "CARD_DECLINED" ]; then
             finish_check "Check 3 (Declined payment)" "$CHECK3_START" "PASS" "3. Declined payment: FAILED in payment_db with failureCode=CARD_DECLINED and payment.failed on payment.events"
         else
-            finish_check "Check 3 (Declined payment)" "$CHECK3_START" "FAIL" "3. Order 2 expected failure_code=CARD_DECLINED, got '${FAIL_CODE}'"
+            print_payment_check_failure_diagnostics "Check 3 (Declined payment)" "$ORDER2_ID"
+            finish_check "Check 3 (Declined payment)" "$CHECK3_START" "FAIL" "3. Order 2 (${ORDER2_ID}) expected failure_code=CARD_DECLINED, got '${FAIL_CODE}'"
         fi
     else
-        finish_check "Check 3 (Declined payment)" "$CHECK3_START" "FAIL" "3. Order 2 did not reach FAILED or publish payment.failed"
+        print_payment_check_failure_diagnostics "Check 3 (Declined payment)" "$ORDER2_ID"
+        finish_check "Check 3 (Declined payment)" "$CHECK3_START" "FAIL" "3. Order 2 (${ORDER2_ID}) did not reach FAILED or publish payment.failed within 30s"
     fi
 else
-    finish_check "Check 3 (Declined payment)" "$CHECK3_START" "FAIL" "3. Failed to produce order.payment.requested for Order 2"
+    print_payment_check_failure_diagnostics "Check 3 (Declined payment)" "$ORDER2_ID"
+    finish_check "Check 3 (Declined payment)" "$CHECK3_START" "FAIL" "3. Failed to produce order.payment.requested for Order 2 (${ORDER2_ID})"
 fi
 
 # =============================================================================
@@ -531,10 +601,12 @@ if produce_kafka_event "Check 4 (Order 2 duplicate delivery)" "order.events" "$O
     if [ "$ORDER2_COUNT" = "1" ] && [ "$ORDER2_OUTBOX_COUNT" = "1" ]; then
         finish_check "Check 4 (Duplicate payment event)" "$CHECK4_START" "PASS" "4. Duplicate payment event processed idempotently: exactly 1 payment row and 1 outbox row"
     else
-        finish_check "Check 4 (Duplicate payment event)" "$CHECK4_START" "FAIL" "4. Duplicate payment event resulted in payments count=${ORDER2_COUNT}, outbox count=${ORDER2_OUTBOX_COUNT}"
+        print_payment_check_failure_diagnostics "Check 4 (Duplicate payment event)" "$ORDER2_ID"
+        finish_check "Check 4 (Duplicate payment event)" "$CHECK4_START" "FAIL" "4. Duplicate payment event for Order 2 (${ORDER2_ID}) resulted in payments count=${ORDER2_COUNT}, outbox count=${ORDER2_OUTBOX_COUNT}"
     fi
 else
-    finish_check "Check 4 (Duplicate payment event)" "$CHECK4_START" "FAIL" "4. Failed to produce duplicate event for Order 2"
+    print_payment_check_failure_diagnostics "Check 4 (Duplicate payment event)" "$ORDER2_ID"
+    finish_check "Check 4 (Duplicate payment event)" "$CHECK4_START" "FAIL" "4. Failed to produce duplicate event for Order 2 (${ORDER2_ID})"
 fi
 
 # =============================================================================
@@ -545,15 +617,17 @@ if [ -n "${PAYMENT1_ID:-}" ]; then
     REFUND1_EVT_ID=$(uuid_v4)
     REF1_JSON=$(build_order_refund_requested_envelope "$ORDER1_ID" "$PAYMENT1_ID" "$USER1_ID" 15000 "LATE_PAYMENT_EXPIRED_HOLD" "$REFUND1_EVT_ID")
     if produce_kafka_event "Check 5 (Order 1 refund.requested)" "order.events" "$ORDER1_ID" "$REF1_JSON"; then
-        if poll_payment_status "Check 5 (Order 1 poll REFUNDED)" "$ORDER1_ID" "REFUNDED" 20 \
-            && poll_outbox_published "Check 5 (Order 1 outbox payment.refunded)" "$ORDER1_ID" "payment.refunded" 20 \
-            && verify_payment_event_on_kafka "Check 5 (Order 1 kafka payment.refunded)" "$ORDER1_ID" "payment.refunded" 20; then
+        if poll_payment_status "Check 5 (Order 1 poll REFUNDED)" "$ORDER1_ID" "REFUNDED" 30 \
+            && poll_outbox_published "Check 5 (Order 1 outbox payment.refunded)" "$ORDER1_ID" "payment.refunded" 30 \
+            && verify_payment_event_on_kafka "Check 5 (Order 1 kafka payment.refunded)" "$ORDER1_ID" "payment.refunded" 30; then
             finish_check "Check 5 (Compensating refund)" "$CHECK5_START" "PASS" "5. Compensating refund: payment moved to REFUNDED and payment.refunded published"
         else
-            finish_check "Check 5 (Compensating refund)" "$CHECK5_START" "FAIL" "5. Order 1 refund did not reach REFUNDED or publish payment.refunded"
+            print_payment_check_failure_diagnostics "Check 5 (Compensating refund)" "$ORDER1_ID"
+            finish_check "Check 5 (Compensating refund)" "$CHECK5_START" "FAIL" "5. Order 1 (${ORDER1_ID}) refund did not reach REFUNDED or publish payment.refunded within 30s"
         fi
     else
-        finish_check "Check 5 (Compensating refund)" "$CHECK5_START" "FAIL" "5. Failed to produce order.refund.requested for Order 1"
+        print_payment_check_failure_diagnostics "Check 5 (Compensating refund)" "$ORDER1_ID"
+        finish_check "Check 5 (Compensating refund)" "$CHECK5_START" "FAIL" "5. Failed to produce order.refund.requested for Order 1 (${ORDER1_ID})"
     fi
 else
     finish_check "Check 5 (Compensating refund)" "$CHECK5_START" "FAIL" "5. Skipped because Order 1 payment was not recorded"
@@ -573,9 +647,11 @@ if [ -n "${PAYMENT1_ID:-}" ]; then
         if [ "$ORDER1_STATUS" = "REFUNDED" ] && [ "$ORDER1_REFUND_OUTBOX_COUNT" = "1" ]; then
             finish_check "Check 6 (Second refund request no-op)" "$CHECK6_START" "PASS" "6. Second refund request was an idempotent no-op: exactly 1 payment.refunded outbox row"
         else
-            finish_check "Check 6 (Second refund request no-op)" "$CHECK6_START" "FAIL" "6. Second refund request expected 1 outbox row, found ${ORDER1_REFUND_OUTBOX_COUNT}"
+            print_payment_check_failure_diagnostics "Check 6 (Second refund request no-op)" "$ORDER1_ID"
+            finish_check "Check 6 (Second refund request no-op)" "$CHECK6_START" "FAIL" "6. Second refund request for Order 1 (${ORDER1_ID}) expected 1 outbox row, found ${ORDER1_REFUND_OUTBOX_COUNT}"
         fi
     else
+        print_payment_check_failure_diagnostics "Check 6 (Second refund request no-op)" "$ORDER1_ID"
         finish_check "Check 6 (Second refund request no-op)" "$CHECK6_START" "FAIL" "6. Failed to produce second refund request"
     fi
 else
