@@ -1,10 +1,45 @@
+server:
+  port: ${SERVER_PORT:8080}
+
 spring:
   application:
     name: gateway-service
-server:
-  port: 8080
+  data:
+    redis:
+      host: ${REDIS_HOST:localhost}
+      port: ${REDIS_PORT:6379}
+  cloud:
+    gateway:
+      httpclient:
+        connect-timeout: 2000
+        response-timeout: 10s
+
+inventory:
+  service:
+    url: ${INVENTORY_SERVICE_URL:http://localhost:8081}
+
+order:
+  service:
+    url: ${ORDER_SERVICE_URL:http://localhost:8082}
+
+payment:
+  service:
+    url: ${PAYMENT_SERVICE_URL:http://localhost:8083}
+
+ticketing:
+  gateway:
+    allow-insecure-dev-secret: ${TICKETING_GATEWAY_ALLOW_INSECURE_DEV_SECRET:false}
+    dev-token:
+      enabled: ${TICKETING_GATEWAY_DEV_TOKEN_ENABLED:true}
+      allow-admin: ${TICKETING_GATEWAY_DEV_TOKEN_ALLOW_ADMIN:false}
+
 management:
   endpoints:
     web:
       exposure:
-        include: health
+        include: health,info,prometheus
+  endpoint:
+    health:
+      show-details: always
+      probes:
+        enabled: true

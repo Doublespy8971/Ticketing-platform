@@ -112,6 +112,9 @@ All custom metrics use the `ticketing_` prefix, lowercase `snake_case`, and base
 | `payment_provider_calls_total` | `Counter` | `service`, `operation` (`charge`, `refund`), `outcome` (`succeeded`, `declined`, `error`) | `payment-service` | Total calls to the payment provider. |
 | `payment_provider_duration_seconds` | `Timer` | `service`, `operation` (`charge`, `refund`) | `payment-service` | Duration of payment provider calls. |
 | `payment_events_handled_total` | `Counter` | `service`, `event_type`, `outcome` (`applied`, `noop`, `ignored`) | `payment-service` | Total order events handled by payment-service partitioned by event type and outcome. |
+| `gateway_requests_total` | `Counter` | `service`, `route`, `status_class` (`2xx`, `4xx`, `5xx`) | `gateway-service` | Total incoming requests routed through the gateway. |
+| `gateway_rate_limited_total` | `Counter` | `service`, `route` | `gateway-service` | Total requests rejected by the Redis rate limiter (HTTP 429). |
+| `gateway_auth_failures_total` | `Counter` | `service`, `reason` (`missing`, `invalid`, `expired`, `forbidden`) | `gateway-service` | Total authentication and authorization rejections at the gateway. |
 | `ticketing_notifications_sent_total` | `Counter` | `service`, `event_type`, `status` (`SENT`, `DEDUPLICATED`, `FAILED`) | `notification-service` | Total notifications dispatched or deduplicated via Redis. |
 
 > **Consumer meter tag rules**: the `service` tag on every meter comes from the registry's common tags and is never added per meter. The `event_type` tag of the `consumer_*` meters is restricted to the `EventTypes` constants of `ticketing-common`; any other value, including a missing or unparseable event type, is tagged `unknown`.
