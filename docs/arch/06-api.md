@@ -16,11 +16,19 @@
     - `X-User-Id: <sub claim>`
     - `X-User-Roles: <comma-joined roles claim>` (`"USER"` or `"ADMIN,USER"`)
     - `X-Correlation-Id: <incoming UUID or newly generated UUIDv4>`
-- **Route Access Matrix**:
+- **Route Access Matrix & Method Predicates**:
+  - `inventory-seats` (`GET /api/v1/events/{eventId}/seats`): Public (no JWT required; rate-limited by client IP).
+  - `inventory-reservations` (`POST /api/v1/reservations`): Requires valid JWT with `USER` or `ADMIN` in `roles`.
+  - `order-checkout` (`POST /api/v1/orders/{orderId}/checkout`): Requires valid JWT with `USER` or `ADMIN` in `roles`.
+  - `order-get` (`GET /api/v1/orders/{orderId}`): Requires valid JWT with `USER` or `ADMIN` in `roles`.
+  - `inventory-admin` (`POST /api/v1/admin/events`, `POST /api/v1/admin/events/{eventId}/seats/bulk`, `PATCH /api/v1/admin/events/{eventId}/status`): Requires valid JWT with `ADMIN` in `roles` (enforced both at `gateway-service` and by `inventory-service` checking `X-User-Roles`).
   - `POST /api/v1/auth/token`: Public in `dev` / `local` profiles only (disabled in `prod`).
-  - `GET /api/v1/events/{eventId}/seats`: Public (no JWT required; rate-limited by client IP).
-  - `POST /api/v1/reservations`, `POST /api/v1/orders/{orderId}/checkout`, `GET /api/v1/orders/{orderId}`: Requires valid JWT with `USER` or `ADMIN` in `roles`.
-  - `POST /api/v1/admin/**`: Requires valid JWT with `ADMIN` in `roles` (enforced both at `gateway-service` and by `inventory-service` checking `X-User-Roles`).
+  - Requests matching no route return `404 Not Found` (`RESOURCE_NOT_FOUND`).
+- **Route Classification by Route ID**:
+  - Authorization and rate-limiting decisions are driven strictly by the matched Spring Cloud Gateway Route ID (`ServerWebExchangeUtils.GATEWAY_ROUTE_ATTR`), never by string matching on request path.
+  - Bounded route ID set: `inventory-seats`, `inventory-reservations`, `inventory-admin`, `order-checkout`, `order-get`, `payment-service`, `auth-token`, `actuator`, and `unmatched`.
+- **Strict Path Hygiene Rule**:
+  - A highest-precedence WebFilter intercepts all requests before route matching and rejects with `400 Bad Request` (`VALIDATION_ERROR`) any request whose raw path contains a percent sign (`%`), semicolon (`;`), backslash (`\`), two consecutive slashes (`//`), dot-dot segment (`..`), NUL byte (`\0`), or non-ASCII characters.
 
 ---
 

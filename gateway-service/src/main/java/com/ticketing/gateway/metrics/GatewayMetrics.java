@@ -1,7 +1,10 @@
 package com.ticketing.gateway.metrics;
 
+import com.ticketing.gateway.config.GatewayRoutesConfig;
 import io.micrometer.core.instrument.MeterRegistry;
 import org.springframework.stereotype.Component;
+
+import java.util.Set;
 
 /**
  * Custom metrics for gateway-service:
@@ -9,10 +12,26 @@ import org.springframework.stereotype.Component;
  * - gateway_rate_limited_total (tags: route)
  * - gateway_auth_failures_total (tags: reason: missing, invalid, expired, forbidden)
  *
+ * Route tags are strictly bounded:
+ * inventory-seats, inventory-reservations, inventory-admin, order-checkout, order-get,
+ * payment-service, auth-token, actuator, unmatched.
+ *
  * Security: Tokens and Authorization headers are NEVER logged or used as tags.
  */
 @Component
 public class GatewayMetrics {
+
+    public static final Set<String> ALLOWED_ROUTES = Set.of(
+            GatewayRoutesConfig.ROUTE_INVENTORY_SEATS,
+            GatewayRoutesConfig.ROUTE_INVENTORY_RESERVATIONS,
+            GatewayRoutesConfig.ROUTE_INVENTORY_ADMIN,
+            GatewayRoutesConfig.ROUTE_ORDER_CHECKOUT,
+            GatewayRoutesConfig.ROUTE_ORDER_GET,
+            GatewayRoutesConfig.ROUTE_PAYMENT,
+            GatewayRoutesConfig.ROUTE_AUTH_TOKEN,
+            GatewayRoutesConfig.ROUTE_ACTUATOR,
+            GatewayRoutesConfig.ROUTE_UNMATCHED
+    );
 
     private final MeterRegistry meterRegistry;
 
@@ -52,22 +71,12 @@ public class GatewayMetrics {
 
     public static String normalizeRoute(String route) {
         if (route == null || route.isBlank()) {
-            return "unknown";
+            return GatewayRoutesConfig.ROUTE_UNMATCHED;
         }
-        return switch (route) {
-            case "inventory-seats", "inventory-reservations", "inventory-admin",
-                 "order-checkout", "order-get", "auth-token", "actuator" -> route;
-            default -> {
-                if (route.contains("seats")) yield "inventory-seats";
-                if (route.contains("reservations")) yield "inventory-reservations";
-                if (route.contains("admin")) yield "inventory-admin";
-                if (route.contains("checkout")) yield "order-checkout";
-                if (route.contains("orders")) yield "order-get";
-                if (route.contains("auth")) yield "auth-token";
-                if (route.contains("actuator")) yield "actuator";
-                yield "unknown";
-            }
-        };
+        if (ALLOWED_ROUTES.contains(route)) {
+            return route;
+        }
+        return GatewayRoutesConfig.ROUTE_UNMATCHED;
     }
 
     public static String normalizeReason(String reason) {
@@ -80,4 +89,3 @@ public class GatewayMetrics {
         };
     }
 }
-

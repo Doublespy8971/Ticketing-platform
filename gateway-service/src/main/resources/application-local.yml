@@ -1,0 +1,7 @@
+ticketing:
+  gateway:
+    allow-insecure-dev-secret: true
+    dev-token:
+      enabled: true
+      allow-admin: true
+

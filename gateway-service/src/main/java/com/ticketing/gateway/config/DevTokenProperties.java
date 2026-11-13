@@ -1,7 +1,11 @@
 package com.ticketing.gateway.config;
 
+import jakarta.annotation.PostConstruct;
 import org.springframework.boot.context.properties.ConfigurationProperties;
+import org.springframework.core.env.Environment;
 import org.springframework.stereotype.Component;
+
+import java.util.Arrays;
 
 /**
  * Configuration properties for dev-only token issuance endpoint.
@@ -10,17 +14,31 @@ import org.springframework.stereotype.Component;
 @ConfigurationProperties(prefix = "ticketing.gateway.dev-token")
 public class DevTokenProperties {
 
-    /**
-     * Whether the dev-only /api/v1/auth/token endpoint is enabled.
-     * Default true locally; must never be enabled in production.
-     */
-    private boolean enabled = true;
+    private final Environment environment;
+
+    public DevTokenProperties(Environment environment) {
+        this.environment = environment;
+    }
 
     /**
-     * Whether requests for the ADMIN role are permitted on the dev token endpoint.
-     * Default false.
+     * Whether the dev-only /api/v1/auth/token endpoint is enabled.
+     * Defaults to false in application.yml; enabled only via dev/local profiles.
      */
+    @org.springframework.beans.factory.annotation.Value("${ticketing.gateway.dev-token.enabled:false}")
+    private boolean enabled = false;
+
+    @org.springframework.beans.factory.annotation.Value("${ticketing.gateway.dev-token.allow-admin:false}")
     private boolean allowAdmin = false;
+
+    @PostConstruct
+    public void validate() {
+        boolean isProd = Arrays.asList(environment.getActiveProfiles()).contains("prod")
+                || environment.matchesProfiles("prod");
+        if (isProd && enabled) {
+            throw new IllegalStateException(
+                    "Dev token endpoint (ticketing.gateway.dev-token.enabled) must NEVER be enabled when prod profile is active");
+        }
+    }
 
     public boolean isEnabled() {
         return enabled;
@@ -38,4 +56,3 @@ public class DevTokenProperties {
         this.allowAdmin = allowAdmin;
     }
 }
-

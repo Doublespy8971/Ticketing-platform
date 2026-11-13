@@ -8,11 +8,19 @@ spring:
     redis:
       host: ${REDIS_HOST:localhost}
       port: ${REDIS_PORT:6379}
+      timeout: 200ms
+      connect-timeout: 500ms
   cloud:
     gateway:
       httpclient:
         connect-timeout: 2000
         response-timeout: 10s
+        pool:
+          type: fixed
+          max-connections: 200
+          acquire-timeout: 2000
+          max-idle-time: 30s
+          max-life-time: 5m
 
 inventory:
   service:
@@ -29,11 +37,15 @@ payment:
 ticketing:
   gateway:
     allow-insecure-dev-secret: ${TICKETING_GATEWAY_ALLOW_INSECURE_DEV_SECRET:false}
+    trusted-proxies: ${TICKETING_GATEWAY_TRUSTED_PROXIES:}
     dev-token:
-      enabled: ${TICKETING_GATEWAY_DEV_TOKEN_ENABLED:true}
+      enabled: ${TICKETING_GATEWAY_DEV_TOKEN_ENABLED:false}
       allow-admin: ${TICKETING_GATEWAY_DEV_TOKEN_ALLOW_ADMIN:false}
 
 management:
+  metrics:
+    tags:
+      service: gateway-service
   endpoints:
     web:
       exposure:

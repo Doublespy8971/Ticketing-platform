@@ -11,11 +11,13 @@ import static org.assertj.core.api.Assertions.assertThatThrownBy;
 class StartupFailureTest {
 
     @Test
-    @DisplayName("Startup fails when secret is shorter than 32 bytes and allow-insecure-dev-secret is false")
-    void startupFailsWithShortSecretAndNoInsecureFlag() {
+    @DisplayName("Startup fails when secret is 31 bytes (shorter than 32 bytes) and allow-insecure-dev-secret is false")
+    void startupFailsWith31ByteSecret() {
+        // Exactly 31 characters / 31 UTF-8 bytes
+        String secret31 = "1234567890123456789012345678901";
         try (AnnotationConfigApplicationContext context = new AnnotationConfigApplicationContext()) {
             TestPropertyValues.of(
-                    "JWT_SECRET=too-short-secret",
+                    "JWT_SECRET=" + secret31,
                     "ticketing.gateway.allow-insecure-dev-secret=false"
             ).applyTo(context);
             context.register(JwtProperties.class);
@@ -28,11 +30,28 @@ class StartupFailureTest {
     }
 
     @Test
-    @DisplayName("Startup fails when secret is missing and allow-insecure-dev-secret is false")
-    void startupFailsWithMissingSecretAndNoInsecureFlag() {
+    @DisplayName("Startup succeeds when secret is exactly 32 bytes")
+    void startupSucceedsWith32ByteSecret() {
+        // Exactly 32 characters / 32 UTF-8 bytes
+        String secret32 = "12345678901234567890123456789012";
         try (AnnotationConfigApplicationContext context = new AnnotationConfigApplicationContext()) {
             TestPropertyValues.of(
-                    "JWT_SECRET=",
+                    "JWT_SECRET=" + secret32,
+                    "ticketing.gateway.allow-insecure-dev-secret=false"
+            ).applyTo(context);
+            context.register(JwtProperties.class);
+            context.refresh();
+
+            JwtProperties props = context.getBean(JwtProperties.class);
+            assertThat(props.getEffectiveSecret()).isEqualTo(secret32);
+        }
+    }
+
+    @Test
+    @DisplayName("Startup fails when JWT_SECRET is not set at all and allow-insecure-dev-secret is false")
+    void startupFailsWhenSecretNotSetAtAll() {
+        try (AnnotationConfigApplicationContext context = new AnnotationConfigApplicationContext()) {
+            TestPropertyValues.of(
                     "ticketing.gateway.allow-insecure-dev-secret=false"
             ).applyTo(context);
             context.register(JwtProperties.class);
@@ -61,18 +80,19 @@ class StartupFailureTest {
     }
 
     @Test
-    @DisplayName("Startup succeeds when secret is at least 32 bytes")
-    void startupSucceedsWithValidSecret() {
+    @DisplayName("Startup fails when prod profile is active and dev-token.enabled is true")
+    void startupFailsWhenProdProfileWithDevTokenEnabled() {
         try (AnnotationConfigApplicationContext context = new AnnotationConfigApplicationContext()) {
+            context.getEnvironment().setActiveProfiles("prod");
             TestPropertyValues.of(
-                    "JWT_SECRET=this-is-a-valid-secret-key-that-is-at-least-32-bytes-long",
-                    "ticketing.gateway.allow-insecure-dev-secret=false"
+                    "ticketing.gateway.dev-token.enabled=true"
             ).applyTo(context);
-            context.register(JwtProperties.class);
-            context.refresh();
+            context.register(DevTokenProperties.class);
 
-            JwtProperties props = context.getBean(JwtProperties.class);
-            assertThat(props.getEffectiveSecret()).isEqualTo("this-is-a-valid-secret-key-that-is-at-least-32-bytes-long");
+            assertThatThrownBy(context::refresh)
+                    .hasRootCauseInstanceOf(IllegalStateException.class)
+                    .rootCause()
+                    .hasMessageContaining("Dev token endpoint");
         }
     }
 }
