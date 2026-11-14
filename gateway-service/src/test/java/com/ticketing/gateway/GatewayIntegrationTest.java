@@ -8,6 +8,7 @@ import com.fasterxml.jackson.databind.ObjectMapper;
 import com.ticketing.gateway.api.DevTokenRequest;
 import com.ticketing.gateway.auth.JwtTokenService;
 import com.ticketing.gateway.auth.SecurityConstants;
+import com.ticketing.gateway.config.DevTokenProperties;
 import com.ticketing.gateway.config.GatewayRoutesConfig;
 import com.ticketing.gateway.filter.CorrelationIdWebFilter;
 import com.ticketing.gateway.metrics.GatewayMetrics;
@@ -47,6 +48,7 @@ import reactor.netty.http.server.HttpServer;
 import java.nio.charset.StandardCharsets;
 import java.time.Duration;
 import java.util.ArrayList;
+import java.util.Base64;
 import java.util.Collections;
 import java.util.HashMap;
 import java.util.List;
@@ -218,6 +220,9 @@ public class GatewayIntegrationTest {
     @Autowired
     private GatewayMetrics gatewayMetrics;
 
+    @Autowired
+    private DevTokenProperties devTokenProperties;
+
     @BeforeEach
     void clearRecorded() {
         recordedInventoryRequests.clear();
@@ -238,6 +243,24 @@ public class GatewayIntegrationTest {
         String token = jwtTokenService.generateToken(userId, roles, ttl);
         issuedTokensForLogCheck.add(token);
         return token;
+    }
+
+    private double getAuthFailureCount(String reason) {
+        var counter = meterRegistry.find("gateway_auth_failures_total")
+                .tag("reason", reason)
+                .counter();
+        return counter != null ? counter.count() : 0.0;
+    }
+
+    private static String sign(String signingInput, String secret) {
+        try {
+            javax.crypto.Mac mac = javax.crypto.Mac.getInstance("HmacSHA256");
+            mac.init(new javax.crypto.spec.SecretKeySpec(secret.getBytes(StandardCharsets.UTF_8), "HmacSHA256"));
+            byte[] sig = mac.doFinal(signingInput.getBytes(StandardCharsets.US_ASCII));
+            return signingInput + "." + Base64.getUrlEncoder().withoutPadding().encodeToString(sig);
+        } catch (Exception e) {
+            throw new RuntimeException(e);
+        }
     }
 
     // 1. Path Hygiene: %61dmin, semicolon, dot-dot, double-slash, backslash return 400 with stub uncalled
@@ -366,9 +389,442 @@ public class GatewayIntegrationTest {
         assertThat(recordedInventoryRequests).isEmpty();
     }
 
-    // 4. IP rate limiting & rotating X-Forwarded-For direct client vs trusted proxy
+    // 4. Admin token on admin route is forwarded
     @Test
     @Order(4)
+    @DisplayName("Admin token on admin route is forwarded")
+    void adminTokenOnAdminRouteIsForwarded() {
+        UUID adminId = UUID.randomUUID();
+        String token = createToken(adminId, List.of("ADMIN"), 3600);
+
+        webTestClient.post()
+                .uri("/api/v1/admin/events")
+                .header(HttpHeaders.AUTHORIZATION, "Bearer " + token)
+                .contentType(MediaType.APPLICATION_JSON)
+                .bodyValue("{\"name\":\"Test Event\"}")
+                .exchange()
+                .expectStatus().isCreated();
+
+        RecordedRequest req = recordedInventoryRequests.poll();
+        assertThat(req).isNotNull();
+        assertThat(req.headers().get("x-user-id")).isEqualTo(adminId.toString());
+        assertThat(req.headers().get("x-user-roles")).isEqualTo("ADMIN");
+    }
+
+    // 5. Valid user token reaches stub with X-User-Id and X-User-Roles
+    @Test
+    @Order(5)
+    @DisplayName("Valid user token reaches stub with X-User-Id and X-User-Roles")
+    void validUserTokenReachesStubWithHeaders() {
+        UUID userId = UUID.randomUUID();
+        String token = createToken(userId, List.of("USER"), 3600);
+
+        webTestClient.post()
+                .uri("/api/v1/reservations")
+                .header(HttpHeaders.AUTHORIZATION, "Bearer " + token)
+                .contentType(MediaType.APPLICATION_JSON)
+                .bodyValue("{\"eventId\":\"" + UUID.randomUUID() + "\",\"seatIds\":[\"" + UUID.randomUUID() + "\"]}")
+                .exchange()
+                .expectStatus().isCreated()
+                .expectHeader().value("X-Correlation-Id", val -> assertThat(val).isNotBlank());
+
+        RecordedRequest req = recordedInventoryRequests.poll();
+        assertThat(req).isNotNull();
+        assertThat(req.headers().get("x-user-id")).isEqualTo(userId.toString());
+        assertThat(req.headers().get("x-user-roles")).isEqualTo("USER");
+    }
+
+    // 6. Valid user token + spoofed headers arrives with token-derived values only on protected route and none on public route
+    @Test
+    @Order(6)
+    @DisplayName("Valid user token + spoofed headers arrives with token-derived values only on protected route and none on public route")
+    void validUserTokenWithSpoofedHeadersSanitized() {
+        UUID validUserId = UUID.randomUUID();
+        UUID spoofedUserId = UUID.randomUUID();
+        String token = createToken(validUserId, List.of("USER"), 3600);
+
+        // Protected route
+        webTestClient.post()
+                .uri("/api/v1/reservations")
+                .header(HttpHeaders.AUTHORIZATION, "Bearer " + token)
+                .header("X-User-Id", spoofedUserId.toString())
+                .header("x-user-id", spoofedUserId.toString())
+                .header("X-USER-ID", spoofedUserId.toString())
+                .header("X-User-Roles", "ADMIN")
+                .header("x-user-roles", "ADMIN")
+                .header("X-USER-ROLES", "ADMIN")
+                .contentType(MediaType.APPLICATION_JSON)
+                .bodyValue("{}")
+                .exchange()
+                .expectStatus().isCreated();
+
+        RecordedRequest reqProtected = recordedInventoryRequests.poll();
+        assertThat(reqProtected).isNotNull();
+        assertThat(reqProtected.headers().get("x-user-id")).isEqualTo(validUserId.toString());
+        assertThat(reqProtected.headers().get("x-user-roles")).isEqualTo("USER");
+
+        // Public route
+        webTestClient.get()
+                .uri("/api/v1/events/" + UUID.randomUUID() + "/seats")
+                .header(HttpHeaders.AUTHORIZATION, "Bearer " + token)
+                .header("X-User-Id", spoofedUserId.toString())
+                .header("x-user-id", spoofedUserId.toString())
+                .header("X-USER-ID", spoofedUserId.toString())
+                .header("X-User-Roles", "ADMIN")
+                .header("x-user-roles", "ADMIN")
+                .header("X-USER-ROLES", "ADMIN")
+                .exchange()
+                .expectStatus().isOk();
+
+        RecordedRequest reqPublic = recordedInventoryRequests.poll();
+        assertThat(reqPublic).isNotNull();
+        assertThat(reqPublic.headers().get("x-user-id")).isNull();
+        assertThat(reqPublic.headers().get("x-user-roles")).isNull();
+    }
+
+    // 7. Spoofed headers without token return 401 and stub is never called
+    @Test
+    @Order(7)
+    @DisplayName("Spoofed headers without token return 401 and stub is never called")
+    void spoofedHeadersWithoutTokenReturns401() {
+        webTestClient.post()
+                .uri("/api/v1/reservations")
+                .header("X-User-Id", UUID.randomUUID().toString())
+                .header("x-user-id", UUID.randomUUID().toString())
+                .header("X-USER-ID", UUID.randomUUID().toString())
+                .header("X-User-Roles", "ADMIN")
+                .header("x-user-roles", "ADMIN")
+                .header("X-USER-ROLES", "ADMIN")
+                .contentType(MediaType.APPLICATION_JSON)
+                .bodyValue("{}")
+                .exchange()
+                .expectStatus().isUnauthorized()
+                .expectHeader().contentType(MediaType.parseMediaType("application/problem+json"))
+                .expectBody()
+                .jsonPath("$.errorCode").isEqualTo("UNAUTHORIZED")
+                .jsonPath("$.status").isEqualTo(401)
+                .jsonPath("$.detail").isEqualTo("Authentication required");
+
+        assertThat(recordedInventoryRequests).isEmpty();
+    }
+
+    // 8. Expired token beyond clock skew returns 401 and records expired metric
+    @Test
+    @Order(8)
+    @DisplayName("Expired token beyond clock skew returns 401 and records expired metric")
+    void expiredTokenReturns401() {
+        UUID userId = UUID.randomUUID();
+        long nowSec = java.time.Instant.now().getEpochSecond();
+        long expSec = nowSec - 45;
+        long iatSec = nowSec - 1000;
+        String header = "{\"alg\":\"HS256\",\"typ\":\"JWT\"}";
+        String payload = "{\"sub\":\"" + userId + "\",\"roles\":[\"USER\"],\"iat\":" + iatSec + ",\"exp\":" + expSec + "}";
+        String hB64 = Base64.getUrlEncoder().withoutPadding().encodeToString(header.getBytes(StandardCharsets.UTF_8));
+        String pB64 = Base64.getUrlEncoder().withoutPadding().encodeToString(payload.getBytes(StandardCharsets.UTF_8));
+        String token = sign(hB64 + "." + pB64, "dev-only-hs256-secret-key-minimum-32-bytes-long!");
+        issuedTokensForLogCheck.add(token);
+
+        double countBefore = getAuthFailureCount("expired");
+
+        webTestClient.post()
+                .uri("/api/v1/reservations")
+                .header(HttpHeaders.AUTHORIZATION, "Bearer " + token)
+                .contentType(MediaType.APPLICATION_JSON)
+                .bodyValue("{}")
+                .exchange()
+                .expectStatus().isUnauthorized()
+                .expectHeader().contentType(MediaType.parseMediaType("application/problem+json"))
+                .expectBody()
+                .jsonPath("$.errorCode").isEqualTo("UNAUTHORIZED")
+                .jsonPath("$.status").isEqualTo(401)
+                .jsonPath("$.detail").isEqualTo("Authentication required");
+
+        assertThat(getAuthFailureCount("expired")).isGreaterThan(countBefore);
+        assertThat(recordedInventoryRequests).isEmpty();
+    }
+
+    // 9. Wrongly signed token returns 401 and records invalid metric
+    @Test
+    @Order(9)
+    @DisplayName("Wrongly signed token returns 401 and records invalid metric")
+    void wronglySignedTokenReturns401() {
+        UUID userId = UUID.randomUUID();
+        String token = createToken(userId, List.of("USER"), 3600);
+        String[] parts = token.split("\\.");
+        String wrongToken = parts[0] + "." + parts[1] + ".invalidSignatureFake123456";
+        issuedTokensForLogCheck.add(wrongToken);
+
+        double countBefore = getAuthFailureCount("invalid");
+
+        webTestClient.post()
+                .uri("/api/v1/reservations")
+                .header(HttpHeaders.AUTHORIZATION, "Bearer " + wrongToken)
+                .contentType(MediaType.APPLICATION_JSON)
+                .bodyValue("{}")
+                .exchange()
+                .expectStatus().isUnauthorized()
+                .expectHeader().contentType(MediaType.parseMediaType("application/problem+json"))
+                .expectBody()
+                .jsonPath("$.errorCode").isEqualTo("UNAUTHORIZED")
+                .jsonPath("$.status").isEqualTo(401)
+                .jsonPath("$.detail").isEqualTo("Authentication required");
+
+        assertThat(getAuthFailureCount("invalid")).isGreaterThan(countBefore);
+        assertThat(recordedInventoryRequests).isEmpty();
+    }
+
+    // 10. Token signed with different secret returns 401 and records invalid metric
+    @Test
+    @Order(10)
+    @DisplayName("Token signed with different secret returns 401 and records invalid metric")
+    void differentSecretTokenReturns401() {
+        UUID userId = UUID.randomUUID();
+        long nowSec = java.time.Instant.now().getEpochSecond();
+        String header = "{\"alg\":\"HS256\",\"typ\":\"JWT\"}";
+        String payload = "{\"sub\":\"" + userId + "\",\"roles\":[\"USER\"],\"iat\":" + nowSec + ",\"exp\":" + (nowSec + 3600) + "}";
+        String hB64 = Base64.getUrlEncoder().withoutPadding().encodeToString(header.getBytes(StandardCharsets.UTF_8));
+        String pB64 = Base64.getUrlEncoder().withoutPadding().encodeToString(payload.getBytes(StandardCharsets.UTF_8));
+        String token = sign(hB64 + "." + pB64, "different-secret-key-at-least-32-bytes!");
+        issuedTokensForLogCheck.add(token);
+
+        double countBefore = getAuthFailureCount("invalid");
+
+        webTestClient.post()
+                .uri("/api/v1/reservations")
+                .header(HttpHeaders.AUTHORIZATION, "Bearer " + token)
+                .contentType(MediaType.APPLICATION_JSON)
+                .bodyValue("{}")
+                .exchange()
+                .expectStatus().isUnauthorized()
+                .expectHeader().contentType(MediaType.parseMediaType("application/problem+json"))
+                .expectBody()
+                .jsonPath("$.errorCode").isEqualTo("UNAUTHORIZED")
+                .jsonPath("$.status").isEqualTo(401)
+                .jsonPath("$.detail").isEqualTo("Authentication required");
+
+        assertThat(getAuthFailureCount("invalid")).isGreaterThan(countBefore);
+        assertThat(recordedInventoryRequests).isEmpty();
+    }
+
+    // 11. Malformed tokens return 401 and record invalid metric
+    @Test
+    @Order(11)
+    @DisplayName("Malformed tokens return 401 and record invalid metric")
+    void malformedTokenReturns401() {
+        UUID userId = UUID.randomUUID();
+        String validToken = createToken(userId, List.of("USER"), 3600);
+
+        List<String> malformedAuthHeaders = List.of(
+                "Bearer not.a.valid.jwt.token",
+                "Bearer justonestring",
+                "Bearer ",
+                "Bearer " + validToken + "."
+        );
+
+        for (String authHeader : malformedAuthHeaders) {
+            double countBefore = getAuthFailureCount("invalid");
+
+            webTestClient.post()
+                    .uri("/api/v1/reservations")
+                    .header(HttpHeaders.AUTHORIZATION, authHeader)
+                    .contentType(MediaType.APPLICATION_JSON)
+                    .bodyValue("{}")
+                    .exchange()
+                    .expectStatus().isUnauthorized()
+                    .expectHeader().contentType(MediaType.parseMediaType("application/problem+json"))
+                    .expectBody()
+                    .jsonPath("$.errorCode").isEqualTo("UNAUTHORIZED")
+                    .jsonPath("$.status").isEqualTo(401)
+                    .jsonPath("$.detail").isEqualTo("Authentication required");
+
+            assertThat(getAuthFailureCount("invalid")).isGreaterThan(countBefore);
+        }
+
+        assertThat(recordedInventoryRequests).isEmpty();
+    }
+
+    // 12. Token without sub claim returns 401 and records invalid metric
+    @Test
+    @Order(12)
+    @DisplayName("Token without sub claim returns 401 and records invalid metric")
+    void missingClaimTokenReturns401() {
+        long nowSec = java.time.Instant.now().getEpochSecond();
+        String noSub = "{\"roles\":[\"USER\"],\"iat\":" + nowSec + ",\"exp\":" + (nowSec + 3600) + "}";
+        String header = "{\"alg\":\"HS256\",\"typ\":\"JWT\"}";
+        String hB64 = Base64.getUrlEncoder().withoutPadding().encodeToString(header.getBytes(StandardCharsets.UTF_8));
+        String pB64 = Base64.getUrlEncoder().withoutPadding().encodeToString(noSub.getBytes(StandardCharsets.UTF_8));
+        String token = sign(hB64 + "." + pB64, "dev-only-hs256-secret-key-minimum-32-bytes-long!");
+        issuedTokensForLogCheck.add(token);
+
+        double countBefore = getAuthFailureCount("invalid");
+
+        webTestClient.post()
+                .uri("/api/v1/reservations")
+                .header(HttpHeaders.AUTHORIZATION, "Bearer " + token)
+                .contentType(MediaType.APPLICATION_JSON)
+                .bodyValue("{}")
+                .exchange()
+                .expectStatus().isUnauthorized()
+                .expectHeader().contentType(MediaType.parseMediaType("application/problem+json"))
+                .expectBody()
+                .jsonPath("$.errorCode").isEqualTo("UNAUTHORIZED")
+                .jsonPath("$.status").isEqualTo(401)
+                .jsonPath("$.detail").isEqualTo("Authentication required");
+
+        assertThat(getAuthFailureCount("invalid")).isGreaterThan(countBefore);
+        assertThat(recordedInventoryRequests).isEmpty();
+    }
+
+    // 13. Authorization header is NOT forwarded downstream
+    @Test
+    @Order(13)
+    @DisplayName("Authorization header is NOT forwarded downstream")
+    void authorizationHeaderNotForwarded() {
+        UUID userId = UUID.randomUUID();
+        String token = createToken(userId, List.of("USER"), 3600);
+
+        webTestClient.post()
+                .uri("/api/v1/reservations")
+                .header(HttpHeaders.AUTHORIZATION, "Bearer " + token)
+                .contentType(MediaType.APPLICATION_JSON)
+                .bodyValue("{}")
+                .exchange()
+                .expectStatus().isCreated();
+
+        RecordedRequest req = recordedInventoryRequests.poll();
+        assertThat(req).isNotNull();
+        assertThat(req.headers().get("authorization")).isNull();
+        assertThat(req.headers().get("Authorization")).isNull();
+    }
+
+    // 14. Idempotency-Key and X-Correlation-Id reach downstream stub unchanged
+    @Test
+    @Order(14)
+    @DisplayName("Idempotency-Key and X-Correlation-Id reach downstream stub unchanged")
+    void idempotencyKeyAndCorrelationIdForwarded() {
+        UUID userId = UUID.randomUUID();
+        String token = createToken(userId, List.of("USER"), 3600);
+        String idempotencyKey = UUID.randomUUID().toString();
+        String clientCorrelationId = UUID.randomUUID().toString();
+
+        webTestClient.post()
+                .uri("/api/v1/reservations")
+                .header(HttpHeaders.AUTHORIZATION, "Bearer " + token)
+                .header("Idempotency-Key", idempotencyKey)
+                .header("X-Correlation-Id", clientCorrelationId)
+                .contentType(MediaType.APPLICATION_JSON)
+                .bodyValue("{}")
+                .exchange()
+                .expectStatus().isCreated()
+                .expectHeader().valueEquals("X-Correlation-Id", clientCorrelationId);
+
+        RecordedRequest req = recordedInventoryRequests.poll();
+        assertThat(req).isNotNull();
+        assertThat(req.headers().get("idempotency-key")).isEqualTo(idempotencyKey);
+        assertThat(req.headers().get("x-correlation-id")).isEqualTo(clientCorrelationId);
+    }
+
+    // 15. Token endpoint issues token accepted by gateway; admin rejected when allow-admin is false
+    @Test
+    @Order(15)
+    @DisplayName("Token endpoint issues token accepted by gateway; admin rejected when allow-admin is false")
+    void tokenEndpointWorkflow() {
+        UUID userId = UUID.randomUUID();
+
+        // 1. Request user token
+        EntityExchangeResult<byte[]> tokenResult = webTestClient.post()
+                .uri("/api/v1/auth/token")
+                .contentType(MediaType.APPLICATION_JSON)
+                .bodyValue("{\"userId\":\"" + userId + "\",\"roles\":[\"USER\"],\"ttlSeconds\":1800}")
+                .exchange()
+                .expectStatus().isOk()
+                .expectBody().returnResult();
+
+        String responseBody = new String(tokenResult.getResponseBody(), StandardCharsets.UTF_8);
+        try {
+            JsonNode json = objectMapper.readTree(responseBody);
+            String accessToken = json.path("accessToken").asText();
+            assertThat(accessToken).isNotBlank();
+            issuedTokensForLogCheck.add(accessToken);
+
+            // Use the minted token on a protected route
+            webTestClient.post()
+                    .uri("/api/v1/reservations")
+                    .header(HttpHeaders.AUTHORIZATION, "Bearer " + accessToken)
+                    .contentType(MediaType.APPLICATION_JSON)
+                    .bodyValue("{}")
+                    .exchange()
+                    .expectStatus().isCreated();
+
+            RecordedRequest req = recordedInventoryRequests.poll();
+            assertThat(req).isNotNull();
+            assertThat(req.headers().get("x-user-id")).isEqualTo(userId.toString());
+        } catch (Exception e) {
+            throw new RuntimeException(e);
+        }
+
+        // 2. Request admin token when allowAdmin is false -> 403 Forbidden
+        boolean prevAllowAdmin = devTokenProperties.isAllowAdmin();
+        try {
+            devTokenProperties.setAllowAdmin(false);
+            webTestClient.post()
+                    .uri("/api/v1/auth/token")
+                    .contentType(MediaType.APPLICATION_JSON)
+                    .bodyValue("{\"userId\":\"" + userId + "\",\"roles\":[\"ADMIN\"],\"ttlSeconds\":1800}")
+                    .exchange()
+                    .expectStatus().isForbidden()
+                    .expectHeader().contentType(MediaType.parseMediaType("application/problem+json"))
+                    .expectBody()
+                    .jsonPath("$.errorCode").isEqualTo("FORBIDDEN");
+        } finally {
+            devTokenProperties.setAllowAdmin(prevAllowAdmin);
+        }
+    }
+
+    // 16. Rate limiting burst above capacity returns 429 for same user; other user unaffected
+    @Test
+    @Order(16)
+    @DisplayName("Rate limiting burst above capacity returns 429 for same user; other user unaffected")
+    void rateLimitingBurstReturns429() {
+        UUID userA = UUID.randomUUID();
+        UUID userB = UUID.randomUUID();
+        String tokenA = createToken(userA, List.of("USER"), 3600);
+        String tokenB = createToken(userB, List.of("USER"), 3600);
+
+        boolean hit429 = false;
+        // User capacity is 10. Fire 15 requests rapidly
+        for (int i = 0; i < 15; i++) {
+            EntityExchangeResult<byte[]> exchangeResult = webTestClient.post()
+                    .uri("/api/v1/reservations")
+                    .header(HttpHeaders.AUTHORIZATION, "Bearer " + tokenA)
+                    .contentType(MediaType.APPLICATION_JSON)
+                    .bodyValue("{}")
+                    .exchange()
+                    .expectBody().returnResult();
+
+            int statusCode = exchangeResult.getStatus().value();
+            if (statusCode == 429) {
+                hit429 = true;
+                assertThat(exchangeResult.getResponseHeaders().getFirst("Retry-After")).isEqualTo("1");
+                assertThat(exchangeResult.getResponseHeaders().getContentType().toString()).contains("application/problem+json");
+                break;
+            }
+        }
+        assertThat(hit429).isTrue();
+
+        // User B must be unaffected!
+        webTestClient.post()
+                .uri("/api/v1/reservations")
+                .header(HttpHeaders.AUTHORIZATION, "Bearer " + tokenB)
+                .contentType(MediaType.APPLICATION_JSON)
+                .bodyValue("{}")
+                .exchange()
+                .expectStatus().isCreated();
+    }
+
+    // 17. IP rate limiting & rotating X-Forwarded-For direct client vs trusted proxy
+    @Test
+    @Order(17)
     @DisplayName("Rotating X-Forwarded-For from direct client does not bypass IP rate limit")
     void rotatingXForwardedForFromDirectClientBlocked() {
         boolean hit429 = false;
@@ -389,9 +845,9 @@ public class GatewayIntegrationTest {
         assertThat(hit429).isTrue();
     }
 
-    // 5. Dev token endpoint rate limiting (capacity 10, refill 1/s)
+    // 18. Dev token endpoint rate limiting (capacity 10, refill 1/s)
     @Test
-    @Order(5)
+    @Order(18)
     @DisplayName("Token endpoint returns 429 with Retry-After when hammered")
     void tokenEndpointRateLimitedWhenHammered() {
         boolean hit429 = false;
@@ -412,9 +868,9 @@ public class GatewayIntegrationTest {
         assertThat(hit429).isTrue();
     }
 
-    // 6. Toxiproxy 2s latency on Redis makes requests fail open in under 1 second
+    // 19. Toxiproxy 2s latency on Redis makes requests fail open in under 1 second
     @Test
-    @Order(6)
+    @Order(19)
     @DisplayName("Toxiproxy 2s latency on Redis fails open under 1 second and increments counter")
     void toxiproxyLatencyFailsOpenUnderOneSecond() {
         long startCount = meterRegistry.find("gateway_redis_failures_total").counter() != null
@@ -443,34 +899,9 @@ public class GatewayIntegrationTest {
         }
     }
 
-    // 7. Exact 4xx metrics counts, payment route tag, service=gateway-service, lua timer
+    // 20. Correlation ID handling: 401, 404, token endpoint, 500 char, non-UUID, duplicates, uppercase
     @Test
-    @Order(7)
-    @DisplayName("Metrics: exact 4xx counts, payment route tag, service tag, and lua duration timer")
-    void metricsCountersAndTagsVerified() {
-        // Record payment route tag explicitly
-        gatewayMetrics.recordRequest(GatewayRoutesConfig.ROUTE_PAYMENT, "2xx");
-        assertThat(meterRegistry.get("gateway_requests_total")
-                .tag("route", "payment-service")
-                .tag("status_class", "2xx").counter().count()).isGreaterThanOrEqualTo(1.0);
-
-        // Verify 4xx counter exists
-        assertThat(meterRegistry.find("gateway_requests_total")
-                .tag("status_class", "4xx").counters()).isNotEmpty();
-
-        // Verify all meters carry service=gateway-service
-        meterRegistry.getMeters().forEach(meter -> {
-            String serviceTag = meter.getId().getTag("service");
-            assertThat(serviceTag).isEqualTo("gateway-service");
-        });
-
-        // Verify ticketing_redis_lua_duration_seconds timer exists
-        assertThat(meterRegistry.find("ticketing_redis_lua_duration_seconds").timers()).isNotEmpty();
-    }
-
-    // 8. Correlation ID handling: 401, 404, token endpoint, 500 char, non-UUID, duplicates, uppercase
-    @Test
-    @Order(8)
+    @Order(20)
     @DisplayName("X-Correlation-Id handling: 401, 404, token endpoint, 500 char, non-UUID, duplicates, uppercase")
     void correlationIdEchoedAndSanitized() {
         // 1. Echoed on 401
@@ -538,9 +969,9 @@ public class GatewayIntegrationTest {
         UUID.fromString(echoedDups.get(0));
     }
 
-    // 9. Closed connection stub makes gateway answer 502 and stub saw exactly ONE request (no retry!)
+    // 21. Closed connection stub makes gateway answer 502 and stub saw exactly ONE request (no retry!)
     @Test
-    @Order(9)
+    @Order(21)
     @DisplayName("Closed connection stub returns 502 and stub sees exactly one request (no automatic retry)")
     void closedConnectionReturns502WithZeroRetries() {
         UUID userId = UUID.randomUUID();
@@ -564,9 +995,9 @@ public class GatewayIntegrationTest {
         assertThat(abortAttempts).isEqualTo(1);
     }
 
-    // 10. Slow stub returns 504 Gateway Timeout
+    // 22. Slow stub returns 504 Gateway Timeout
     @Test
-    @Order(10)
+    @Order(22)
     @DisplayName("Slow downstream stub returns 504 GATEWAY_TIMEOUT")
     void slowStubReturns504() {
         webTestClient.get()
@@ -579,22 +1010,157 @@ public class GatewayIntegrationTest {
                 .jsonPath("$.detail").isEqualTo("Downstream service timed out");
     }
 
-    // 11. Real gateway log inspection: tokens and secret never appear in captured logs
+    // 23. Metrics: exact counts, bounded tags, rate limit metric, auth failure reasons, and timer
     @Test
-    @Order(11)
+    @Order(23)
+    @DisplayName("Metrics: exact counts, bounded tags, rate limit metric, auth failure reasons, and timer")
+    void metricsCountersAndTagsVerified() {
+        double start2xx = meterRegistry.find("gateway_requests_total").tag("status_class", "2xx").counters().stream().mapToDouble(io.micrometer.core.instrument.Counter::count).sum();
+        double start4xx = meterRegistry.find("gateway_requests_total").tag("status_class", "4xx").counters().stream().mapToDouble(io.micrometer.core.instrument.Counter::count).sum();
+        double start5xx = meterRegistry.find("gateway_requests_total").tag("status_class", "5xx").counters().stream().mapToDouble(io.micrometer.core.instrument.Counter::count).sum();
+
+        UUID testUser = UUID.randomUUID();
+        String testToken = createToken(testUser, List.of("USER"), 3600);
+
+        // Exactly 2 requests -> 2xx
+        webTestClient.get()
+                .uri("/api/v1/events/" + UUID.randomUUID() + "/seats")
+                .exchange()
+                .expectStatus().isOk();
+
+        webTestClient.post()
+                .uri("/api/v1/reservations")
+                .header(HttpHeaders.AUTHORIZATION, "Bearer " + testToken)
+                .contentType(MediaType.APPLICATION_JSON)
+                .bodyValue("{}")
+                .exchange()
+                .expectStatus().isCreated();
+
+        // Exactly 3 requests -> 4xx (404 unmatched, 401 unauth, 403 forbidden)
+        webTestClient.get()
+                .uri("/api/v1/unmatched-route-metrics-check")
+                .exchange()
+                .expectStatus().isNotFound();
+
+        webTestClient.post()
+                .uri("/api/v1/reservations")
+                .contentType(MediaType.APPLICATION_JSON)
+                .bodyValue("{}")
+                .exchange()
+                .expectStatus().isUnauthorized();
+
+        webTestClient.post()
+                .uri("/api/v1/admin/events")
+                .header(HttpHeaders.AUTHORIZATION, "Bearer " + testToken)
+                .contentType(MediaType.APPLICATION_JSON)
+                .bodyValue("{}")
+                .exchange()
+                .expectStatus().isForbidden();
+
+        // Exactly 1 request -> 5xx (502 abort-conn)
+        webTestClient.post()
+                .uri("/api/v1/orders/abort-conn/checkout")
+                .header(HttpHeaders.AUTHORIZATION, "Bearer " + testToken)
+                .contentType(MediaType.APPLICATION_JSON)
+                .bodyValue("{}")
+                .exchange()
+                .expectStatus().isEqualTo(502);
+
+        double end2xx = meterRegistry.find("gateway_requests_total").tag("status_class", "2xx").counters().stream().mapToDouble(io.micrometer.core.instrument.Counter::count).sum();
+        double end4xx = meterRegistry.find("gateway_requests_total").tag("status_class", "4xx").counters().stream().mapToDouble(io.micrometer.core.instrument.Counter::count).sum();
+        double end5xx = meterRegistry.find("gateway_requests_total").tag("status_class", "5xx").counters().stream().mapToDouble(io.micrometer.core.instrument.Counter::count).sum();
+
+        assertThat(end2xx - start2xx).isEqualTo(2.0);
+        assertThat(end4xx - start4xx).isEqualTo(3.0);
+        assertThat(end5xx - start5xx).isEqualTo(1.0);
+
+        // Assert gateway_rate_limited_total >= 1 for inventory-reservations route
+        assertThat(meterRegistry.get("gateway_rate_limited_total")
+                .tag("route", "inventory-reservations").counter().count()).isGreaterThanOrEqualTo(1.0);
+
+        // Assert gateway_auth_failures_total has non-zero counts for each reason value used
+        for (String reason : List.of("missing", "invalid", "expired", "forbidden")) {
+            assertThat(meterRegistry.get("gateway_auth_failures_total")
+                    .tag("reason", reason).counter().count()).isGreaterThanOrEqualTo(1.0);
+        }
+
+        // Assert route tags across gateway_* meters are strictly within ALLOWED_ROUTES
+        meterRegistry.getMeters().forEach(meter -> {
+            String name = meter.getId().getName();
+            if (name.startsWith("gateway_")) {
+                String routeTag = meter.getId().getTag("route");
+                if (routeTag != null) {
+                    assertThat(GatewayMetrics.ALLOWED_ROUTES)
+                            .withFailMessage("Meter %s has disallowed route tag: %s", name, routeTag)
+                            .contains(routeTag);
+                }
+            }
+        });
+
+        // Verify all meters carry service=gateway-service
+        meterRegistry.getMeters().forEach(meter -> {
+            String serviceTag = meter.getId().getTag("service");
+            assertThat(serviceTag).isEqualTo("gateway-service");
+        });
+
+        // Verify ticketing_redis_lua_duration_seconds timer exists
+        assertThat(meterRegistry.find("ticketing_redis_lua_duration_seconds").timers()).isNotEmpty();
+    }
+
+    // 24. Real gateway log inspection: tokens and secret never appear in captured logs
+    @Test
+    @Order(24)
     @DisplayName("Real gateway log inspection: non-empty logs contain no secrets or tokens")
     void tokensAndSecretsNeverInLogs() {
-        assertThat(listAppender.list).isNotEmpty();
-        for (ILoggingEvent event : listAppender.list) {
-            if (event.getLoggerName().startsWith("org.springframework.test")) {
-                continue;
-            }
+        List<ILoggingEvent> gatewayLogs = listAppender.list.stream()
+                .filter(e -> e.getLoggerName().startsWith("com.ticketing.gateway"))
+                .toList();
+
+        assertThat(gatewayLogs).isNotEmpty();
+        for (ILoggingEvent event : gatewayLogs) {
             String msg = event.getFormattedMessage();
             for (String issuedToken : issuedTokensForLogCheck) {
-                assertThat(msg).doesNotContain(issuedToken);
+                assertThat(msg)
+                        .withFailMessage("Security violation: Token was logged in gateway log event: " + msg)
+                        .doesNotContain(issuedToken);
             }
-            assertThat(msg).doesNotContain("dev-only-hs256-secret-key-minimum-32-bytes-long!");
+            assertThat(msg)
+                    .withFailMessage("Security violation: Authorization header was logged in gateway log event: " + msg)
+                    .doesNotContain("Bearer ")
+                    .doesNotContain("bearer ");
+            assertThat(msg)
+                    .withFailMessage("Security violation: JWT secret was logged in gateway log event: " + msg)
+                    .doesNotContain("dev-only-hs256-secret-key-minimum-32-bytes-long!");
         }
+    }
+
+    // 25. Redis stopped makes requests behave per policy (fail open) and does not crash gateway
+    @Test
+    @Order(25)
+    @DisplayName("Redis stopped fails open and does not crash gateway")
+    void redisStoppedFailsOpen() {
+        // Stop Redis container
+        REDIS.stop();
+
+        UUID userId = UUID.randomUUID();
+        String token = createToken(userId, List.of("USER"), 3600);
+
+        // Protected request should still succeed (fail-open)
+        webTestClient.post()
+                .uri("/api/v1/reservations")
+                .header(HttpHeaders.AUTHORIZATION, "Bearer " + token)
+                .contentType(MediaType.APPLICATION_JSON)
+                .bodyValue("{}")
+                .exchange()
+                .expectStatus().isCreated();
+
+        // Public seat query should also succeed (fail-open)
+        webTestClient.get()
+                .uri("/api/v1/events/" + UUID.randomUUID() + "/seats")
+                .exchange()
+                .expectStatus().isOk();
+
+        assertThat(meterRegistry.get("gateway_redis_failures_total").counter().count()).isGreaterThanOrEqualTo(1.0);
     }
 
     // Nested test for trusted proxies honoring X-Forwarded-For

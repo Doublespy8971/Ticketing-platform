@@ -64,6 +64,23 @@ class StartupFailureTest {
     }
 
     @Test
+    @DisplayName("Startup fails when JWT_SECRET is empty string and allow-insecure-dev-secret is false")
+    void startupFailsWhenSecretIsEmptyString() {
+        try (AnnotationConfigApplicationContext context = new AnnotationConfigApplicationContext()) {
+            TestPropertyValues.of(
+                    "JWT_SECRET=",
+                    "ticketing.gateway.allow-insecure-dev-secret=false"
+            ).applyTo(context);
+            context.register(JwtProperties.class);
+
+            assertThatThrownBy(context::refresh)
+                    .hasRootCauseInstanceOf(IllegalStateException.class)
+                    .rootCause()
+                    .hasMessageContaining("missing or shorter than 32 bytes");
+        }
+    }
+
+    @Test
     @DisplayName("Startup succeeds with dev default when allow-insecure-dev-secret is true")
     void startupSucceedsWithDevFallbackWhenAllowed() {
         try (AnnotationConfigApplicationContext context = new AnnotationConfigApplicationContext()) {

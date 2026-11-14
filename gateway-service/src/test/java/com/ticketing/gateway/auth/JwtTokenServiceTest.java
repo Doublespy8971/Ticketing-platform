@@ -265,4 +265,60 @@ class JwtTokenServiceTest {
         assertThatThrownBy(() -> jwtTokenService.validateAndParseToken(manualToken(header, p4, signingKey)))
                 .isInstanceOf(JwtValidationException.class);
     }
+
+    @Test
+    @DisplayName("Reject wrongly signed token with INVALID reason")
+    void rejectWronglySignedToken() {
+        UUID userId = UUID.randomUUID();
+        String token = jwtTokenService.generateToken(userId, List.of("USER"), 3600);
+
+        // Tamper with signature
+        String[] parts = token.split("\\.");
+        String tampered = parts[0] + "." + parts[1] + ".invalidSignature1234567890";
+
+        assertThatThrownBy(() -> jwtTokenService.validateAndParseToken(tampered))
+                .isInstanceOf(JwtValidationException.class)
+                .satisfies(ex -> assertThat(((JwtValidationException) ex).getReason()).isEqualTo(JwtValidationException.Reason.INVALID));
+    }
+
+    @Test
+    @DisplayName("Reject token signed with different secret")
+    void rejectTokenSignedWithDifferentSecret() {
+        JwtProperties otherProps = new JwtProperties();
+        otherProps.setRawSecret("different-secret-key-at-least-32-bytes!");
+        otherProps.setAllowInsecureDevSecret(false);
+        otherProps.validate();
+        JwtTokenService otherService = new JwtTokenService(otherProps, objectMapper);
+
+        UUID userId = UUID.randomUUID();
+        String token = otherService.generateToken(userId, List.of("USER"), 3600);
+
+        assertThatThrownBy(() -> jwtTokenService.validateAndParseToken(token))
+                .isInstanceOf(JwtValidationException.class)
+                .satisfies(ex -> assertThat(((JwtValidationException) ex).getReason()).isEqualTo(JwtValidationException.Reason.INVALID));
+    }
+
+    @Test
+    @DisplayName("Reject malformed token")
+    void rejectMalformedToken() {
+        assertThatThrownBy(() -> jwtTokenService.validateAndParseToken("not.a.valid.jwt.token"))
+                .isInstanceOf(JwtValidationException.class)
+                .satisfies(ex -> assertThat(((JwtValidationException) ex).getReason()).isEqualTo(JwtValidationException.Reason.INVALID));
+
+        assertThatThrownBy(() -> jwtTokenService.validateAndParseToken("justonestring"))
+                .isInstanceOf(JwtValidationException.class)
+                .satisfies(ex -> assertThat(((JwtValidationException) ex).getReason()).isEqualTo(JwtValidationException.Reason.INVALID));
+    }
+
+    @Test
+    @DisplayName("Reject missing sub claim")
+    void rejectMissingSubClaim() {
+        String noSub = "{\"roles\":[\"USER\"],\"iat\":1000,\"exp\":2000000000}";
+        String header = "{\"alg\":\"HS256\",\"typ\":\"JWT\"}";
+        String token = manualToken(header, noSub, signingKey);
+
+        assertThatThrownBy(() -> jwtTokenService.validateAndParseToken(token))
+                .isInstanceOf(JwtValidationException.class)
+                .satisfies(ex -> assertThat(((JwtValidationException) ex).getReason()).isEqualTo(JwtValidationException.Reason.INVALID));
+    }
 }
