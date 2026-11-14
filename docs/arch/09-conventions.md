@@ -116,6 +116,9 @@ All custom metrics use the `ticketing_` prefix, lowercase `snake_case`, and base
 | `gateway_rate_limited_total` | `Counter` | `service`, `route` | `gateway-service` | Total requests rejected by the Redis rate limiter (HTTP 429). |
 | `gateway_auth_failures_total` | `Counter` | `service`, `reason` (`missing`, `invalid`, `expired`, `forbidden`) | `gateway-service` | Total authentication and authorization rejections at the gateway. |
 | `ticketing_notifications_sent_total` | `Counter` | `service`, `event_type`, `status` (`SENT`, `DEDUPLICATED`, `FAILED`) | `notification-service` | Total notifications dispatched or deduplicated via Redis. |
+| `notification_events_total` | `Counter` | `outcome` (`sent`, `duplicate`, `ignored`, `invalid`, `failed`) | `notification-service` | Total order events received by notification-service partitioned by outcome. |
+| `notification_send_duration_seconds` | `Histogram` | (none) | `notification-service` | Duration of notification send attempts in seconds. |
+| `notification_dedup_redis_errors_total` | `Counter` | (none) | `notification-service` | Total Redis errors encountered during deduplication claims or releases. |
 
 > **Consumer and gateway meter tag rules**: the `service` tag on every meter comes from the registry's common tags and is never added per meter. The `event_type` tag of the `consumer_*` meters is restricted to the `EventTypes` constants of `ticketing-common`; any other value, including a missing or unparseable event type, is tagged `unknown`. The `route` tag on `gateway_*` meters is strictly bounded to the set: `inventory-seats`, `inventory-reservations`, `inventory-admin`, `order-checkout`, `order-get`, `payment-service`, `auth-token`, `actuator`, and `unmatched`.
 

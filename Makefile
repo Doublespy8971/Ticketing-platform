@@ -1,7 +1,7 @@
 COMPOSE := docker compose -f infra/docker-compose.yml
 HEALTHY_SERVICES := kafka postgres-inventory postgres-order postgres-payment redis
 
-.PHONY: infra-up infra-down infra-reset infra-topics infra-psql-inventory infra-psql-order infra-psql-payment infra-redis-cli smoke-inventory smoke-order smoke-payment smoke-gateway run-gateway
+.PHONY: infra-up infra-down infra-reset infra-topics infra-psql-inventory infra-psql-order infra-psql-payment infra-redis-cli smoke-inventory smoke-order smoke-payment smoke-gateway run-gateway smoke-notification run-notification
 
 infra-up:
 	@test -f infra/.env || cp infra/.env.example infra/.env
@@ -44,5 +44,12 @@ smoke-gateway:
 
 run-gateway:
 	mvn spring-boot:run -pl gateway-service -Dspring-boot.run.profiles=local
+
+smoke-notification:
+	bash scripts/smoke-notification.sh
+
+run-notification:
+	cd notification-service && go run ./cmd/notification-service
+
 
 
