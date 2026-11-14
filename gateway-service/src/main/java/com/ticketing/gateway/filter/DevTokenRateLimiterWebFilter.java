@@ -7,8 +7,11 @@ import com.ticketing.gateway.config.GatewayRoutesConfig;
 import com.ticketing.gateway.metrics.GatewayMetrics;
 import com.ticketing.gateway.ratelimit.ClientAddressResolver;
 import com.ticketing.gateway.ratelimit.RedisRateLimiterService;
+import org.springframework.boot.autoconfigure.condition.ConditionalOnProperty;
+import org.springframework.context.annotation.Profile;
 import org.springframework.core.Ordered;
 import org.springframework.core.io.buffer.DataBuffer;
+import org.springframework.http.HttpMethod;
 import org.springframework.http.HttpStatus;
 import org.springframework.http.MediaType;
 import org.springframework.http.server.reactive.ServerHttpResponse;
@@ -26,8 +29,12 @@ import java.util.UUID;
  * Applies IP-based rate limiting to the dev token endpoint (/api/v1/auth/token).
  * Token bucket: capacity 10, refill 1 req/s.
  * Returns 429 RATE_LIMIT_EXCEEDED with Retry-After: 1 on breach.
+ * Active ONLY under 'dev' or 'local' profile AND when ticketing.gateway.dev-token.enabled=true,
+ * and applies only to POST requests.
  */
 @Component
+@Profile({"dev", "local"})
+@ConditionalOnProperty(name = "ticketing.gateway.dev-token.enabled", havingValue = "true")
 public class DevTokenRateLimiterWebFilter implements WebFilter, Ordered {
 
     private final RedisRateLimiterService rateLimiterService;
@@ -47,13 +54,14 @@ public class DevTokenRateLimiterWebFilter implements WebFilter, Ordered {
 
     @Override
     public int getOrder() {
-        return Ordered.HIGHEST_PRECEDENCE + 3;
+        return Ordered.HIGHEST_PRECEDENCE + 4;
     }
 
     @Override
     public Mono<Void> filter(ServerWebExchange exchange, WebFilterChain chain) {
         String path = exchange.getRequest().getPath().value();
-        if (!path.equals("/api/v1/auth/token")) {
+        HttpMethod method = exchange.getRequest().getMethod();
+        if (!path.equals("/api/v1/auth/token") || method != HttpMethod.POST) {
             return chain.filter(exchange);
         }
 

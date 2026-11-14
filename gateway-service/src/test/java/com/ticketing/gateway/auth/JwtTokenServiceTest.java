@@ -321,4 +321,64 @@ class JwtTokenServiceTest {
                 .isInstanceOf(JwtValidationException.class)
                 .satisfies(ex -> assertThat(((JwtValidationException) ex).getReason()).isEqualTo(JwtValidationException.Reason.INVALID));
     }
+
+    static class CountingObjectMapper extends ObjectMapper {
+        final java.util.concurrent.atomic.AtomicInteger payloadReadCalls = new java.util.concurrent.atomic.AtomicInteger(0);
+
+        @Override
+        public com.fasterxml.jackson.databind.JsonNode readTree(byte[] content) throws java.io.IOException {
+            String s = new String(content, java.nio.charset.StandardCharsets.UTF_8);
+            if (s.contains("sub") || s.contains("roles")) {
+                payloadReadCalls.incrementAndGet();
+            }
+            return super.readTree(content);
+        }
+
+        @Override
+        public com.fasterxml.jackson.databind.JsonNode readTree(java.io.Reader reader) throws java.io.IOException {
+            com.fasterxml.jackson.databind.JsonNode node = super.readTree(reader);
+            if (node.has("sub") || node.has("roles")) {
+                payloadReadCalls.incrementAndGet();
+            }
+            return node;
+        }
+
+        @Override
+        public com.fasterxml.jackson.databind.JsonNode readTree(String content) throws com.fasterxml.jackson.core.JsonProcessingException {
+            if (content.contains("sub") || content.contains("roles")) {
+                payloadReadCalls.incrementAndGet();
+            }
+            return super.readTree(content);
+        }
+    }
+
+    @Test
+    @DisplayName("No JSON parsing happens for token with invalid signature")
+    void noJsonParsingHappensForTokenWithInvalidSignature() {
+        CountingObjectMapper countingMapper = new CountingObjectMapper();
+        JwtTokenService testService = new JwtTokenService(jwtProperties, countingMapper);
+
+        UUID userId = UUID.randomUUID();
+        String validToken = testService.generateToken(userId, List.of("USER"), 3600);
+        String tamperedToken = validToken.substring(0, validToken.lastIndexOf('.') + 1) + "tamperedSignature123";
+
+        assertThatThrownBy(() -> testService.validateAndParseToken(tamperedToken))
+                .isInstanceOf(JwtValidationException.class);
+
+        // Verify zero unverified payload JSON parsing calls
+        assertThat(countingMapper.payloadReadCalls.get()).isZero();
+    }
+
+    @Test
+    @DisplayName("Accept BEARER and bearer prefixes case-insensitively")
+    void acceptBearerPrefixCaseInsensitive() {
+        UUID userId = UUID.randomUUID();
+        String token = jwtTokenService.generateToken(userId, List.of("USER"), 3600);
+
+        ParsedJwt upper = jwtTokenService.validateAndParseToken("BEARER " + token);
+        assertThat(upper.userId()).isEqualTo(userId);
+
+        ParsedJwt lower = jwtTokenService.validateAndParseToken("bearer " + token);
+        assertThat(lower.userId()).isEqualTo(userId);
+    }
 }

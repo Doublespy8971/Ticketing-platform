@@ -151,7 +151,7 @@ public class GlobalErrorWebExceptionHandler implements ErrorWebExceptionHandler 
 
         String slug = errorCode.toLowerCase().replace('_', '-');
         String type = ProblemDetails.TYPE_BASE + slug;
-        String instance = exchange.getRequest().getPath().value();
+        String instance = (status == HttpStatus.NOT_FOUND) ? "/" : exchange.getRequest().getPath().value();
 
         ProblemDetails problem = new ProblemDetails(
                 type,

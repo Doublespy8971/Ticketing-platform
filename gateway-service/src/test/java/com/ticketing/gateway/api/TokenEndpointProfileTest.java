@@ -12,6 +12,8 @@ import org.springframework.test.web.reactive.server.WebTestClient;
 
 import java.util.UUID;
 
+import static org.assertj.core.api.Assertions.assertThat;
+
 class TokenEndpointProfileTest {
 
     @Nested
@@ -66,6 +68,39 @@ class TokenEndpointProfileTest {
                     .expectHeader().contentType(MediaType.parseMediaType("application/problem+json"))
                     .expectBody()
                     .jsonPath("$.errorCode").isEqualTo("RESOURCE_NOT_FOUND");
+        }
+
+        @Test
+        @DisplayName("In prod profile, 12 rapid POST requests to /api/v1/auth/token all return 404 and none 429")
+        void tokenEndpointTwelveRequestsAllReturn404UnderProdProfile() {
+            for (int i = 0; i < 12; i++) {
+                webTestClient.post()
+                        .uri("/api/v1/auth/token")
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .bodyValue("{\"userId\":\"" + UUID.randomUUID() + "\",\"roles\":[\"USER\"],\"ttlSeconds\":1800}")
+                        .exchange()
+                        .expectStatus().isNotFound()
+                        .expectHeader().contentType(MediaType.parseMediaType("application/problem+json"))
+                        .expectBody()
+                        .jsonPath("$.errorCode").isEqualTo("RESOURCE_NOT_FOUND");
+            }
+        }
+
+        @Test
+        @DisplayName("In prod profile, /actuator/health on main port is unavailable (404) and never contains component details")
+        void actuatorHealthUnavailableOnMainPortUnderProdProfile() {
+            webTestClient.get()
+                    .uri("/actuator/health")
+                    .exchange()
+                    .expectStatus().isNotFound()
+                    .expectBody(String.class)
+                    .value(body -> {
+                        if (body != null) {
+                            assertThat(body).doesNotContain("components");
+                            assertThat(body).doesNotContain("diskSpace");
+                            assertThat(body).doesNotContain("redis");
+                        }
+                    });
         }
     }
 

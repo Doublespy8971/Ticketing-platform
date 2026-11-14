@@ -18,7 +18,6 @@ import java.nio.charset.StandardCharsets;
 import java.time.Instant;
 import java.time.temporal.ChronoUnit;
 import java.util.ArrayList;
-import java.util.Base64;
 import java.util.Date;
 import java.util.List;
 import java.util.UUID;
@@ -28,6 +27,8 @@ import java.util.regex.Pattern;
  * Service for issuing and verifying HS256 JWTs using JJWT 0.12.6.
  * Enforces strict RFC requirements, max token length (4096), canonical UUID sub,
  * exact upper-case roles, integral iat/exp claims, and 30-second clock skew.
+ * Signature is verified first using a reused JwtParser; claims are read only
+ * from the verified payload, never from an unverified Base64-decoded copy.
  * Tokens and secret values are never logged.
  */
 @Service
@@ -40,10 +41,56 @@ public class JwtTokenService {
 
     private final JwtProperties jwtProperties;
     private final ObjectMapper objectMapper;
+    private final SecretKey signingKey;
+    private final JwtParser jwtParser;
 
     public JwtTokenService(JwtProperties jwtProperties, ObjectMapper objectMapper) {
         this.jwtProperties = jwtProperties;
         this.objectMapper = objectMapper;
+        this.signingKey = Keys.hmacShaKeyFor(jwtProperties.getEffectiveSecret().getBytes(StandardCharsets.UTF_8));
+        this.jwtParser = Jwts.parser()
+                .json(new io.jsonwebtoken.io.Deserializer<java.util.Map<String, ?>>() {
+                    @Override
+                    public java.util.Map<String, ?> deserialize(byte[] bytes) throws io.jsonwebtoken.io.DeserializationException {
+                        try {
+                            JsonNode node = objectMapper.readTree(bytes);
+                            return validateAndConvert(node);
+                        } catch (JwtValidationException e) {
+                            throw e;
+                        } catch (Exception e) {
+                            throw new io.jsonwebtoken.io.DeserializationException("Failed to deserialize JSON", e);
+                        }
+                    }
+
+                    @Override
+                    public java.util.Map<String, ?> deserialize(java.io.Reader reader) throws io.jsonwebtoken.io.DeserializationException {
+                        try {
+                            JsonNode node = objectMapper.readTree(reader);
+                            return validateAndConvert(node);
+                        } catch (JwtValidationException e) {
+                            throw e;
+                        } catch (Exception e) {
+                            throw new io.jsonwebtoken.io.DeserializationException("Failed to deserialize JSON", e);
+                        }
+                    }
+
+                    private java.util.Map<String, ?> validateAndConvert(JsonNode node) {
+                        if (node != null && node.isObject()) {
+                            JsonNode expNode = node.get("exp");
+                            if (expNode != null && !expNode.isIntegralNumber()) {
+                                throw new JwtValidationException(JwtValidationException.Reason.INVALID, "exp claim must be an integral number");
+                            }
+                            JsonNode iatNode = node.get("iat");
+                            if (iatNode != null && !iatNode.isIntegralNumber()) {
+                                throw new JwtValidationException(JwtValidationException.Reason.INVALID, "iat claim must be an integral number");
+                            }
+                        }
+                        return objectMapper.convertValue(node, new com.fasterxml.jackson.core.type.TypeReference<java.util.Map<String, Object>>() {});
+                    }
+                })
+                .verifyWith(this.signingKey)
+                .clockSkewSeconds(CLOCK_SKEW_SECONDS)
+                .build();
     }
 
     /**
@@ -68,8 +115,6 @@ public class JwtTokenService {
         Instant now = Instant.now().truncatedTo(ChronoUnit.SECONDS);
         Instant exp = now.plusSeconds(ttlSeconds);
 
-        SecretKey key = getSigningKey();
-
         return Jwts.builder()
                 .header()
                     .type("JWT")
@@ -78,12 +123,14 @@ public class JwtTokenService {
                 .claim("roles", roles)
                 .issuedAt(Date.from(now))
                 .expiration(Date.from(exp))
-                .signWith(key, Jwts.SIG.HS256)
+                .signWith(signingKey, Jwts.SIG.HS256)
                 .compact();
     }
 
     /**
      * Validates and parses an HS256 JWT.
+     * Signature is verified first using the pre-built JwtParser; claims are read only
+     * from the verified payload, never from an unverified Base64-decoded copy.
      *
      * @param rawToken raw token or 'Bearer <token>'
      * @return validated ParsedJwt claims
@@ -94,10 +141,7 @@ public class JwtTokenService {
             throw new JwtValidationException(JwtValidationException.Reason.MISSING, "Missing Authorization token");
         }
 
-        String token = rawToken.trim();
-        if (token.startsWith("Bearer ") || token.startsWith("bearer ")) {
-            token = token.substring(7).trim();
-        }
+        String token = SecurityConstants.stripBearerPrefix(rawToken);
 
         // 1. Length bound check
         if (token.length() > MAX_TOKEN_LENGTH) {
@@ -110,61 +154,12 @@ public class JwtTokenService {
             throw new JwtValidationException(JwtValidationException.Reason.INVALID, "Malformed token: expected 3 non-empty parts");
         }
 
-        // 3. Pre-verify payload JSON for required claim types (integral numbers for exp & iat, array for roles)
-        JsonNode payloadNode;
-        try {
-            byte[] payloadBytes = Base64.getUrlDecoder().decode(parts[1]);
-            payloadNode = objectMapper.readTree(payloadBytes);
-        } catch (Exception e) {
-            throw new JwtValidationException(JwtValidationException.Reason.INVALID, "Malformed token payload JSON", e);
-        }
-
-        // exp claim required and must be an integral number
-        JsonNode expNode = payloadNode.get("exp");
-        if (expNode == null || !expNode.isIntegralNumber()) {
-            throw new JwtValidationException(JwtValidationException.Reason.INVALID, "Missing or non-integral exp claim");
-        }
-
-        // iat claim required and must be an integral number
-        JsonNode iatNode = payloadNode.get("iat");
-        if (iatNode == null || !iatNode.isIntegralNumber()) {
-            throw new JwtValidationException(JwtValidationException.Reason.INVALID, "Missing or non-integral iat claim");
-        }
-
-        // roles claim must be a non-empty array of allowlisted uppercase strings
-        JsonNode rolesNode = payloadNode.get("roles");
-        if (rolesNode == null || !rolesNode.isArray() || rolesNode.isEmpty()) {
-            throw new JwtValidationException(JwtValidationException.Reason.INVALID, "Missing or non-array roles claim");
-        }
-        List<String> roles = new ArrayList<>();
-        for (JsonNode r : rolesNode) {
-            if (!r.isTextual()) {
-                throw new JwtValidationException(JwtValidationException.Reason.INVALID, "Role element must be a string");
-            }
-            String roleText = r.asText();
-            if (!SecurityConstants.ALLOWED_ROLES.contains(roleText)) {
-                throw new JwtValidationException(JwtValidationException.Reason.INVALID, "Role is not allowlisted: " + roleText);
-            }
-            roles.add(roleText);
-        }
-
-        // sub claim must be present and match canonical UUID format
-        JsonNode subNode = payloadNode.get("sub");
-        if (subNode == null || !subNode.isTextual() || !CANONICAL_UUID_PATTERN.matcher(subNode.asText()).matches()) {
-            throw new JwtValidationException(JwtValidationException.Reason.INVALID, "sub claim must be a valid canonical UUID");
-        }
-        UUID userId = UUID.fromString(subNode.asText());
-
-        // 4. JJWT signature and claim verification with 30-second clock skew
-        SecretKey key = getSigningKey();
-        JwtParser parser = Jwts.parser()
-                .verifyWith(key)
-                .clockSkewSeconds(CLOCK_SKEW_SECONDS)
-                .build();
-
+        // 3. Verify signature and structure with JJWT parser (built once and reused)
         Jws<Claims> jws;
         try {
-            jws = parser.parseSignedClaims(token);
+            jws = jwtParser.parseSignedClaims(token);
+        } catch (JwtValidationException e) {
+            throw e;
         } catch (ExpiredJwtException e) {
             throw new JwtValidationException(JwtValidationException.Reason.EXPIRED, "Token has expired", e);
         } catch (PrematureJwtException e) {
@@ -173,20 +168,53 @@ public class JwtTokenService {
             throw new JwtValidationException(JwtValidationException.Reason.INVALID, "Invalid token signature or structure", e);
         }
 
-        // 5. Enforce HS256 algorithm check from header
+        // 4. Enforce HS256 algorithm check from header
         String alg = jws.getHeader().getAlgorithm();
         if (!"HS256".equals(alg)) {
             throw new JwtValidationException(JwtValidationException.Reason.INVALID, "Unsupported algorithm: " + alg);
         }
 
-        Date issuedAt = jws.getPayload().getIssuedAt();
-        Date expiration = jws.getPayload().getExpiration();
+        // 5. Read claims strictly from verified payload (never from unverified copy)
+        Claims claims = jws.getPayload();
+
+        // exp claim required and must be an integral number
+        Object expVal = claims.get("exp");
+        if (expVal == null || !(expVal instanceof Integer || expVal instanceof Long)) {
+            throw new JwtValidationException(JwtValidationException.Reason.INVALID, "Missing or non-integral exp claim");
+        }
+
+        // iat claim required and must be an integral number
+        Object iatVal = claims.get("iat");
+        if (iatVal == null || !(iatVal instanceof Integer || iatVal instanceof Long)) {
+            throw new JwtValidationException(JwtValidationException.Reason.INVALID, "Missing or non-integral iat claim");
+        }
+
+        // roles claim must be a non-empty array of allowlisted uppercase strings
+        Object rolesVal = claims.get("roles");
+        if (rolesVal == null || !(rolesVal instanceof List<?> rawRolesList) || rawRolesList.isEmpty()) {
+            throw new JwtValidationException(JwtValidationException.Reason.INVALID, "Missing or non-array roles claim");
+        }
+        List<String> roles = new ArrayList<>();
+        for (Object r : rawRolesList) {
+            if (!(r instanceof String roleText)) {
+                throw new JwtValidationException(JwtValidationException.Reason.INVALID, "Role element must be a string");
+            }
+            if (!SecurityConstants.ALLOWED_ROLES.contains(roleText)) {
+                throw new JwtValidationException(JwtValidationException.Reason.INVALID, "role is not allowlisted");
+            }
+            roles.add(roleText);
+        }
+
+        // sub claim must be present and match canonical UUID format
+        Object subVal = claims.get("sub");
+        if (subVal == null || !(subVal instanceof String subStr) || !CANONICAL_UUID_PATTERN.matcher(subStr).matches()) {
+            throw new JwtValidationException(JwtValidationException.Reason.INVALID, "sub claim must be a valid canonical UUID");
+        }
+        UUID userId = UUID.fromString((String) subVal);
+
+        Date issuedAt = claims.getIssuedAt();
+        Date expiration = claims.getExpiration();
 
         return new ParsedJwt(userId, roles, issuedAt.toInstant(), expiration.toInstant());
-    }
-
-    private SecretKey getSigningKey() {
-        byte[] secretBytes = jwtProperties.getEffectiveSecret().getBytes(StandardCharsets.UTF_8);
-        return Keys.hmacShaKeyFor(secretBytes);
     }
 }

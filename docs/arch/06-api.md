@@ -28,7 +28,14 @@
   - Authorization and rate-limiting decisions are driven strictly by the matched Spring Cloud Gateway Route ID (`ServerWebExchangeUtils.GATEWAY_ROUTE_ATTR`), never by string matching on request path.
   - Bounded route ID set: `inventory-seats`, `inventory-reservations`, `inventory-admin`, `order-checkout`, `order-get`, `payment-service`, `auth-token`, `actuator`, and `unmatched`.
 - **Strict Path Hygiene Rule**:
-  - A highest-precedence WebFilter intercepts all requests before route matching and rejects with `400 Bad Request` (`VALIDATION_ERROR`) any request whose raw path contains a percent sign (`%`), semicolon (`;`), backslash (`\`), two consecutive slashes (`//`), dot-dot segment (`..`), NUL byte (`\0`), or non-ASCII characters.
+  - A highest-precedence WebFilter intercepts all requests before route matching and rejects with `400 Bad Request` (`VALIDATION_ERROR`) any request whose raw path contains a percent sign (`%`), semicolon (`;`), backslash (`\`), two consecutive slashes (`//`), dot-dot segment (`..`), NUL byte (`\0`), or non-ASCII characters. The `instance` field of path hygiene rejections is the fixed string `"/"`.
+- **Request Limits & Connection Hygiene**:
+  - `server.max-http-request-header-size`: `16KB`.
+  - `server.netty.connection-timeout`: `5s`; `server.netty.idle-timeout`: `15s`.
+  - `GET` requests must have no body (`Content-Length > 0` or `Transfer-Encoding` present returns `400 Bad Request` with `VALIDATION_ERROR`).
+  - `POST` / `PATCH` requests require `Content-Length` (`Transfer-Encoding: chunked` returns `411 Length Required` with `LENGTH_REQUIRED`).
+  - Request body limits: 64KB default, 2MB for bulk seat creation (`POST /api/v1/admin/events/{eventId}/seats/bulk`). Larger bodies return `413 Payload Too Large` (`PAYLOAD_TOO_LARGE`) without reaching downstream services.
+  - In production (`prod` profile), internal actuator endpoints are bound to dedicated management port `8085` (`management.server.port: 8085`) and not exposed on public ingress port `8080`. Health details (`show-details: never`) are always suppressed.
 
 ---
 

@@ -112,7 +112,7 @@ All custom metrics use the `ticketing_` prefix, lowercase `snake_case`, and base
 | `payment_provider_calls_total` | `Counter` | `service`, `operation` (`charge`, `refund`), `outcome` (`succeeded`, `declined`, `error`) | `payment-service` | Total calls to the payment provider. |
 | `payment_provider_duration_seconds` | `Timer` | `service`, `operation` (`charge`, `refund`) | `payment-service` | Duration of payment provider calls. |
 | `payment_events_handled_total` | `Counter` | `service`, `event_type`, `outcome` (`applied`, `noop`, `ignored`) | `payment-service` | Total order events handled by payment-service partitioned by event type and outcome. |
-| `gateway_requests_total` | `Counter` | `service`, `route`, `status_class` (`2xx`, `4xx`, `5xx`) | `gateway-service` | Total incoming requests routed through the gateway. |
+| `gateway_requests_total` | `Counter` | `service`, `route`, `status_class` (`2xx`, `3xx`, `4xx`, `5xx`, `cancelled`, `other`) | `gateway-service` | Total incoming requests routed through the gateway (cancelled requests counted once with `status_class: "cancelled"`). |
 | `gateway_rate_limited_total` | `Counter` | `service`, `route` | `gateway-service` | Total requests rejected by the Redis rate limiter (HTTP 429). |
 | `gateway_auth_failures_total` | `Counter` | `service`, `reason` (`missing`, `invalid`, `expired`, `forbidden`) | `gateway-service` | Total authentication and authorization rejections at the gateway. |
 | `ticketing_notifications_sent_total` | `Counter` | `service`, `event_type`, `status` (`SENT`, `DEDUPLICATED`, `FAILED`) | `notification-service` | Total notifications dispatched or deduplicated via Redis. |
@@ -130,6 +130,8 @@ All custom metrics use the `ticketing_` prefix, lowercase `snake_case`, and base
 | `order-service` (`:8082`) | `GET /actuator/health/liveness` | `GET /actuator/health/readiness` (`order_db`, Kafka) | `GET /actuator/prometheus` |
 | `payment-service` (`:8083`) | `GET /actuator/health/liveness` | `GET /actuator/health/readiness` (`payment_db`, Kafka) | `GET /actuator/prometheus` |
 | `notification-service` (`:8084`) | `GET /health/liveness` | `GET /health/readiness` (Redis 7, Kafka) | `GET /metrics` |
+
+> **Production Management Port Rule**: In production (`prod` profile), `gateway-service` binds actuator endpoints to a dedicated internal management port (`management.server.port: 8085`) exposing only `health`, `info`, and `prometheus`. Port 8085 must never be exposed publicly. Health component details are disabled (`management.endpoint.health.show-details: never`). Netty limits: `connection-timeout: 5s`, `idle-timeout: 15s`, `max-http-request-header-size: 16KB`.
 
 ---
 

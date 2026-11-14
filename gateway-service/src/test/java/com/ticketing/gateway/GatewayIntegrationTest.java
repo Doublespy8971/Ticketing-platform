@@ -29,6 +29,7 @@ import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.boot.test.autoconfigure.web.reactive.AutoConfigureWebTestClient;
 import org.springframework.boot.test.context.SpringBootTest;
 import org.springframework.http.HttpHeaders;
+import org.springframework.http.HttpMethod;
 import org.springframework.http.MediaType;
 import org.springframework.test.context.ActiveProfiles;
 import org.springframework.test.context.DynamicPropertyRegistry;
@@ -138,6 +139,16 @@ public class GatewayIntegrationTest {
                                 return res.status(201)
                                         .header(HttpHeaderNames.CONTENT_TYPE, "application/json")
                                         .sendString(Mono.just("{\"eventId\":\"evt-admin-123\"}"));
+                            });
+                        })
+                        .post("/api/v1/admin/events/{eventId}/seats/bulk", (req, res) -> {
+                            Map<String, String> hdrs = new HashMap<>();
+                            req.requestHeaders().forEach(entry -> hdrs.put(entry.getKey().toLowerCase(), entry.getValue()));
+                            return req.receive().asString(StandardCharsets.UTF_8).defaultIfEmpty("").flatMap(body -> {
+                                recordedInventoryRequests.add(new RecordedRequest(req.uri(), "POST", hdrs, body));
+                                return res.status(201)
+                                        .header(HttpHeaderNames.CONTENT_TYPE, "application/json")
+                                        .sendString(Mono.just("{\"created\":true}"));
                             });
                         })
                         .route(r -> io.netty.handler.codec.http.HttpMethod.PATCH.equals(r.method()) && r.uri().contains("/status"), (req, res) -> {
@@ -1134,9 +1145,304 @@ public class GatewayIntegrationTest {
         }
     }
 
-    // 25. Redis stopped makes requests behave per policy (fail open) and does not crash gateway
+    // 25. Underscore headers and method override headers never reach stub
     @Test
     @Order(25)
+    @DisplayName("Underscore headers and method override headers never reach stub on protected and public routes")
+    void underscoreAndMethodOverrideHeadersNeverReachStub() {
+        UUID validUserId = UUID.randomUUID();
+        UUID spoofedUserId = UUID.randomUUID();
+        String token = createToken(validUserId, List.of("USER"), 3600);
+
+        // Protected route
+        recordedInventoryRequests.clear();
+        webTestClient.post()
+                .uri("/api/v1/reservations")
+                .header(HttpHeaders.AUTHORIZATION, "Bearer " + token)
+                .header("X_User_Id", spoofedUserId.toString())
+                .header("X_USER_ID", spoofedUserId.toString())
+                .header("x_user_id", spoofedUserId.toString())
+                .header("X_User_Roles", "ADMIN")
+                .header("X_USER_ROLES", "ADMIN")
+                .header("x_user_roles", "ADMIN")
+                .header("X-HTTP-Method-Override", "DELETE")
+                .header("X_HTTP_Method_Override", "DELETE")
+                .header("X-HTTP-Method", "DELETE")
+                .header("X_HTTP_Method", "DELETE")
+                .header("X-Method-Override", "DELETE")
+                .header("X_Method_Override", "DELETE")
+                .contentType(MediaType.APPLICATION_JSON)
+                .bodyValue("{}")
+                .exchange()
+                .expectStatus().isCreated();
+
+        RecordedRequest reqProtected = recordedInventoryRequests.poll();
+        assertThat(reqProtected).isNotNull();
+        assertThat(reqProtected.headers().get("x-user-id")).isEqualTo(validUserId.toString());
+        assertThat(reqProtected.headers().get("x-user-roles")).isEqualTo("USER");
+        assertThat(reqProtected.headers()).doesNotContainKey("x_user_id");
+        assertThat(reqProtected.headers()).doesNotContainKey("x_user_roles");
+        assertThat(reqProtected.headers()).doesNotContainKey("x-http-method-override");
+        assertThat(reqProtected.headers()).doesNotContainKey("x_http_method_override");
+        assertThat(reqProtected.headers()).doesNotContainKey("x-http-method");
+        assertThat(reqProtected.headers()).doesNotContainKey("x_http_method");
+        assertThat(reqProtected.headers()).doesNotContainKey("x-method-override");
+        assertThat(reqProtected.headers()).doesNotContainKey("x_method_override");
+
+        // Public route
+        recordedInventoryRequests.clear();
+        webTestClient.get()
+                .uri("/api/v1/events/" + UUID.randomUUID() + "/seats")
+                .header(HttpHeaders.AUTHORIZATION, "Bearer " + token)
+                .header("X_User_Id", spoofedUserId.toString())
+                .header("X_USER_ID", spoofedUserId.toString())
+                .header("x_user_id", spoofedUserId.toString())
+                .header("X_User_Roles", "ADMIN")
+                .header("X_USER_ROLES", "ADMIN")
+                .header("x_user_roles", "ADMIN")
+                .header("X-HTTP-Method-Override", "DELETE")
+                .header("X_HTTP_Method_Override", "DELETE")
+                .header("X-HTTP-Method", "DELETE")
+                .header("X_HTTP_Method", "DELETE")
+                .header("X-Method-Override", "DELETE")
+                .header("X_Method_Override", "DELETE")
+                .exchange()
+                .expectStatus().isOk();
+
+        RecordedRequest reqPublic = recordedInventoryRequests.poll();
+        assertThat(reqPublic).isNotNull();
+        assertThat(reqPublic.headers().get("x-user-id")).isNull();
+        assertThat(reqPublic.headers().get("x-user-roles")).isNull();
+        assertThat(reqPublic.headers()).doesNotContainKey("x_user_id");
+        assertThat(reqPublic.headers()).doesNotContainKey("x_user_roles");
+        assertThat(reqPublic.headers()).doesNotContainKey("x-http-method-override");
+        assertThat(reqPublic.headers()).doesNotContainKey("x_http_method_override");
+        assertThat(reqPublic.headers()).doesNotContainKey("x-http-method");
+        assertThat(reqPublic.headers()).doesNotContainKey("x_http_method");
+        assertThat(reqPublic.headers()).doesNotContainKey("x-method-override");
+        assertThat(reqPublic.headers()).doesNotContainKey("x_method_override");
+    }
+
+    // 26. Bearer prefix case-insensitivity
+    @Test
+    @Order(26)
+    @DisplayName("Bearer prefix case-insensitive: BEARER and bearer both succeed")
+    void bearerPrefixCaseInsensitive() {
+        UUID userId = UUID.randomUUID();
+        String token = createToken(userId, List.of("USER"), 3600);
+
+        webTestClient.post()
+                .uri("/api/v1/reservations")
+                .header(HttpHeaders.AUTHORIZATION, "BEARER " + token)
+                .contentType(MediaType.APPLICATION_JSON)
+                .bodyValue("{}")
+                .exchange()
+                .expectStatus().isCreated();
+
+        webTestClient.post()
+                .uri("/api/v1/reservations")
+                .header(HttpHeaders.AUTHORIZATION, "bearer " + token)
+                .contentType(MediaType.APPLICATION_JSON)
+                .bodyValue("{}")
+                .exchange()
+                .expectStatus().isCreated();
+    }
+
+    // 27. Request body limits enforced
+    @Test
+    @Order(27)
+    @DisplayName("Request body limits enforced: GET no body (400), POST chunked (411), oversized body (413)")
+    void requestBodyLimitsEnforced() {
+        UUID userId = UUID.randomUUID();
+        String userToken = createToken(userId, List.of("USER"), 3600);
+        String adminToken = createToken(userId, List.of("ADMIN"), 3600);
+
+        // 1. GET with body returns 400 VALIDATION_ERROR
+        webTestClient.method(HttpMethod.GET)
+                .uri("/api/v1/events/" + UUID.randomUUID() + "/seats")
+                .header(HttpHeaders.CONTENT_LENGTH, "10")
+                .bodyValue("0123456789")
+                .exchange()
+                .expectStatus().isBadRequest()
+                .expectHeader().contentType(MediaType.parseMediaType("application/problem+json"))
+                .expectBody()
+                .jsonPath("$.errorCode").isEqualTo("VALIDATION_ERROR");
+
+        // 2. POST with chunked body returns 411 LENGTH_REQUIRED
+        webTestClient.post()
+                .uri("/api/v1/reservations")
+                .header(HttpHeaders.AUTHORIZATION, "Bearer " + userToken)
+                .header(HttpHeaders.TRANSFER_ENCODING, "chunked")
+                .body(org.springframework.web.reactive.function.BodyInserters.fromPublisher(
+                        reactor.core.publisher.Flux.just("{\"test\":1}"), String.class))
+                .exchange()
+                .expectStatus().isEqualTo(411)
+                .expectHeader().contentType(MediaType.parseMediaType("application/problem+json"))
+                .expectBody()
+                .jsonPath("$.errorCode").isEqualTo("LENGTH_REQUIRED");
+
+        // 3. POST with body > 64KB returns 413 PAYLOAD_TOO_LARGE and zero stub requests
+        recordedInventoryRequests.clear();
+        String bigBody65k = "{\"data\":\"" + "a".repeat(65 * 1024) + "\"}";
+        webTestClient.post()
+                .uri("/api/v1/reservations")
+                .header(HttpHeaders.AUTHORIZATION, "Bearer " + userToken)
+                .contentType(MediaType.APPLICATION_JSON)
+                .bodyValue(bigBody65k)
+                .exchange()
+                .expectStatus().isEqualTo(413)
+                .expectHeader().contentType(MediaType.parseMediaType("application/problem+json"))
+                .expectBody()
+                .jsonPath("$.errorCode").isEqualTo("PAYLOAD_TOO_LARGE");
+
+        assertThat(recordedInventoryRequests).isEmpty();
+
+        // 4. Bulk seats route accepts larger body (100KB <= 2MB)
+        String bulk100k = "{\"seats\":[],\"data\":\"" + "x".repeat(100 * 1024) + "\"}";
+        webTestClient.post()
+                .uri("/api/v1/admin/events/" + UUID.randomUUID() + "/seats/bulk")
+                .header(HttpHeaders.AUTHORIZATION, "Bearer " + adminToken)
+                .contentType(MediaType.APPLICATION_JSON)
+                .bodyValue(bulk100k)
+                .exchange()
+                .expectStatus().isCreated();
+
+        // 5. Bulk seats route rejects body > 2MB
+        String bulkOver2M = "{\"seats\":[],\"data\":\"" + "x".repeat(2 * 1024 * 1024 + 1024) + "\"}";
+        webTestClient.post()
+                .uri("/api/v1/admin/events/" + UUID.randomUUID() + "/seats/bulk")
+                .header(HttpHeaders.AUTHORIZATION, "Bearer " + adminToken)
+                .contentType(MediaType.APPLICATION_JSON)
+                .bodyValue(bulkOver2M)
+                .exchange()
+                .expectStatus().isEqualTo(413)
+                .expectHeader().contentType(MediaType.parseMediaType("application/problem+json"))
+                .expectBody()
+                .jsonPath("$.errorCode").isEqualTo("PAYLOAD_TOO_LARGE");
+    }
+
+    // 28. Path hygiene rejection counted in metrics with unmatched route
+    @Test
+    @Order(28)
+    @DisplayName("Path hygiene rejection is counted in gateway_requests_total with route unmatched")
+    void pathHygieneRejectionCountedInMetricsWithUnmatchedRoute() {
+        double beforeCount = meterRegistry.find("gateway_requests_total")
+                .tag("route", "unmatched")
+                .tag("status_class", "4xx")
+                .counters().stream().mapToDouble(io.micrometer.core.instrument.Counter::count).sum();
+
+        webTestClient.get()
+                .uri("/api/v1/%61dmin/events")
+                .exchange()
+                .expectStatus().isBadRequest();
+
+        double afterCount = meterRegistry.find("gateway_requests_total")
+                .tag("route", "unmatched")
+                .tag("status_class", "4xx")
+                .counters().stream().mapToDouble(io.micrometer.core.instrument.Counter::count).sum();
+
+        assertThat(afterCount - beforeCount).isGreaterThanOrEqualTo(1.0);
+    }
+
+    // 29. Aborted client request counted once as cancelled
+    @Test
+    @Order(29)
+    @DisplayName("Aborted client request is counted once with status_class cancelled")
+    void abortedClientRequestCountedOnceAsCancelled() throws Exception {
+        double beforeCancelled = meterRegistry.find("gateway_requests_total")
+                .tag("status_class", "cancelled")
+                .counters().stream().mapToDouble(io.micrometer.core.instrument.Counter::count).sum();
+
+        try (java.net.Socket socket = new java.net.Socket("127.0.0.1", localPort)) {
+            java.io.OutputStream out = socket.getOutputStream();
+            out.write("GET /api/v1/events/slow/seats HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n".getBytes(StandardCharsets.UTF_8));
+            out.flush();
+            Thread.sleep(150);
+            socket.setSoLinger(true, 0);
+        }
+
+        Thread.sleep(300);
+
+        double afterCancelled = meterRegistry.find("gateway_requests_total")
+                .tag("status_class", "cancelled")
+                .counters().stream().mapToDouble(io.micrometer.core.instrument.Counter::count).sum();
+
+        assertThat(afterCancelled - beforeCancelled).isEqualTo(1.0);
+    }
+
+    // 30. Unmatched auth and actuator routes tagged unmatched
+    @Test
+    @Order(30)
+    @DisplayName("GET /api/v1/auth/foo and /actuator/env are tagged unmatched")
+    void unmatchedAuthAndActuatorRoutesTaggedUnmatched() {
+        double beforeUnmatched = meterRegistry.find("gateway_requests_total")
+                .tag("route", "unmatched")
+                .counters().stream().mapToDouble(io.micrometer.core.instrument.Counter::count).sum();
+
+        webTestClient.get()
+                .uri("/api/v1/auth/foo")
+                .exchange()
+                .expectStatus().isNotFound();
+
+        webTestClient.get()
+                .uri("/actuator/env")
+                .exchange()
+                .expectStatus().isNotFound();
+
+        double afterUnmatched = meterRegistry.find("gateway_requests_total")
+                .tag("route", "unmatched")
+                .counters().stream().mapToDouble(io.micrometer.core.instrument.Counter::count).sum();
+
+        assertThat(afterUnmatched - beforeUnmatched).isGreaterThanOrEqualTo(2.0);
+    }
+
+    // 31. Error bodies never contain marker role or path segment
+    @Test
+    @Order(31)
+    @DisplayName("Error bodies never contain request-derived marker role or marker path segment")
+    void errorBodiesNeverContainMarkerRoleOrPathSegment() {
+        // 1. Role validation error
+        String markerRole = "MARKER_ROLE_FORBIDDEN_XYZ_999";
+        webTestClient.post()
+                .uri("/api/v1/auth/token")
+                .contentType(MediaType.APPLICATION_JSON)
+                .bodyValue(new DevTokenRequest(UUID.randomUUID().toString(), List.of(markerRole), 3600L))
+                .exchange()
+                .expectStatus().isBadRequest()
+                .expectBody(String.class)
+                .value(body -> {
+                    assertThat(body).contains("role is not allowlisted");
+                    assertThat(body).doesNotContain(markerRole);
+                });
+
+        // 2. Path hygiene rejection
+        String markerPathSegment = "marker_hygiene_test_path_segment_123";
+        webTestClient.get()
+                .uri("/api/v1/%61dmin/" + markerPathSegment)
+                .exchange()
+                .expectStatus().isBadRequest()
+                .expectBody(String.class)
+                .value(body -> {
+                    assertThat(body).contains("\"instance\":\"/\"");
+                    assertThat(body).doesNotContain(markerPathSegment);
+                });
+
+        // 3. Unmatched route 404
+        String markerUnmatchedSegment = "marker_unmatched_route_path_segment_789";
+        webTestClient.get()
+                .uri("/api/v1/" + markerUnmatchedSegment)
+                .exchange()
+                .expectStatus().isNotFound()
+                .expectBody(String.class)
+                .value(body -> {
+                    assertThat(body).contains("\"instance\":\"/\"");
+                    assertThat(body).doesNotContain(markerUnmatchedSegment);
+                });
+    }
+
+    // 32. Redis stopped makes requests behave per policy (fail open) and does not crash gateway
+    @Test
+    @Order(32)
     @DisplayName("Redis stopped fails open and does not crash gateway")
     void redisStoppedFailsOpen() {
         // Stop Redis container
@@ -1193,6 +1499,29 @@ public class GatewayIntegrationTest {
                         .exchange()
                         .expectStatus().isOk();
             }
+        }
+
+        @Test
+        @DisplayName("X-Forwarded-For: 203.0.113.5, unknown from trusted proxy resolves to proxy address")
+        void xffWithUnknownEntryStopsAndUsesProxyAddress() {
+            client.get()
+                    .uri("/api/v1/events/" + UUID.randomUUID() + "/seats")
+                    .header("X-Forwarded-For", "203.0.113.5, unknown")
+                    .exchange()
+                    .expectStatus().isOk();
+
+            com.ticketing.gateway.ratelimit.ClientAddressResolver resolver =
+                    new com.ticketing.gateway.ratelimit.ClientAddressResolver("127.0.0.1/32");
+            org.springframework.mock.http.server.reactive.MockServerHttpRequest request =
+                    org.springframework.mock.http.server.reactive.MockServerHttpRequest.get("/api/v1/events/123/seats")
+                            .remoteAddress(new java.net.InetSocketAddress("127.0.0.1", 12345))
+                            .header("X-Forwarded-For", "203.0.113.5, unknown")
+                            .build();
+            org.springframework.mock.web.server.MockServerWebExchange exchange =
+                    org.springframework.mock.web.server.MockServerWebExchange.from(request);
+
+            String resolved = resolver.resolveClientIp(exchange);
+            assertThat(resolved).isEqualTo("127.0.0.1");
         }
     }
 }

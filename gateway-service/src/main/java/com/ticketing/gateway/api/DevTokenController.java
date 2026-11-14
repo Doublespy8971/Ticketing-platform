@@ -77,7 +77,7 @@ public class DevTokenController {
                 return validationError("role must not contain comma or whitespace", instance, correlationId);
             }
             if (!SecurityConstants.ALLOWED_ROLES.contains(role)) {
-                return validationError("role is not allowlisted: " + role, instance, correlationId);
+                return validationError("role is not allowlisted", instance, correlationId);
             }
         }
 

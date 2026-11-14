@@ -70,8 +70,8 @@ public class ClientAddressResolver {
             String candidate = entries.get(i);
             InetAddress candidateInet = parseIpAddress(candidate);
             if (candidateInet == null) {
-                // Garbage or invalid IP: skip and continue or fallback if none
-                continue;
+                // Entry cannot be parsed as an IP address: stop immediately and use connection address
+                return fallbackIp;
             }
             if (!isTrusted(candidateInet)) {
                 return candidateInet.getHostAddress();
@@ -143,10 +143,7 @@ public class ClientAddressResolver {
         for (String part : config.split(",")) {
             String trimmed = part.trim();
             if (!trimmed.isEmpty()) {
-                try {
-                    matchers.add(new CidrMatcher(trimmed));
-                } catch (Exception ignored) {
-                }
+                matchers.add(new CidrMatcher(trimmed));
             }
         }
         return matchers;
@@ -158,18 +155,36 @@ public class ClientAddressResolver {
         private final int addressFamily;
 
         public CidrMatcher(String cidrStr) {
-            String[] parts = cidrStr.trim().split("/", -1);
-            InetAddress addr = parseIpAddress(parts[0]);
+            if (cidrStr == null) {
+                throw new IllegalArgumentException("CIDR string must not be null");
+            }
+            String trimmed = cidrStr.trim();
+            int firstSlash = trimmed.indexOf('/');
+            int lastSlash = trimmed.lastIndexOf('/');
+            if (firstSlash == -1 || firstSlash != lastSlash || firstSlash == 0 || firstSlash == trimmed.length() - 1) {
+                throw new IllegalArgumentException("Invalid CIDR format (must contain exactly one slash): " + cidrStr);
+            }
+            String ipPart = trimmed.substring(0, firstSlash).trim();
+            String prefixPart = trimmed.substring(firstSlash + 1).trim();
+
+            InetAddress addr = parseIpAddress(ipPart);
             if (addr == null) {
                 throw new IllegalArgumentException("Invalid CIDR IP: " + cidrStr);
             }
             this.networkBytes = addr.getAddress();
             this.addressFamily = networkBytes.length;
-            if (parts.length == 2) {
-                this.prefixLength = Integer.parseInt(parts[1].trim());
-            } else {
-                this.prefixLength = networkBytes.length * 8;
+
+            int maxPrefix = (addressFamily == 4) ? 32 : 128;
+            int prefix;
+            try {
+                prefix = Integer.parseInt(prefixPart);
+            } catch (NumberFormatException e) {
+                throw new IllegalArgumentException("Invalid CIDR prefix length: " + cidrStr, e);
             }
+            if (prefix < 0 || prefix > maxPrefix) {
+                throw new IllegalArgumentException("CIDR prefix length out of range (0-" + maxPrefix + "): " + cidrStr);
+            }
+            this.prefixLength = prefix;
         }
 
         public boolean matches(InetAddress address) {

@@ -90,7 +90,7 @@ public class SecurityAndHygieneGlobalFilter implements GlobalFilter, Ordered {
 
         // 2. Protected routes: extract Authorization header
         String authHeader = exchange.getRequest().getHeaders().getFirst(HttpHeaders.AUTHORIZATION);
-        if (authHeader == null || !authHeader.toLowerCase().startsWith("bearer ")) {
+        if (authHeader == null || !SecurityConstants.hasBearerPrefix(authHeader)) {
             gatewayMetrics.recordAuthFailure("missing");
             return writeProblemResponse(exchange, HttpStatus.UNAUTHORIZED,
                     ErrorCode.UNAUTHORIZED, "Authentication required", null, correlationId);
@@ -135,13 +135,17 @@ public class SecurityAndHygieneGlobalFilter implements GlobalFilter, Ordered {
                                                  List<String> roles) {
         ServerHttpRequest.Builder reqBuilder = exchange.getRequest().mutate();
         reqBuilder.headers(headers -> {
-            // Strip client-supplied identity and authorization headers
-            headers.remove("X-User-Id");
-            headers.remove("x-user-id");
-            headers.remove("X-User-Roles");
-            headers.remove("x-user-roles");
-            headers.remove(HttpHeaders.AUTHORIZATION);
-            headers.remove("authorization");
+            // Strip any header whose normalized name is in STRIPPED_NORMALIZED_HEADERS
+            java.util.List<String> keysToRemove = new java.util.ArrayList<>();
+            for (String headerName : headers.keySet()) {
+                if (SecurityConstants.STRIPPED_NORMALIZED_HEADERS.contains(
+                        SecurityConstants.normalizeHeaderName(headerName))) {
+                    keysToRemove.add(headerName);
+                }
+            }
+            for (String key : keysToRemove) {
+                headers.remove(key);
+            }
 
             // Inject verified identity headers if authenticated
             if (userId != null) {
@@ -181,8 +185,7 @@ public class SecurityAndHygieneGlobalFilter implements GlobalFilter, Ordered {
         try {
             bytes = objectMapper.writeValueAsBytes(problem);
         } catch (Exception e) {
-            bytes = ("{\"status\":" + status.value() + ",\"title\":\"" + errorCode.title() + "\",\"detail\":\"" + detail + "\"}")
-                    .getBytes(StandardCharsets.UTF_8);
+            throw new RuntimeException("Failed to serialize problem details", e);
         }
         DataBuffer buffer = response.bufferFactory().wrap(bytes);
         return response.writeWith(Mono.just(buffer));

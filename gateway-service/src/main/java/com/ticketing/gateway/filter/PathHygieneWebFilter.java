@@ -51,7 +51,7 @@ public class PathHygieneWebFilter implements WebFilter, Ordered {
         if (isInvalidPath(rawPath) || isInvalidPath(pathValue)) {
             String correlationId = (String) exchange.getAttributes().getOrDefault(
                     CorrelationIdWebFilter.CORRELATION_ID_ATTR, UUID.randomUUID().toString());
-            return writeBadRequestResponse(exchange, pathValue, correlationId);
+            return writeBadRequestResponse(exchange, correlationId);
         }
 
         return chain.filter(exchange);
@@ -78,7 +78,7 @@ public class PathHygieneWebFilter implements WebFilter, Ordered {
         return false;
     }
 
-    private Mono<Void> writeBadRequestResponse(ServerWebExchange exchange, String instance, String correlationId) {
+    private Mono<Void> writeBadRequestResponse(ServerWebExchange exchange, String correlationId) {
         ServerHttpResponse response = exchange.getResponse();
         response.setStatusCode(HttpStatus.BAD_REQUEST);
         response.getHeaders().setContentType(MediaType.parseMediaType(ProblemDetails.MEDIA_TYPE));
@@ -87,7 +87,7 @@ public class PathHygieneWebFilter implements WebFilter, Ordered {
         ProblemDetails problem = ProblemDetails.of(
                 ErrorCode.VALIDATION_ERROR,
                 "Invalid request path",
-                instance,
+                "/",
                 correlationId,
                 List.of()
         );
@@ -96,8 +96,7 @@ public class PathHygieneWebFilter implements WebFilter, Ordered {
         try {
             bytes = objectMapper.writeValueAsBytes(problem);
         } catch (Exception e) {
-            bytes = "{\"status\":400,\"errorCode\":\"VALIDATION_ERROR\",\"title\":\"Validation Error\",\"detail\":\"Invalid request path\"}"
-                    .getBytes(StandardCharsets.UTF_8);
+            throw new RuntimeException("Failed to serialize problem details", e);
         }
         DataBuffer buffer = response.bufferFactory().wrap(bytes);
         return response.writeWith(Mono.just(buffer));

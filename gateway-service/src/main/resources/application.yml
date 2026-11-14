@@ -1,5 +1,9 @@
 server:
   port: ${SERVER_PORT:8080}
+  max-http-request-header-size: 16KB
+  netty:
+    connection-timeout: 5s
+    idle-timeout: 15s
 
 spring:
   application:
@@ -52,6 +56,6 @@ management:
         include: health,info,prometheus
   endpoint:
     health:
-      show-details: always
+      show-details: never
       probes:
         enabled: true

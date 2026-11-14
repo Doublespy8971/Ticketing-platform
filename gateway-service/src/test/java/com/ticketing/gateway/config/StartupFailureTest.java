@@ -1,9 +1,12 @@
 package com.ticketing.gateway.config;
 
+import com.ticketing.gateway.ratelimit.ClientAddressResolver;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
 import org.springframework.boot.test.util.TestPropertyValues;
 import org.springframework.context.annotation.AnnotationConfigApplicationContext;
+
+import java.util.List;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
@@ -110,6 +113,59 @@ class StartupFailureTest {
                     .hasRootCauseInstanceOf(IllegalStateException.class)
                     .rootCause()
                     .hasMessageContaining("Dev token endpoint");
+        }
+    }
+
+    @Test
+    @DisplayName("Startup fails when prod profile is active and allow-insecure-dev-secret is true")
+    void startupFailsWhenProdProfileWithInsecureDevSecretAllowed() {
+        try (AnnotationConfigApplicationContext context = new AnnotationConfigApplicationContext()) {
+            context.getEnvironment().setActiveProfiles("prod");
+            TestPropertyValues.of(
+                    "JWT_SECRET=12345678901234567890123456789012",
+                    "ticketing.gateway.allow-insecure-dev-secret=true"
+            ).applyTo(context);
+            context.register(JwtProperties.class);
+
+            assertThatThrownBy(context::refresh)
+                    .hasRootCauseInstanceOf(IllegalStateException.class)
+                    .rootCause()
+                    .hasMessageContaining("allow-insecure-dev-secret must NEVER be true when prod profile is active");
+        }
+    }
+
+    @Test
+    @DisplayName("Startup fails when prod profile is active and secret is short")
+    void startupFailsWhenProdProfileWithShortSecret() {
+        try (AnnotationConfigApplicationContext context = new AnnotationConfigApplicationContext()) {
+            context.getEnvironment().setActiveProfiles("prod");
+            TestPropertyValues.of(
+                    "JWT_SECRET=short",
+                    "ticketing.gateway.allow-insecure-dev-secret=false"
+            ).applyTo(context);
+            context.register(JwtProperties.class);
+
+            assertThatThrownBy(context::refresh)
+                    .hasRootCauseInstanceOf(IllegalStateException.class)
+                    .rootCause()
+                    .hasMessageContaining("JWT_SECRET must be at least 32 UTF-8 bytes when prod profile is active");
+        }
+    }
+
+    @Test
+    @DisplayName("Startup fails when trusted-proxies contains invalid CIDRs")
+    void invalidCidrEntriesFailStartup() {
+        List<String> invalidCidrs = List.of("10.0.0.0/99", "10.0.0.0/-1", "10.0.0.0/8/8", "garbage");
+        for (String invalidCidr : invalidCidrs) {
+            try (AnnotationConfigApplicationContext context = new AnnotationConfigApplicationContext()) {
+                TestPropertyValues.of(
+                        "ticketing.gateway.trusted-proxies=" + invalidCidr
+                ).applyTo(context);
+                context.register(ClientAddressResolver.class);
+
+                assertThatThrownBy(context::refresh)
+                        .hasRootCauseInstanceOf(IllegalArgumentException.class);
+            }
         }
     }
 }

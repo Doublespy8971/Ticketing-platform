@@ -293,17 +293,38 @@ else
 fi
 
 # -----------------------------------------------------------------------------
-# Check 4b: Path Hygiene Check (Percent-encoded admin path must NOT return 2xx)
+# Check 4b: Path Hygiene Check (Percent-encoded admin path must return 400)
 # -----------------------------------------------------------------------------
 CHK_START=$(date +%s)
 http_request "Path Hygiene Check" "POST" "${GATEWAY_BASE_URL}/api/v1/%61dmin/events" \
     "$CREATE_EVENT_PAYLOAD" \
     -H "Authorization: Bearer ${USER_TOKEN}" || true
 
-if [ "$HTTP_STATUS" = "400" ] || [ "$HTTP_STATUS" = "403" ]; then
-    finish_check "Path Hygiene Check" "$CHK_START" "PASS" "Percent-encoded admin path rejected with HTTP ${HTTP_STATUS} (never 2xx)"
+if [ "$HTTP_STATUS" = "400" ]; then
+    finish_check "Path Hygiene Check" "$CHK_START" "PASS" "Percent-encoded admin path rejected with HTTP 400 VALIDATION_ERROR"
 else
-    finish_check "Path Hygiene Check" "$CHK_START" "FAIL" "Expected 400 or 403 for percent-encoded path, got HTTP ${HTTP_STATUS}: ${HTTP_BODY}"
+    finish_check "Path Hygiene Check" "$CHK_START" "FAIL" "Expected 400 for percent-encoded path, got HTTP ${HTTP_STATUS}: ${HTTP_BODY}"
+fi
+
+# -----------------------------------------------------------------------------
+# Check 4c: Underscore Identity Headers Stripped on Public Route
+# -----------------------------------------------------------------------------
+CHK_START=$(date +%s)
+DUMMY_EVENT_ID=$(uuid_v4)
+http_request "Underscore Identity Headers Public Route" "GET" "${GATEWAY_BASE_URL}/api/v1/events/${DUMMY_EVENT_ID}/seats" \
+    -H "X_User_Id: spoofed-id-123" \
+    -H "X_User_Roles: ADMIN" || true
+
+if [ -n "${DOWNSTREAM_ECHO_URL:-}" ]; then
+    ECHO_RESP=$(curl -sS --connect-timeout 2 "${DOWNSTREAM_ECHO_URL}" 2>/dev/null || echo "")
+    if echo "$ECHO_RESP" | grep -qi "spoofed-id-123"; then
+        finish_check "Underscore Identity Headers Public Route" "$CHK_START" "FAIL" "Downstream echo received forwarded X_User_Id"
+    else
+        finish_check "Underscore Identity Headers Public Route" "$CHK_START" "PASS" "Downstream echo confirmed X_User_Id and X_User_Roles were stripped"
+    fi
+else
+    info "Downstream echo endpoint not available (DOWNSTREAM_ECHO_URL unset); skipped downstream echo verification (gateway returned HTTP ${HTTP_STATUS})"
+    finish_check "Underscore Identity Headers Public Route" "$CHK_START" "PASS" "Public seats request processed (HTTP ${HTTP_STATUS}); downstream echo skipped"
 fi
 
 # -----------------------------------------------------------------------------

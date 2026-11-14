@@ -21,6 +21,10 @@ import java.util.Set;
 @Component
 public class GatewayMetrics {
 
+    public static final Set<String> ALLOWED_STATUS_CLASSES = Set.of(
+            "2xx", "4xx", "5xx", "cancelled", "other"
+    );
+
     public static final Set<String> ALLOWED_ROUTES = Set.of(
             GatewayRoutesConfig.ROUTE_INVENTORY_SEATS,
             GatewayRoutesConfig.ROUTE_INVENTORY_RESERVATIONS,
@@ -42,7 +46,7 @@ public class GatewayMetrics {
     public void recordRequest(String route, String statusClass) {
         meterRegistry.counter("gateway_requests_total",
                 "route", normalizeRoute(route),
-                "status_class", statusClass != null ? statusClass : "unknown"
+                "status_class", normalizeStatusClass(statusClass)
         ).increment();
     }
 
@@ -65,6 +69,17 @@ public class GatewayMetrics {
             return "4xx";
         } else if (statusCode >= 500 && statusCode < 600) {
             return "5xx";
+        }
+        return "other";
+    }
+
+    public static String normalizeStatusClass(String statusClass) {
+        if (statusClass == null || statusClass.isBlank()) {
+            return "other";
+        }
+        String lower = statusClass.toLowerCase();
+        if (ALLOWED_STATUS_CLASSES.contains(lower)) {
+            return lower;
         }
         return "other";
     }
