@@ -15,7 +15,8 @@ import java.util.regex.Pattern;
  * Resolves the client IP address for IP-based rate limiting.
  * Section 4:
  * - Uses TCP remote connection address by default.
- * - Honors X-Forwarded-For only when remote address is within configured trusted proxies.
+ * - Honors X-Forwarded-For only when remote address is within configured
+ * trusted proxies.
  * - Uses the right-most address that is not inside the trusted list.
  * - Guarantees the resolved value is a valid parsed IPv4 or IPv6 string.
  */
@@ -65,12 +66,14 @@ public class ClientAddressResolver {
             return fallbackIp;
         }
 
-        // Walk right-to-left to find the right-most address that is not inside the trusted list
+        // Walk right-to-left to find the right-most address that is not inside the
+        // trusted list
         for (int i = entries.size() - 1; i >= 0; i--) {
             String candidate = entries.get(i);
             InetAddress candidateInet = parseIpAddress(candidate);
             if (candidateInet == null) {
-                // Entry cannot be parsed as an IP address: stop immediately and use connection address
+                // Entry cannot be parsed as an IP address: stop immediately and use connection
+                // address
                 return fallbackIp;
             }
             if (!isTrusted(candidateInet)) {
@@ -109,7 +112,8 @@ public class ClientAddressResolver {
                 String[] octets = trimmed.split("\\.");
                 for (String o : octets) {
                     int val = Integer.parseInt(o);
-                    if (val < 0 || val > 255) return null;
+                    if (val < 0 || val > 255)
+                        return null;
                 }
             }
             return addr;
@@ -209,4 +213,3 @@ public class ClientAddressResolver {
         }
     }
 }
-
