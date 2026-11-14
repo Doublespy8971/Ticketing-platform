@@ -554,7 +554,7 @@ UNKNOWN_ORDER_ID=$(uuid_v4)
 UNKNOWN_ENVELOPE=$(cat <<EOF
 {
   "eventId": "${UNKNOWN_EVENT_ID}",
-  "eventType": "order.payment.requested",
+  "eventType": "order.unrecognized.event",
   "occurredAt": "$(iso_now)",
   "correlationId": "$(uuid_v4)",
   "schemaVersion": 1,

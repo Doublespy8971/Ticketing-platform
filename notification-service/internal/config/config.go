@@ -6,20 +6,28 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	"github.com/google/uuid"
 )
 
 type Config struct {
-	ServerPort                   int
-	RedisHost                    string
-	RedisPort                    int
-	KafkaBootstrapServers        []string
-	NotificationDedupTTL         time.Duration
-	KafkaGroupID                 string
-	KafkaTopic                   string
-	SenderMaxAttempts            int
-	SenderInitialBackoff         time.Duration
-	SenderMaxBackoff             time.Duration
-	RedisMaxPollInterval         time.Duration
+	WorkerID              string
+	ServerPort            int
+	RedisHost             string
+	RedisPort             int
+	RedisPassword         string
+	RedisDB               int
+	RedisTLSEnabled       bool
+	KafkaBootstrapServers []string
+	NotificationDedupTTL  time.Duration
+	NotificationClaimTTL  time.Duration
+	KafkaGroupID          string
+	KafkaTopic            string
+	SenderMaxAttempts     int
+	SenderInitialBackoff  time.Duration
+	SenderMaxBackoff      time.Duration
+	SenderTimeout         time.Duration
+	RedisMaxPollInterval  time.Duration
 }
 
 func (c *Config) ServerAddr() string {
@@ -48,6 +56,25 @@ func LoadConfig() (*Config, error) {
 		return nil, fmt.Errorf("invalid REDIS_PORT %q: must be integer between 1 and 65535", redisPortStr)
 	}
 
+	redisPassword := getEnv("REDIS_PASSWORD", "")
+
+	redisDBStr := getEnv("REDIS_DB", "0")
+	redisDB, err := strconv.Atoi(redisDBStr)
+	if err != nil || redisDB < 0 {
+		return nil, fmt.Errorf("invalid REDIS_DB %q: must be integer >= 0", redisDBStr)
+	}
+
+	redisTLSStr := strings.ToLower(strings.TrimSpace(getEnv("REDIS_TLS_ENABLED", "false")))
+	var redisTLSEnabled bool
+	switch redisTLSStr {
+	case "true", "1", "yes":
+		redisTLSEnabled = true
+	case "false", "0", "no", "":
+		redisTLSEnabled = false
+	default:
+		return nil, fmt.Errorf("invalid REDIS_TLS_ENABLED %q: must be boolean (true/false)", redisTLSStr)
+	}
+
 	bootstrapServersStr := getEnv("KAFKA_BOOTSTRAP_SERVERS", "localhost:29092")
 	var bootstrapServers []string
 	for _, s := range strings.Split(bootstrapServersStr, ",") {
@@ -64,6 +91,12 @@ func LoadConfig() (*Config, error) {
 	dedupTTLSec, err := strconv.Atoi(dedupTTLStr)
 	if err != nil || dedupTTLSec <= 0 {
 		return nil, fmt.Errorf("invalid NOTIFICATION_DEDUP_TTL_SECONDS %q: must be positive integer", dedupTTLStr)
+	}
+
+	claimTTLStr := getEnv("NOTIFICATION_CLAIM_TTL_SECONDS", "60")
+	claimTTLSec, err := strconv.Atoi(claimTTLStr)
+	if err != nil || claimTTLSec <= 0 {
+		return nil, fmt.Errorf("invalid NOTIFICATION_CLAIM_TTL_SECONDS %q: must be positive integer", claimTTLStr)
 	}
 
 	groupID := getEnv("KAFKA_GROUP_ID", "notification-service-order-cg")
@@ -94,23 +127,51 @@ func LoadConfig() (*Config, error) {
 		return nil, fmt.Errorf("invalid NOTIFICATION_SENDER_MAX_BACKOFF_MS %q: must be integer >= initial backoff (%d ms)", maxBackoffMsStr, initialBackoffMs)
 	}
 
+	senderTimeoutMsStr := getEnv("NOTIFICATION_SENDER_TIMEOUT_MS", "5000")
+	senderTimeoutMs, err := strconv.Atoi(senderTimeoutMsStr)
+	if err != nil || senderTimeoutMs <= 0 {
+		return nil, fmt.Errorf("invalid NOTIFICATION_SENDER_TIMEOUT_MS %q: must be positive integer", senderTimeoutMsStr)
+	}
+
 	maxPollIntervalMsStr := getEnv("REDIS_MAX_POLL_INTERVAL_MS", "300000")
 	maxPollIntervalMs, err := strconv.Atoi(maxPollIntervalMsStr)
 	if err != nil || maxPollIntervalMs <= 0 {
 		return nil, fmt.Errorf("invalid REDIS_MAX_POLL_INTERVAL_MS %q: must be positive integer", maxPollIntervalMsStr)
 	}
 
+	// Validate that claim TTL exceeds worst-case send time (attempts * timeout + backoff sum)
+	var backoffSum time.Duration
+	curBackoff := time.Duration(initialBackoffMs) * time.Millisecond
+	for i := 1; i < maxAttempts; i++ {
+		backoffSum += curBackoff
+		curBackoff = curBackoff * 2
+		if curBackoff > time.Duration(maxBackoffMs)*time.Millisecond {
+			curBackoff = time.Duration(maxBackoffMs) * time.Millisecond
+		}
+	}
+	worstCaseSendTime := time.Duration(maxAttempts)*time.Duration(senderTimeoutMs)*time.Millisecond + backoffSum
+	if time.Duration(claimTTLSec)*time.Second <= worstCaseSendTime {
+		return nil, fmt.Errorf("NOTIFICATION_CLAIM_TTL_SECONDS (%ds) must exceed worst case send time (%v = %d attempts * %v timeout + %v backoff sum)",
+			claimTTLSec, worstCaseSendTime, maxAttempts, time.Duration(senderTimeoutMs)*time.Millisecond, backoffSum)
+	}
+
 	return &Config{
+		WorkerID:              uuid.NewString(),
 		ServerPort:            port,
 		RedisHost:             redisHost,
 		RedisPort:             redisPort,
+		RedisPassword:         redisPassword,
+		RedisDB:               redisDB,
+		RedisTLSEnabled:       redisTLSEnabled,
 		KafkaBootstrapServers: bootstrapServers,
 		NotificationDedupTTL:  time.Duration(dedupTTLSec) * time.Second,
+		NotificationClaimTTL:  time.Duration(claimTTLSec) * time.Second,
 		KafkaGroupID:          groupID,
 		KafkaTopic:            topic,
 		SenderMaxAttempts:     maxAttempts,
 		SenderInitialBackoff:  time.Duration(initialBackoffMs) * time.Millisecond,
 		SenderMaxBackoff:      time.Duration(maxBackoffMs) * time.Millisecond,
+		SenderTimeout:         time.Duration(senderTimeoutMs) * time.Millisecond,
 		RedisMaxPollInterval:  time.Duration(maxPollIntervalMs) * time.Millisecond,
 	}, nil
 }

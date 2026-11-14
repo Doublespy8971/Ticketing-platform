@@ -120,3 +120,30 @@ func TestReadinessHandlerRedisDown(t *testing.T) {
 		t.Fatalf("expected Redis DOWN, got %+v", resp)
 	}
 }
+
+func TestReadinessHandlerShuttingDown(t *testing.T) {
+	h := NewHealthHandler(
+		func(ctx context.Context) error { return nil },
+		func(ctx context.Context) error { return nil },
+		1*time.Second,
+	)
+
+	h.SetShuttingDown()
+
+	req := httptest.NewRequest(http.MethodGet, "/ready", nil)
+	rec := httptest.NewRecorder()
+
+	h.ReadinessHandler(rec, req)
+
+	if rec.Code != http.StatusServiceUnavailable {
+		t.Fatalf("expected 503 Service Unavailable when shutting down, got %d", rec.Code)
+	}
+
+	var resp ReadinessResponse
+	if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("failed to parse json response: %v", err)
+	}
+	if resp.Status != "DOWN" {
+		t.Fatalf("expected status DOWN when shutting down, got %s", resp.Status)
+	}
+}

@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"crypto/tls"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -39,21 +40,40 @@ func main() {
 	logger.Info("Starting notification-service",
 		slog.Int("port", cfg.ServerPort),
 		slog.String("redisAddr", cfg.RedisAddr()),
+		slog.Int("redisDB", cfg.RedisDB),
+		slog.Bool("redisTLS", cfg.RedisTLSEnabled),
 		slog.Any("kafkaBrokers", cfg.KafkaBootstrapServers),
 		slog.String("kafkaTopic", cfg.KafkaTopic),
 		slog.String("kafkaGroup", cfg.KafkaGroupID),
+		slog.String("workerId", cfg.WorkerID),
 	)
 
-	// Redis client
+	// Redis client with password, DB and optional TLS (never logging password)
+	var tlsConfig *tls.Config
+	if cfg.RedisTLSEnabled {
+		tlsConfig = &tls.Config{
+			MinVersion: tls.VersionTLS12,
+		}
+	}
 	rdb := redis.NewClient(&redis.Options{
-		Addr: cfg.RedisAddr(),
+		Addr:      cfg.RedisAddr(),
+		Password:  cfg.RedisPassword,
+		DB:        cfg.RedisDB,
+		TLSConfig: tlsConfig,
 	})
-
-	// Dedup
-	deduplicator := dedup.NewRedisDeduplicator(rdb, cfg.KafkaGroupID, cfg.NotificationDedupTTL)
 
 	// Metrics
 	m := metrics.NewMetrics()
+
+	// Dedup with two-phase claim and ownership
+	deduplicator := dedup.NewRedisDeduplicator(
+		rdb,
+		cfg.KafkaGroupID,
+		cfg.NotificationDedupTTL,
+		dedup.WithRedisWorkerID(cfg.WorkerID),
+		dedup.WithRedisClaimTTL(cfg.NotificationClaimTTL),
+		dedup.WithRedisMetrics(m),
+	)
 
 	// Sender (structured JSON logger)
 	sender := notify.NewLogSender(os.Stdout)
@@ -110,14 +130,15 @@ func main() {
 		Handler: mux,
 	}
 
-	// Context for graceful shutdown
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
+	// Context for graceful drain
+	drainPeriod := 10 * time.Second
+	consumerCtx, consumerCancel := context.WithCancel(context.Background())
+	defer consumerCancel()
 
 	// Start consumer in background
 	consumerDone := make(chan error, 1)
 	go func() {
-		if err := c.Run(ctx); err != nil {
+		if err := c.Run(consumerCtx); err != nil {
 			logger.Error("Consumer terminated with error", slog.String("error", err.Error()))
 			consumerDone <- err
 			return
@@ -146,7 +167,7 @@ func main() {
 		logger.Info("Shutdown signal received, initiating graceful drain", slog.String("signal", sig.String()))
 	case err := <-consumerDone:
 		if err != nil {
-			logger.Error("Fatal consumer error, initiating shutdown", slog.String("error", err.Error()))
+			logger.Error("Consumer loop ended unexpectedly, initiating shutdown", slog.String("error", err.Error()))
 		}
 	case err := <-serverDone:
 		if err != nil {
@@ -154,23 +175,48 @@ func main() {
 		}
 	}
 
-	// Graceful shutdown with 10 second drain
-	drainCtx, drainCancel := context.WithTimeout(context.Background(), 10*time.Second)
+	// 1. Mark /ready as not ready immediately
+	healthHandler.SetShuttingDown()
+
+	// 2. Stop fetching new messages
+	c.StopFetching()
+
+	// 3. Graceful drain: let in-flight message finish using drain context of 10s
+	drainCtx, drainCancel := context.WithTimeout(context.Background(), drainPeriod)
 	defer drainCancel()
 
-	// 1. Stop consumer
-	cancel()
-	_ = reader.Close()
+	consumerExited := make(chan struct{})
+	go func() {
+		<-consumerDone
+		close(consumerExited)
+	}()
 
-	// 2. Drain and shut down HTTP server
-	if err := server.Shutdown(drainCtx); err != nil {
-		logger.Warn("HTTP server shutdown encountered error", slog.String("error", err.Error()))
+	select {
+	case <-consumerExited:
+		logger.Info("In-flight consumer processing completed cleanly")
+	case <-drainCtx.Done():
+		consumerCancel()
+		logger.Error("Drain period of 10s exceeded during shutdown; in-flight claim released, exiting non-zero")
+		_ = reader.Close()
+		_ = rdb.Close()
+		_ = server.Close()
+		os.Exit(1)
 	}
 
-	// 3. Close Redis
+	// 4. Close Kafka reader, Redis client, and HTTP server, in that order
+	if err := reader.Close(); err != nil {
+		logger.Warn("Kafka reader close encountered error", slog.String("error", err.Error()))
+	}
+
 	if err := rdb.Close(); err != nil {
 		logger.Warn("Redis client close encountered error", slog.String("error", err.Error()))
 	}
 
-	logger.Info("Graceful shutdown completed")
+	httpDrainCtx, httpDrainCancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer httpDrainCancel()
+	if err := server.Shutdown(httpDrainCtx); err != nil {
+		logger.Warn("HTTP server shutdown encountered error", slog.String("error", err.Error()))
+	}
+
+	logger.Info("Graceful shutdown completed successfully")
 }

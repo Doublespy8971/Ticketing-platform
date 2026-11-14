@@ -52,7 +52,12 @@ Every stateful Java consumer group (`inventory-service`, `order-service`, `payme
   - `kafka_dlt-exception-fqcn`
   - `kafka_dlt-exception-message`
   - `kafka_dlt-exception-stacktrace`
-- **No Retry or DLT Topics for `notification-service`**: Because customer notifications are non-critical to saga state convergence, `notification-service` does **not** have `-retry-0`, `-retry-1`, or `-dlt` topics. When `notification-service` fails to process or dispatch a notification, it logs the error at `ERROR` level, increments `ticketing_notifications_sent_total{status="FAILED"}`, commits the offset, and does not forward the message to any topic.
+- **No Retry or DLT Topics for `notification-service`**: Because customer notifications are non-critical to saga state convergence, `notification-service` does **not** have `-retry-0`, `-retry-1`, or `-dlt` topics. Delivery semantics and deduplication are governed by a two-phase Redis claim with worker ownership:
+  - **Key Format**: `notif:dedup:{consumerGroup}:{eventId}`
+  - **Two-Phase Lifecycle**: When an event is consumed, the worker acquires an in-progress claim (`SET key <workerId>:IN_PROGRESS NX EX 60`). Upon successful dispatch, the worker promotes the claim to `"SENT"` with a 7-day TTL (`604800s`) via compare-and-set Lua. If another worker holds `IN_PROGRESS`, the consumer polls every 500ms up to `claimTTL + 5s` until it transitions to `SENT` (duplicate) or expires (re-claimed).
+  - **At-Least-Once Delivery Before Exhaustion**: If a delivery attempt fails or the process is gracefully interrupted/cancelled/panics before promotion, the claim is released via compare-and-delete Lua on a fresh context with a 2-second timeout, ensuring the uncommitted event will be retried upon redelivery.
+  - **At-Most-Once Delivery After Exhaustion**: When all retry attempts are exhausted, `notification-service` logs the error at `ERROR` level, increments `notification_events_total{outcome="failed"}` and `ticketing_notifications_sent_total{status="FAILED"}`, releases the in-progress claim via compare-and-delete (enabling optional manual redelivery), and commits the Kafka offset without forwarding to any retry or DLT topic.
+  - **Residual Crash Risk**: If the process crashes abruptly (e.g. `SIGKILL`, host failure) after a successful send but before promotion to `"SENT"`, the uncommitted Kafka offset will cause redelivery after the 60-second `IN_PROGRESS` TTL expires, potentially dispatching a duplicate notification.
 
 #### Complete Retry & Dead-Letter Topics Table
 

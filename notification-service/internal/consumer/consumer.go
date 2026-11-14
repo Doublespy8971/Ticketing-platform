@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"sync/atomic"
 	"time"
 
 	"github.com/segmentio/kafka-go"
@@ -30,6 +31,9 @@ type Consumer struct {
 	initialBackoff  time.Duration
 	maxBackoff      time.Duration
 	maxPollInterval time.Duration
+
+	stopping      atomic.Bool
+	stopFetchChan chan struct{}
 }
 
 type Options struct {
@@ -78,35 +82,99 @@ func NewConsumer(
 		initialBackoff:  initialBackoff,
 		maxBackoff:      maxBackoff,
 		maxPollInterval: maxPollInterval,
+		stopFetchChan:   make(chan struct{}),
+	}
+}
+
+func (c *Consumer) StopFetching() {
+	if c.stopping.CompareAndSwap(false, true) {
+		close(c.stopFetchChan)
 	}
 }
 
 func (c *Consumer) Run(ctx context.Context) error {
+	fetchBackoff := 500 * time.Millisecond
+	maxFetchBackoff := 10 * time.Second
+
 	for {
 		select {
 		case <-ctx.Done():
 			return nil
+		case <-c.stopFetchChan:
+			return nil
 		default:
 		}
 
-		msg, err := c.reader.FetchMessage(ctx)
+		if c.stopping.Load() {
+			return nil
+		}
+
+		// Create a fetch context that cancels if ctx cancels or StopFetching is called
+		fetchCtx, fetchCancel := context.WithCancel(ctx)
+		go func() {
+			select {
+			case <-c.stopFetchChan:
+				fetchCancel()
+			case <-fetchCtx.Done():
+			}
+		}()
+
+		msg, err := c.reader.FetchMessage(fetchCtx)
+		fetchCancel()
+
 		if err != nil {
-			if errors.Is(err, context.Canceled) || ctx.Err() != nil {
+			if errors.Is(err, context.Canceled) || ctx.Err() != nil || c.stopping.Load() {
 				return nil
 			}
-			return fmt.Errorf("kafka fetch message error: %w", err)
+			c.logger.Warn("Transient Kafka fetch error, backing off",
+				slog.String("error", err.Error()),
+				slog.Duration("backoff", fetchBackoff),
+			)
+			select {
+			case <-time.After(fetchBackoff):
+				fetchBackoff = min(fetchBackoff*2, maxFetchBackoff)
+				continue
+			case <-ctx.Done():
+				return nil
+			case <-c.stopFetchChan:
+				return nil
+			}
 		}
+
+		// Reset fetch backoff on successful fetch
+		fetchBackoff = 500 * time.Millisecond
 
 		if err := c.ProcessMessage(ctx, msg); err != nil {
 			if errors.Is(err, context.Canceled) || ctx.Err() != nil {
 				return nil
 			}
-			return fmt.Errorf("critical error processing message, halting consumer: %w", err)
+			c.logger.Warn("Error processing message, continuing", slog.String("error", err.Error()))
 		}
 	}
 }
 
-func (c *Consumer) ProcessMessage(ctx context.Context, msg kafka.Message) error {
+func (c *Consumer) ProcessMessage(ctx context.Context, msg kafka.Message) (err error) {
+	var claimedEventID string
+
+	// Panic recovery: catch panic, log topic/partition/offset and panic type, release claim, commit offset, continue
+	defer func() {
+		if r := recover(); r != nil {
+			c.logger.Error("Panic recovered during message processing, discarding poison pill",
+				slog.String("topic", msg.Topic),
+				slog.Int("partition", msg.Partition),
+				slog.Int64("offset", msg.Offset),
+				slog.String("panicType", fmt.Sprintf("%T", r)),
+				slog.Any("panic", r),
+			)
+			c.metrics.RecordEvent("unknown", metrics.OutcomeInvalid)
+			if claimedEventID != "" {
+				c.releaseClaimFreshContext(claimedEventID, metrics.ReleaseReasonPanic)
+			}
+			_ = c.commitWithRetry(ctx, msg)
+			err = nil // Never terminate process on panic
+		}
+	}()
+
 	env, err := events.ParseEnvelope(msg.Value)
 	if err != nil {
 		c.logger.Warn("Invalid record envelope, discarding and committing offset",
@@ -116,12 +184,12 @@ func (c *Consumer) ProcessMessage(ctx context.Context, msg kafka.Message) error 
 			slog.String("error", err.Error()),
 		)
 		c.metrics.RecordEvent("unknown", metrics.OutcomeInvalid)
-		return c.reader.CommitMessages(ctx, msg)
+		return c.commitWithRetry(ctx, msg)
 	}
 
 	if !events.IsHandledEventType(env.EventType) {
 		c.metrics.RecordEvent(env.EventType, metrics.OutcomeIgnored)
-		return c.reader.CommitMessages(ctx, msg)
+		return c.commitWithRetry(ctx, msg)
 	}
 
 	notif, handled, err := notify.MapEventToNotification(env)
@@ -135,12 +203,12 @@ func (c *Consumer) ProcessMessage(ctx context.Context, msg kafka.Message) error 
 			slog.String("error", err.Error()),
 		)
 		c.metrics.RecordEvent(env.EventType, metrics.OutcomeInvalid)
-		return c.reader.CommitMessages(ctx, msg)
+		return c.commitWithRetry(ctx, msg)
 	}
 
 	if !handled || notif == nil {
 		c.metrics.RecordEvent(env.EventType, metrics.OutcomeIgnored)
-		return c.reader.CommitMessages(ctx, msg)
+		return c.commitWithRetry(ctx, msg)
 	}
 
 	// Extract correlationId from header if missing from envelope
@@ -153,7 +221,7 @@ func (c *Consumer) ProcessMessage(ctx context.Context, msg kafka.Message) error 
 		}
 	}
 
-	// Claim deduplication
+	// Two-phase deduplication claim: SET <workerId>:IN_PROGRESS NX EX 60
 	claimed, err := c.dedup.Claim(ctx, env.EventID)
 	if err != nil {
 		c.metrics.RecordRedisError()
@@ -175,10 +243,12 @@ func (c *Consumer) ProcessMessage(ctx context.Context, msg kafka.Message) error 
 	}
 
 	if !claimed {
-		// Duplicate event
+		// Duplicate event (value is "SENT")
 		c.metrics.RecordEvent(env.EventType, metrics.OutcomeDuplicate)
-		return c.reader.CommitMessages(ctx, msg)
+		return c.commitWithRetry(ctx, msg)
 	}
+
+	claimedEventID = env.EventID
 
 	// Dispatch notification with retry and backoff
 	start := time.Now()
@@ -196,6 +266,7 @@ func (c *Consumer) ProcessMessage(ctx context.Context, msg kafka.Message) error 
 			case <-time.After(backoff):
 				backoff = min(backoff*2, c.maxBackoff)
 			case <-ctx.Done():
+				c.releaseClaimFreshContext(claimedEventID, metrics.ReleaseReasonCancelled)
 				return ctx.Err()
 			}
 		}
@@ -204,16 +275,25 @@ func (c *Consumer) ProcessMessage(ctx context.Context, msg kafka.Message) error 
 	if sendErr == nil {
 		c.metrics.ObserveSendDuration(time.Since(start).Seconds())
 		c.metrics.RecordEvent(env.EventType, metrics.OutcomeSent)
-		return c.reader.CommitMessages(ctx, msg)
+
+		// Promote from <workerId>:IN_PROGRESS to SENT with full 7-day TTL
+		if promErr := c.dedup.Promote(ctx, env.EventID); promErr != nil {
+			c.logger.Warn("Failed to promote claim to SENT",
+				slog.String("eventId", env.EventID),
+				slog.String("error", promErr.Error()),
+			)
+			c.releaseClaimFreshContext(claimedEventID, metrics.ReleaseReasonCommitError)
+			return promErr
+		}
+		// Claim promoted successfully; no release needed on exit
+		claimedEventID = ""
+
+		return c.commitWithRetry(ctx, msg)
 	}
 
-	// Sender failed after all attempts
-	if delErr := c.dedup.Release(ctx, env.EventID); delErr != nil {
-		c.logger.Warn("Failed to delete deduplication key after sender failure",
-			slog.String("eventId", env.EventID),
-			slog.String("error", delErr.Error()),
-		)
-	}
+	// Sender failed after all attempts: release claim with compare-and-delete
+	c.releaseClaimFreshContext(claimedEventID, metrics.ReleaseReasonFailure)
+	claimedEventID = ""
 
 	c.metrics.RecordEvent(env.EventType, metrics.OutcomeFailed)
 	c.logger.Error("Notification dispatch failed after all retry attempts, committing offset (at-most-once delivery by design)",
@@ -224,7 +304,56 @@ func (c *Consumer) ProcessMessage(ctx context.Context, msg kafka.Message) error 
 		slog.String("error", sendErr.Error()),
 	)
 
-	return c.reader.CommitMessages(ctx, msg)
+	return c.commitWithRetry(ctx, msg)
+}
+
+func (c *Consumer) releaseClaimFreshContext(eventID, reason string) {
+	if eventID == "" {
+		return
+	}
+	releaseCtx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	if err := c.dedup.Release(releaseCtx, eventID, reason); err != nil {
+		c.logger.Warn("Failed to release deduplication claim on exit path",
+			slog.String("eventId", eventID),
+			slog.String("reason", reason),
+			slog.String("error", err.Error()),
+		)
+	}
+}
+
+func (c *Consumer) commitWithRetry(ctx context.Context, msg kafka.Message) error {
+	backoff := 500 * time.Millisecond
+	maxBackoff := 10 * time.Second
+	var lastErr error
+
+	for i := 1; i <= 5; i++ {
+		err := c.reader.CommitMessages(ctx, msg)
+		if err == nil {
+			return nil
+		}
+		if errors.Is(err, context.Canceled) || ctx.Err() != nil {
+			return err
+		}
+		lastErr = err
+		c.logger.Warn("Transient Kafka commit error, retrying",
+			slog.Int("attempt", i),
+			slog.String("error", err.Error()),
+			slog.Duration("backoff", backoff),
+		)
+		select {
+		case <-time.After(backoff):
+			backoff = min(backoff*2, maxBackoff)
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+	}
+
+	c.logger.Error("Kafka commit failed after 5 retries (safe because SENT key prevents duplicate on redelivery)",
+		slog.Int64("offset", msg.Offset),
+		slog.String("error", lastErr.Error()),
+	)
+	return lastErr
 }
 
 func (c *Consumer) retryDedupClaim(ctx context.Context, eventID string) (bool, error) {

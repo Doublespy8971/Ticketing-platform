@@ -426,6 +426,8 @@ func TestIntegration_HealthReadyMetricsEndpoints(t *testing.T) {
 	m.RecordEvent("unknown", metrics.OutcomeInvalid)
 	m.RecordRedisError()
 	m.ObserveSendDuration(0.05)
+	m.RecordClaimWait()
+	m.RecordClaimRelease("failure")
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("/health", h.LivenessHandler)
@@ -499,6 +501,8 @@ func TestIntegration_HealthReadyMetricsEndpoints(t *testing.T) {
 		"notification_events_total",
 		"notification_send_duration_seconds",
 		"notification_dedup_redis_errors_total",
+		"notification_claim_wait_total",
+		"notification_claim_release_total",
 	}
 	for _, name := range requiredMetricNames {
 		if !strings.Contains(metricsStr, name) {

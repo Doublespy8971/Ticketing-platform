@@ -15,14 +15,36 @@ const (
 	OutcomeInvalid   = "invalid"
 	OutcomeIgnored   = "ignored"
 	OutcomeFailed    = "failed"
+
+	ReleaseReasonFailure     = "failure"
+	ReleaseReasonCancelled   = "cancelled"
+	ReleaseReasonPanic       = "panic"
+	ReleaseReasonCommitError = "commit_error"
 )
 
+var CanonicalEventTypes = map[string]bool{
+	"inventory.seat.reserved":              true,
+	"inventory.seat.released":              true,
+	"inventory.reservation.expired":        true,
+	"inventory.seat.confirmed":             true,
+	"inventory.seat.confirmation_rejected": true,
+	"order.payment.requested":              true,
+	"order.refund.requested":               true,
+	"order.confirmed":                      true,
+	"order.cancelled":                      true,
+	"payment.succeeded":                    true,
+	"payment.failed":                       true,
+	"payment.refunded":                     true,
+}
+
 type Metrics struct {
-	Registry                    *prometheus.Registry
-	NotificationEventsTotal     *prometheus.CounterVec
-	NotificationSendDuration    *prometheus.HistogramVec
+	Registry                     *prometheus.Registry
+	NotificationEventsTotal      *prometheus.CounterVec
+	NotificationSendDuration     *prometheus.HistogramVec
 	NotificationDedupRedisErrors *prometheus.CounterVec
-	LegacyNotificationsSent     *prometheus.CounterVec
+	LegacyNotificationsSent      *prometheus.CounterVec
+	NotificationClaimWaitTotal   *prometheus.CounterVec
+	NotificationClaimReleaseTotal *prometheus.CounterVec
 }
 
 func NewMetrics() *Metrics {
@@ -61,14 +83,32 @@ func NewMetrics() *Metrics {
 		[]string{"service", "event_type", "status"},
 	)
 
-	reg.MustRegister(eventsTotal, sendDuration, redisErrors, legacySent)
+	claimWaitTotal := prometheus.NewCounterVec(
+		prometheus.CounterOpts{
+			Name: "notification_claim_wait_total",
+			Help: "Total times a worker waited on an in-progress deduplication claim held by another worker",
+		},
+		[]string{"service"},
+	)
+
+	claimReleaseTotal := prometheus.NewCounterVec(
+		prometheus.CounterOpts{
+			Name: "notification_claim_release_total",
+			Help: "Total deduplication claims released before promotion partitioned by reason",
+		},
+		[]string{"service", "reason"},
+	)
+
+	reg.MustRegister(eventsTotal, sendDuration, redisErrors, legacySent, claimWaitTotal, claimReleaseTotal)
 
 	return &Metrics{
-		Registry:                     reg,
-		NotificationEventsTotal:      eventsTotal,
-		NotificationSendDuration:     sendDuration,
-		NotificationDedupRedisErrors: redisErrors,
-		LegacyNotificationsSent:      legacySent,
+		Registry:                      reg,
+		NotificationEventsTotal:       eventsTotal,
+		NotificationSendDuration:      sendDuration,
+		NotificationDedupRedisErrors:  redisErrors,
+		LegacyNotificationsSent:       legacySent,
+		NotificationClaimWaitTotal:    claimWaitTotal,
+		NotificationClaimReleaseTotal: claimReleaseTotal,
 	}
 }
 
@@ -99,11 +139,22 @@ func (m *Metrics) RecordRedisError() {
 	m.NotificationDedupRedisErrors.WithLabelValues(ServiceName).Inc()
 }
 
-func normalizeEventType(eventType string) string {
-	switch eventType {
-	case "order.confirmed", "order.cancelled":
-		return eventType
+func (m *Metrics) RecordClaimWait() {
+	m.NotificationClaimWaitTotal.WithLabelValues(ServiceName).Inc()
+}
+
+func (m *Metrics) RecordClaimRelease(reason string) {
+	switch reason {
+	case ReleaseReasonFailure, ReleaseReasonCancelled, ReleaseReasonPanic, ReleaseReasonCommitError:
 	default:
-		return "unknown"
+		reason = "failure"
 	}
+	m.NotificationClaimReleaseTotal.WithLabelValues(ServiceName, reason).Inc()
+}
+
+func normalizeEventType(eventType string) string {
+	if CanonicalEventTypes[eventType] {
+		return eventType
+	}
+	return "unknown"
 }

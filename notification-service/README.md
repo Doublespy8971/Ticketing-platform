@@ -11,9 +11,13 @@
   - Subscribes to topic `order.events`.
   - Consumer group: `notification-service-order-cg`.
   - Isolation level: `read_committed` (`kafka.ReadCommitted`), guaranteeing only committed transactional events are processed.
-  - Manual offset commit after processing.
+  - Manual offset commit per message with up to 5 retries.
   - **No Retry / Dead-Letter Topics**: In accordance with `docs/arch/03-kafka.md`, the notification consumer does not produce to `-retry-0`, `-retry-1`, or `-dlt` topics.
-- **Deduplication**: Uses Redis 7 with atomic `SET key value NX EX` operations to prevent duplicate notifications during Kafka at-least-once deliveries or rebalances.
+- **Two-Phase Deduplication with Ownership**:
+  - Every consumer process generates a unique random `workerId` (UUIDv4) at startup.
+  - **Phase 1 (Claim)**: `SET notif:dedup:{consumerGroup}:{eventId} <workerId>:IN_PROGRESS NX EX 60`.
+  - **Phase 2 (Promotion)**: Upon successful send, promoted to `"SENT"` with full 7-day TTL (`604800s`) via compare-and-set Lua script verifying token ownership.
+  - **Release on Failure / Exit**: If send fails all retries, or on cancellation, panic, or commit error, the claim is released via compare-and-delete Lua script on a fresh 2-second context.
 
 ---
 
@@ -25,64 +29,110 @@
               ▼
    [Envelope Parsing & Validation]
         ├── Malformed/Invalid? ──► Log WARN (topic/partition/offset, no payload) ──► outcome="invalid" ──► Commit Offset
-        └── Unknown event_type? ──────────────────────────────────────────────────► outcome="ignored" ──► Commit Offset
+        └── Unhandled event_type? ───────────────────────────────────────────────► outcome="ignored" ──► Commit Offset
               │
               ▼ (order.confirmed or order.cancelled)
-    [Redis Deduplication Claim]
-        ├── Claim Failed (Key exists) ───────────────────────────────────────────► outcome="duplicate" ──► Commit Offset
-        ├── Redis Error/Unavailable ─────────────────────────────────────────────► Retry with backoff; halt consumer if persistent (No Commit)
-        └── Claim Succeeded (Key created)
+    [Two-Phase Redis Deduplication Claim]
+        ├── Claim Succeeds (acquired <workerId>:IN_PROGRESS) ───────────────────┐
+        └── Claim Fails (Key already exists)                                    │
+              ├── Value is "SENT"? ──────────────────────────────────────────┐  │
+              └── Value is "<otherWorker>:IN_PROGRESS"?                      │  │
+                    │                                                        │  │
+                    ▼                                                        │  │
+             [Poll every 500ms up to claimTTL + 5s]                          │  │
+                    ├── Becomes "SENT"? ─────────────────────────────────────┤  │
+                    ├── Key disappears (expired/released)? ──► Re-claim ─────┼──┘
+                    └── Timeout exceeded? ──► Log warning & retry claim      │
+                                                                             │
+        ┌────────────────────────────────────────────────────────────────────┘
+        ▼
+   [Duplicate Event] ──► outcome="duplicate" ──► Commit Offset
+        │
+        ▼ (when claim is owned by this worker)
+   [Notification Dispatch (up to 3 attempts with exponential backoff)]
+        ├── Success ──► CAS Promotion to "SENT" (7-day TTL) ──► outcome="sent" ──► Commit Offset
+        ├── Exit / Interrupted / Cancelled / Panic ──► CAD Release (fresh 2s context)
+        └── All 3 Attempts Exhausted
               │
               ▼
-    [Notification Dispatch (up to 3 attempts)]
-        ├── Attempt 1 (0ms)
-        ├── Attempt 2 (backoff 200ms)
-        └── Attempt 3 (backoff 400ms / 800ms)
-              │
-              ├── Delivery Success ──────────────────────────────────────────────► outcome="sent" ──► Commit Offset
-              └── All 3 Attempts Failed
-                    │
-                    ▼
-          [At-Most-Once Exhaustion Policy]
-          1. Delete Redis dedup key (enables manual replay/re-delivery later)
-          2. Log ERROR (eventId, eventType, error - NO tokens or PII)
-          3. Metric: outcome="failed"
-          4. Commit Kafka Offset (at-most-once after exhaustion)
+   [At-Most-Once Exhaustion Policy]
+   1. CAD Release claim from Redis (allows optional manual replay later)
+   2. Log ERROR (eventId, eventType, orderId, attempts - NO tokens or PII)
+   3. Metric: outcome="failed", reason="failure"
+   4. Commit Kafka offset with up to 5 retries
 ```
 
 ---
 
-## 3. Deduplication Strategy
+## 3. Two-Phase Deduplication Strategy & Ownership Scripts
 
+### 3.1 Key Format & Values
 - **Key Format**: `notif:dedup:{consumerGroup}:{eventId}`
   - Example: `notif:dedup:notification-service-order-cg:550e8400-e29b-41d4-a716-446655440000`
-  - Includes `consumerGroup` to prevent key collisions across distinct consumer groups.
-- **TTL**: 7 days (`604800` seconds), configurable via `NOTIFICATION_DEDUP_TTL_SECONDS`.
-- **Atomic Claim**: `SET key 1 NX EX {ttl}`
-- **Redis Outage Safety**: If Redis is unreachable during the dedup claim, the consumer does **not** commit the offset and does **not** dispatch the notification. It retries with backoff up to `max.poll.interval.ms`. If Redis remains down, the consumer halts so no messages are dropped or acknowledged prematurely.
+- **Values & TTLs**:
+  - `IN_PROGRESS`: `<workerId>:IN_PROGRESS` (TTL `60s`, configurable via `NOTIFICATION_CLAIM_TTL_SECONDS`).
+  - `SENT`: `"SENT"` (TTL 7 days / `604800s`, configurable via `NOTIFICATION_DEDUP_TTL_SECONDS`).
+
+### 3.2 Atomic Lua Scripts
+1. **CAS Promotion (`promote_notification.lua`)**:
+   Promotes `<workerId>:IN_PROGRESS` to `"SENT"` with 7-day TTL only if the current value matches this worker's token:
+   ```lua
+   local val = redis.call('GET', KEYS[1])
+   if val == ARGV[1] then
+       redis.call('SET', KEYS[1], ARGV[2], 'EX', tonumber(ARGV[3]))
+       return 1
+   else
+       return 0
+   end
+   ```
+2. **CAD Release (`release_notification.lua`)**:
+   Deletes `<workerId>:IN_PROGRESS` only if the current value matches this worker's token, preventing accidental deletion of another worker's in-progress claim:
+   ```lua
+   local val = redis.call('GET', KEYS[1])
+   if val == ARGV[1] then
+       return redis.call('DEL', KEYS[1])
+   else
+       return 0
+   end
+   ```
 
 ---
 
-## 4. At-Most-Once After Exhaustion Policy
+## 4. Delivery Guarantees & Residual Risks
 
-Because customer notifications (emails, SMS) are informational and non-transactional, notification delivery must never block consumer progress on `order.events` indefinitely when an external notification gateway suffers an outage.
-- When all 3 delivery attempts are exhausted:
-  1. The Redis deduplication key is deleted via `DEL key`, so that if the event is re-injected or re-delivered manually, it will not be rejected as a duplicate.
-  2. The failure is recorded in Prometheus metrics (`notification_events_total{outcome="failed"}`).
-  3. A structured error log is emitted with `eventId` and `eventType` (excluding all customer PII and credentials).
-  4. The Kafka offset is committed, allowing the consumer group to advance.
+- **At-Least-Once Delivery Before Exhaustion**: If a message delivery fails before reaching the maximum retry count, or if processing is cancelled or interrupted by shutdown, the in-progress claim is immediately deleted via compare-and-delete on an uncancelled context (2s timeout), guaranteeing that subsequent redeliveries will re-claim and re-try delivery.
+- **At-Most-Once Delivery After Exhaustion**: When all 3 delivery attempts are exhausted without success, the in-progress claim is deleted (permitting manual replay), an `ERROR` log is emitted, and the offset is committed to prevent blocking the consumer partition.
+- **Residual Crash Risk**: If the consumer process suffers an abrupt, uncatchable crash (`SIGKILL`, host power loss, OOM) after a notification has been successfully transmitted over the network but before the CAS promotion to `"SENT"` completes, the Kafka offset remains uncommitted. When the partition is assigned to another worker, the message will be redelivered. Once the 60-second `IN_PROGRESS` TTL expires, the new worker will re-claim the key and transmit a duplicate notification (at most once).
 
 ---
 
-## 5. Metrics & Observability
+## 5. Fault Tolerance & Operational Hardening
+
+1. **Panic Recovery**: Every message processing cycle is wrapped in a `recover()` block. If a panic occurs, topic, partition, offset, and panic type are logged (never the payload), `outcome="invalid"` is recorded, any held claim is released on a fresh 2-second context with `reason="panic"`, the offset is committed to bypass the poison pill, and the process continues running.
+2. **Transient Kafka Errors**:
+   - `FetchMessage` errors other than context cancellation do not terminate the loop: the consumer logs a `WARN`, backs off exponentially (500ms to 10s), and resumes fetching.
+   - `CommitMessages` retries up to 5 times with exponential backoff (500ms to 10s). If all retries fail, it is safe because the `"SENT"` Redis key prevents duplicate dispatches on redelivery.
+3. **Graceful Shutdown**:
+   - On `SIGTERM` or `SIGINT`:
+     1. Immediately marks `/ready` as not ready (HTTP 503 `DOWN`).
+     2. Stops fetching new Kafka messages (`StopFetching()`).
+     3. Allows in-flight message processing and offset commit up to the 10-second drain period.
+     4. Closes Kafka reader, Redis client, and HTTP server, in that exact order.
+     5. If the 10-second drain period is exceeded, releases the in-flight claim on a fresh context (`reason="cancelled"`) and exits non-zero (`os.Exit(1)`).
+
+---
+
+## 6. Metrics & Observability
 
 Exposed at `GET /metrics` in Prometheus exposition format:
 
 | Metric Name | Type | Labels | Description |
 | :--- | :--- | :--- | :--- |
-| `notification_events_total` | Counter | `outcome` (`sent`, `duplicate`, `ignored`, `invalid`, `failed`) | Kafka events processed by outcome. |
-| `notification_send_duration_seconds` | Histogram | (none) | Duration of external notification send attempts. |
-| `notification_dedup_redis_errors_total` | Counter | (none) | Total Redis errors encountered during dedup operations. |
+| `notification_events_total` | Counter | `service`, `event_type`, `outcome` (`sent`, `duplicate`, `ignored`, `invalid`, `failed`) | Events processed partitioned by canonical event type and outcome. |
+| `notification_send_duration_seconds` | Histogram | `service` | Duration of external notification send attempts. |
+| `notification_dedup_redis_errors_total` | Counter | `service` | Total Redis errors encountered during deduplication claims or releases. |
+| `notification_claim_wait_total` | Counter | `service` | Total times a worker waited on an in-progress deduplication claim held by another worker. |
+| `notification_claim_release_total` | Counter | `service`, `reason` (`failure`, `cancelled`, `panic`, `commit_error`) | Total deduplication claims released before promotion partitioned by reason. |
 | `ticketing_notifications_sent_total` | Counter | `service`, `event_type`, `status` (`SENT`, `DEDUPLICATED`, `FAILED`) | Cross-service notification count partitioned by event type and status. |
 
 ### Health Endpoints
@@ -90,13 +140,13 @@ Exposed at `GET /metrics` in Prometheus exposition format:
 - **Liveness**: `GET /health` and `GET /health/liveness`
   - Returns HTTP 200 `{"status":"UP"}`.
 - **Readiness**: `GET /ready` and `GET /health/readiness`
-  - Performs live connectivity probes against Redis (`PING`) and Kafka bootstrap brokers.
-  - Returns HTTP 200 `{"status":"UP"}` when both dependencies respond.
-  - Returns HTTP 503 `{"status":"DOWN"}` without leaking internal addresses or credentials.
+  - Probes live Kafka and Redis connectivity.
+  - Returns HTTP 200 `{"status":"UP"}` when both respond and not shutting down.
+  - Returns HTTP 503 `{"status":"DOWN"}` during shutdown or when either dependency fails.
 
 ---
 
-## 6. Configuration
+## 7. Configuration Reference
 
 All configuration is provided via environment variables with defaults for local development:
 
@@ -104,24 +154,20 @@ All configuration is provided via environment variables with defaults for local 
 | :--- | :--- | :--- |
 | `SERVER_PORT` | `8084` | HTTP listening port for health and metrics endpoints. |
 | `KAFKA_BOOTSTRAP_SERVERS` | `localhost:29092` | Kafka broker bootstrap list (comma-separated). |
-| `KAFKA_TOPIC` | `order.events` | Source topic for order lifecycle events. |
+| `KAFKA_TOPIC` | `order.events` | Source topic for order domain events. |
 | `KAFKA_CONSUMER_GROUP` | `notification-service-order-cg` | Kafka consumer group name. |
 | `REDIS_HOST` | `localhost` | Redis server hostname. |
 | `REDIS_PORT` | `6379` | Redis server port. |
-| `REDIS_PASSWORD` | *(empty)* | Optional Redis password. |
-| `NOTIFICATION_DEDUP_TTL_SECONDS` | `604800` | Redis key TTL (7 days) for event deduplication. |
-| `NOTIFICATION_SENDER_TYPE` | `log` | Notification sender implementation (`log`, `failing`, `slow`). |
-| `LOG_LEVEL` | `info` | Logging verbosity (`debug`, `info`, `warn`, `error`). |
-
----
-
-## 7. Assumptions & Design Decisions
-
-Where architecture specifications were silent, the following engineering choices were made:
-1. **Deduplication Key Namespacing**: The Redis key format includes the consumer group (`notif:dedup:{consumerGroup}:{eventId}`) rather than only `notif:dedup:{eventId}` to avoid collisions if multiple services share the Redis cluster.
-2. **Payload Size Guard**: Envelope payload parsing enforces a strict 1MB JSON limit to prevent denial-of-service via memory exhaustion from rogue messages.
-3. **Structured Log Masking**: `LogSender` outputs structured JSON with customer email and message summary while strictly omitting tokens, payment keys, or unnecessary PII.
-4. **Graceful Shutdown**: Listens for `SIGINT` and `SIGTERM`, stopping the consumer loop and providing up to 10 seconds to finish in-flight delivery attempts before closing network listeners.
+| `REDIS_PASSWORD` | *(empty)* | Optional Redis password (never logged). |
+| `REDIS_DB` | `0` | Redis logical database index (integer >= 0). |
+| `REDIS_TLS_ENABLED` | `false` | Enable TLS encryption on Redis connections. |
+| `NOTIFICATION_CLAIM_TTL_SECONDS` | `60` | In-progress deduplication claim TTL in seconds (must exceed worst-case send duration). |
+| `NOTIFICATION_DEDUP_TTL_SECONDS` | `604800` | Full retention TTL (7 days) for `"SENT"` deduplication keys. |
+| `NOTIFICATION_SENDER_MAX_ATTEMPTS` | `3` | Maximum notification dispatch attempts per event. |
+| `NOTIFICATION_SENDER_INITIAL_BACKOFF_MS` | `200` | Initial backoff delay between dispatch attempts in ms. |
+| `NOTIFICATION_SENDER_MAX_BACKOFF_MS` | `800` | Maximum backoff delay between dispatch attempts in ms. |
+| `NOTIFICATION_SENDER_TIMEOUT_MS` | `5000` | Timeout per send attempt in ms. |
+| `REDIS_MAX_POLL_INTERVAL_MS` | `300000` | Maximum polling duration when Redis is unavailable (5 minutes). |
 
 ---
 
@@ -136,11 +182,6 @@ make run-notification
 ```bash
 cd notification-service
 go test -v ./...
-```
-
-### Docker Build
-```bash
-docker build -t ticketing/notification-service:latest -f notification-service/Dockerfile notification-service
 ```
 
 ### Live Smoke Test

@@ -8,7 +8,7 @@
 | `seat:{eventId}:{seatId}` | `STRING` | `"{reservationId}"` (while held) or `"SOLD"` (once confirmed) | **`660`** while `HELD`; **No TTL (never expires)** once `SOLD` | `inventory-service` | Atomic per-seat concurrency lock. **660s TTL while `HELD` is strictly 60s longer than PostgreSQL `expires_at` (600s)** as a safety net so Redis never expires a held seat before PostgreSQL. Once `SOLD`, the key has no TTL and never expires. |
 | `ratelimit:user:{userId}` | `HASH` | `tokens` (float), `last_refill_ms` (int64) | `60` | `gateway-service` | Per-user token-bucket rate limiter (10 req/s burst, 5 req/s sustained). |
 | `ratelimit:ip:{ipAddress}` | `HASH` | `tokens` (float), `last_refill_ms` (int64) | `60` | `gateway-service` | Per-IP token-bucket rate limiter on unauthenticated endpoints (20 req/s burst, 10 req/s sustained). |
-| `notif:dedup:{eventId}` | `STRING` | `"1"` | `604800` (7 days) | `notification-service` | Stateless consumer deduplication key for `order.confirmed` and `order.cancelled`. |
+| `notif:dedup:{consumerGroup}:{eventId}` | `STRING` | `"{workerId}:IN_PROGRESS"` (while in-flight) or `"SENT"` (once delivered) | **`60`** while `IN_PROGRESS`; **`604800`** (7 days) once `SENT` | `notification-service` | Two-phase consumer deduplication key with worker ownership for `order.confirmed` and `order.cancelled`. |
 
 ---
 
@@ -136,6 +136,43 @@ tokens = tokens - 1.0
 redis.call('HMSET', KEYS[1], 'tokens', tokens, 'last_refill_ms', last_refill_ms)
 redis.call('EXPIRE', KEYS[1], 60)
 return 1
+```
+
+---
+
+#### 9.2.5 Two-Phase Notification Deduplication Lua Scripts (`notification-service`)
+
+##### A. `promote_notification.lua` (CAS Promotion to `SENT`)
+Executes after a notification is successfully dispatched. Only promotes the key if it is currently owned by this worker's token (`<workerId>:IN_PROGRESS`):
+- **`KEYS[1]`**: `notif:dedup:{consumerGroup}:{eventId}`
+- **`ARGV[1]`**: Expected token (`<workerId>:IN_PROGRESS`)
+- **`ARGV[2]`**: Value (`"SENT"`)
+- **`ARGV[3]`**: Full deduplication retention TTL (`"604800"` seconds / 7 days)
+
+```lua
+-- promote_notification.lua
+local val = redis.call('GET', KEYS[1])
+if val == ARGV[1] then
+    redis.call('SET', KEYS[1], ARGV[2], 'EX', tonumber(ARGV[3]))
+    return 1
+else
+    return 0
+end
+```
+
+##### B. `release_notification.lua` (CAD Release on Failure or Cancellation)
+Executes when all delivery attempts are exhausted or when the worker exits non-successfully before promotion. Prevents one worker from releasing another worker's in-progress claim:
+- **`KEYS[1]`**: `notif:dedup:{consumerGroup}:{eventId}`
+- **`ARGV[1]`**: Expected token (`<workerId>:IN_PROGRESS`)
+
+```lua
+-- release_notification.lua
+local val = redis.call('GET', KEYS[1])
+if val == ARGV[1] then
+    return redis.call('DEL', KEYS[1])
+else
+    return 0
+end
 ```
 
 ---

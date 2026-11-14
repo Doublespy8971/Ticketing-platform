@@ -4,15 +4,17 @@ import (
 	"context"
 	"encoding/json"
 	"net/http"
+	"sync/atomic"
 	"time"
 )
 
 type Pinger func(ctx context.Context) error
 
 type HealthHandler struct {
-	checkKafka Pinger
-	checkRedis Pinger
-	timeout    time.Duration
+	checkKafka   Pinger
+	checkRedis   Pinger
+	timeout      time.Duration
+	shuttingDown atomic.Bool
 }
 
 func NewHealthHandler(checkKafka, checkRedis Pinger, timeout time.Duration) *HealthHandler {
@@ -24,6 +26,14 @@ func NewHealthHandler(checkKafka, checkRedis Pinger, timeout time.Duration) *Hea
 		checkRedis: checkRedis,
 		timeout:    timeout,
 	}
+}
+
+func (h *HealthHandler) SetShuttingDown() {
+	h.shuttingDown.Store(true)
+}
+
+func (h *HealthHandler) IsShuttingDown() bool {
+	return h.shuttingDown.Load()
 }
 
 func (h *HealthHandler) LivenessHandler(w http.ResponseWriter, r *http.Request) {
@@ -50,6 +60,19 @@ type ReadinessResponse struct {
 func (h *HealthHandler) ReadinessHandler(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet && r.Method != http.MethodHead {
 		w.WriteHeader(http.StatusMethodNotAllowed)
+		return
+	}
+
+	if h.shuttingDown.Load() {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusServiceUnavailable)
+		if r.Method != http.MethodHead {
+			_ = json.NewEncoder(w).Encode(ReadinessResponse{
+				Status: "DOWN",
+				Kafka:  "DOWN",
+				Redis:  "DOWN",
+			})
+		}
 		return
 	}
 

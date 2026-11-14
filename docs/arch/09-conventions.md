@@ -119,6 +119,8 @@ All custom metrics use the `ticketing_` prefix, lowercase `snake_case`, and base
 | `notification_events_total` | `Counter` | `outcome` (`sent`, `duplicate`, `ignored`, `invalid`, `failed`) | `notification-service` | Total order events received by notification-service partitioned by outcome. |
 | `notification_send_duration_seconds` | `Histogram` | (none) | `notification-service` | Duration of notification send attempts in seconds. |
 | `notification_dedup_redis_errors_total` | `Counter` | (none) | `notification-service` | Total Redis errors encountered during deduplication claims or releases. |
+| `notification_claim_wait_total` | `Counter` | (none) | `notification-service` | Total times a worker waited on an in-progress deduplication claim held by another worker. |
+| `notification_claim_release_total` | `Counter` | `reason` (`failure`, `cancelled`, `panic`, `commit_error`) | `notification-service` | Total deduplication claims released before promotion partitioned by reason. |
 
 > **Consumer and gateway meter tag rules**: the `service` tag on every meter comes from the registry's common tags and is never added per meter. The `event_type` tag of the `consumer_*` meters is restricted to the `EventTypes` constants of `ticketing-common`; any other value, including a missing or unparseable event type, is tagged `unknown`. The `route` tag on `gateway_*` meters is strictly bounded to the set: `inventory-seats`, `inventory-reservations`, `inventory-admin`, `order-checkout`, `order-get`, `payment-service`, `auth-token`, `actuator`, and `unmatched`.
 
@@ -161,7 +163,11 @@ All custom metrics use the `ticketing_` prefix, lowercase `snake_case`, and base
 | `MOCK_PAYMENT_FAILURE_RATE` | `payment-service` | `0.05` | Probability (`0.0` to `1.0`) of random charge failure when using a non-deterministic payment token. |
 | `MOCK_PAYMENT_MIN_LATENCY_MS` | `payment-service` | `50` | Minimum simulated payment processing latency in milliseconds. |
 | `MOCK_PAYMENT_MAX_LATENCY_MS` | `payment-service` | `300` | Maximum simulated payment processing latency in milliseconds. |
-| `NOTIFICATION_DEDUP_TTL_SECONDS` | `notification-service` | `604800` | TTL in seconds (7 days) for `notif:dedup:{eventId}` keys in Redis. |
+| `NOTIFICATION_DEDUP_TTL_SECONDS` | `notification-service` | `604800` | TTL in seconds (7 days) for `SENT` deduplication keys in Redis (`notif:dedup:{consumerGroup}:{eventId}`). |
+| `NOTIFICATION_CLAIM_TTL_SECONDS` | `notification-service` | `60` | TTL in seconds for `IN_PROGRESS` deduplication claims in Redis. Must exceed worst-case send duration. |
+| `REDIS_PASSWORD` | `notification-service` | *(empty)* | Optional Redis password for authenticated instances. Never logged. |
+| `REDIS_DB` | `notification-service` | `0` | Redis logical database index (integer >= 0). |
+| `REDIS_TLS_ENABLED` | `notification-service` | `false` | Boolean switch to enable TLS encryption on Redis connections. |
 
 #### Mock Payment Provider Configuration & Magic Tokens
 

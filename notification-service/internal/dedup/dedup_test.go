@@ -73,3 +73,32 @@ func TestRedisDeduplicatorKeyFormat(t *testing.T) {
 		t.Fatalf("unexpected key format: %s", key)
 	}
 }
+
+func TestMemoryDeduplicatorPromoteAndTwoPhase(t *testing.T) {
+	ctx := context.Background()
+	d := NewMemoryDeduplicator(1*time.Hour, WithMemoryWorkerID("worker-test-1"))
+
+	eventID := "01926b54-7c8a-7000-8000-1a2b3c4d5e6f"
+
+	// 1. Claim
+	claimed, err := d.Claim(ctx, eventID)
+	if err != nil || !claimed {
+		t.Fatalf("expected claim to succeed: %v", err)
+	}
+
+	// 2. Promote to SENT
+	if err := d.Promote(ctx, eventID); err != nil {
+		t.Fatalf("expected promote to succeed: %v", err)
+	}
+
+	// 3. Next claim should see SENT and return false (duplicate)
+	claimed2, err := d.Claim(ctx, eventID)
+	if err != nil || claimed2 {
+		t.Fatalf("expected duplicate claim to return false, got claimed=%v, err=%v", claimed2, err)
+	}
+
+	// 4. Release with reason
+	if err := d.Release(ctx, eventID, "failure"); err != nil {
+		t.Fatalf("release should succeed: %v", err)
+	}
+}

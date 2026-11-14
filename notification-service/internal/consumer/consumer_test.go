@@ -249,3 +249,85 @@ func TestProcessMessageRedisUnavailableStopsConsumer(t *testing.T) {
 		t.Fatalf("offset must NOT be committed when Redis is unavailable, got %d", reader.CommittedCount())
 	}
 }
+
+type panickingSender struct{}
+
+func (p *panickingSender) Send(ctx context.Context, notif notify.Notification) error {
+	panic("unexpected poison pill in sender!")
+}
+
+func TestProcessMessagePanicRecovery(t *testing.T) {
+	reader := NewMockMessageReader(nil)
+	d := dedup.NewMemoryDeduplicator(1 * time.Hour)
+	m := metrics.NewMetrics()
+
+	c := NewConsumer(reader, d, &panickingSender{}, m, Options{})
+
+	msg := kafka.Message{
+		Topic:     "order.events",
+		Partition: 0,
+		Offset:    60,
+		Value:     validConfirmedJSON,
+	}
+
+	// Should NOT panic or terminate process
+	err := c.ProcessMessage(context.Background(), msg)
+	if err != nil {
+		t.Fatalf("expected panic to be recovered without returning fatal error, got %v", err)
+	}
+
+	// Offset must be committed to avoid poison pill partition stall
+	if reader.CommittedCount() != 1 {
+		t.Fatalf("expected offset to be committed after panic recovery, got %d", reader.CommittedCount())
+	}
+
+	// Held claim must be released so key is not orphaned
+	claimed, err := d.Claim(context.Background(), "01926b54-7c8a-7000-8000-1a2b3c4d5e6f")
+	if err != nil || !claimed {
+		t.Fatalf("expected claim to have been released after panic, claimed=%v, err=%v", claimed, err)
+	}
+}
+
+func TestProcessMessageCancelledReleasesClaim(t *testing.T) {
+	reader := NewMockMessageReader(nil)
+	d := dedup.NewMemoryDeduplicator(1 * time.Hour)
+	sender := notify.NewFailingSender(5, errors.New("temporary error"))
+	m := metrics.NewMetrics()
+
+	c := NewConsumer(reader, d, sender, m, Options{
+		MaxAttempts:    3,
+		InitialBackoff: 200 * time.Millisecond,
+		MaxBackoff:     400 * time.Millisecond,
+	})
+
+	ctx, cancel := context.WithCancel(context.Background())
+
+	// Cancel after 50ms (during retry backoff)
+	go func() {
+		time.Sleep(50 * time.Millisecond)
+		cancel()
+	}()
+
+	msg := kafka.Message{
+		Topic:     "order.events",
+		Partition: 0,
+		Offset:    70,
+		Value:     validConfirmedJSON,
+	}
+
+	err := c.ProcessMessage(ctx, msg)
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("expected context.Canceled, got %v", err)
+	}
+
+	// Claim MUST be released with fresh context so key is not orphaned
+	claimed, err := d.Claim(context.Background(), "01926b54-7c8a-7000-8000-1a2b3c4d5e6f")
+	if err != nil || !claimed {
+		t.Fatalf("expected claim to have been released on cancellation with fresh context, claimed=%v, err=%v", claimed, err)
+	}
+
+	// Offset must NOT be committed when cancelled without processing
+	if reader.CommittedCount() != 0 {
+		t.Fatalf("offset must not be committed on cancellation, got %d", reader.CommittedCount())
+	}
+}
