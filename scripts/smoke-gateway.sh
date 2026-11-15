@@ -4,6 +4,9 @@
 # =============================================================================
 set -uo pipefail
 
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+source "${SCRIPT_DIR}/lib/kafka-delivery.sh"
+
 GATEWAY_BASE_URL="${GATEWAY_BASE_URL:-http://localhost:8080}"
 JWT_SECRET="${JWT_SECRET:-dev-only-hs256-secret-key-minimum-32-bytes-long!}"
 SCRIPT_START_EPOCH=$(date +%s)

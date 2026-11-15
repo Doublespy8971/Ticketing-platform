@@ -8,6 +8,9 @@
 
 set -euo pipefail
 
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+source "${SCRIPT_DIR}/lib/kafka-delivery.sh"
+
 INVENTORY_URL="${INVENTORY_URL:-http://localhost:8081}"
 POSTGRES_CONTAINER="${POSTGRES_CONTAINER:-postgres-inventory}"
 REDIS_CONTAINER="${REDIS_CONTAINER:-redis}"

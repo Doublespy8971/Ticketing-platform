@@ -4,6 +4,9 @@
 # =============================================================================
 set -uo pipefail
 
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+source "${SCRIPT_DIR}/lib/kafka-delivery.sh"
+
 BASE_URL="${ORDER_BASE_URL:-http://localhost:8082}"
 POSTGRES_DB="${POSTGRES_ORDER_DB:-order_db}"
 POSTGRES_USER="${POSTGRES_USER:-ticketing}"
@@ -363,41 +366,7 @@ get_topic_total_end_offset() {
 }
 
 produce_kafka_event() {
-    local check_name="$1"
-    local topic="$2"
-    local key="$3"
-    local json_line="$4"
-    local event_type
-    event_type=$(json_field "$json_line" "data.get('eventType','')")
-    event_type="${event_type:-unknown}"
-
-    local before_offset
-    if ! before_offset=$(get_topic_total_end_offset "$check_name" "$topic"); then
-        fail "${check_name}: failed to read end offsets before producing (topic=${topic}, key=${key}, eventType=${event_type})"
-        return 1
-    fi
-
-    if ! docker_exec_stdin_timed "$check_name" "${key}:${json_line}" "$KAFKA_CONTAINER" /opt/kafka/bin/kafka-console-producer.sh \
-        --bootstrap-server kafka:9092 \
-        --topic "$topic" \
-        --property "parse.key=true" \
-        --property "key.separator=:" >/dev/null; then
-        fail "${check_name}: kafka-console-producer failed (topic=${topic}, key=${key}, eventType=${event_type})"
-        return 1
-    fi
-
-    local after_offset
-    if ! after_offset=$(get_topic_total_end_offset "$check_name" "$topic"); then
-        fail "${check_name}: failed to read end offsets after producing (topic=${topic}, key=${key}, eventType=${event_type})"
-        return 1
-    fi
-
-    local delta=$((after_offset - before_offset))
-    if [ "$delta" -ne 1 ]; then
-        fail "${check_name}: produced event not reflected in topic end offsets (topic=${topic}, key=${key}, eventType=${event_type}, expected delta=1, got delta=${delta}, before=${before_offset}, after=${after_offset})"
-        return 1
-    fi
-    return 0
+    produce_and_verify_kafka_delivery "$@"
 }
 
 build_seat_reserved_envelope() {

@@ -5,7 +5,7 @@ APP_SERVICES := gateway-service inventory-service order-service payment-service 
 
 .PHONY: infra-up infra-down infra-reset infra-topics infra-psql-inventory infra-psql-order infra-psql-payment infra-redis-cli \
         smoke-inventory smoke-order smoke-payment smoke-gateway run-gateway smoke-notification run-notification \
-        stack-build stack-up stack-down stack-reset stack-logs stack-ps smoke-all
+        stack-build stack-up stack-down stack-reset stack-logs stack-ps smoke-all smoke-selftest
 
 infra-up:
 	@test -f infra/.env || cp infra/.env.example infra/.env
@@ -149,6 +149,9 @@ smoke-all:
 			echo "All smoke test suites PASSED successfully."; \
 		fi \
 	'
+
+smoke-selftest:
+	bash scripts/test-kafka-delivery.sh
 
 
 
