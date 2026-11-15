@@ -312,29 +312,8 @@ fi
 # -----------------------------------------------------------------------------
 # Check 4c: Underscore Identity Headers Stripped on Public Route
 # -----------------------------------------------------------------------------
-CHK_START=$(date +%s)
-DUMMY_EVENT_ID=$(uuid_v4)
-http_request "Underscore Identity Headers Public Route" "GET" "${GATEWAY_BASE_URL}/api/v1/events/${DUMMY_EVENT_ID}/seats" \
-    -H "X_User_Id: spoofed-id-123" \
-    -H "X_User_Roles: ADMIN" || true
-
-if [ -n "${DOWNSTREAM_ECHO_URL:-}" ]; then
-    ECHO_RESP=$(curl -sS --connect-timeout 2 "${DOWNSTREAM_ECHO_URL}" 2>/dev/null || echo "")
-    if echo "$ECHO_RESP" | grep -qi "spoofed-id-123"; then
-        finish_check "Underscore Identity Headers Public Route" "$CHK_START" "FAIL" "Downstream echo received forwarded X_User_Id"
-    else
-        finish_check "Underscore Identity Headers Public Route" "$CHK_START" "PASS" "Downstream echo confirmed X_User_Id and X_User_Roles were stripped"
-    fi
-else
-    info "Downstream echo endpoint not available (DOWNSTREAM_ECHO_URL unset); skipped downstream echo verification (gateway returned HTTP ${HTTP_STATUS})"
-    finish_check "Underscore Identity Headers Public Route" "$CHK_START" "PASS" "Public seats request processed (HTTP ${HTTP_STATUS}); downstream echo skipped"
-fi
-
-# -----------------------------------------------------------------------------
-# Check 5: Hold Request through Gateway Returns 201 and Belongs to Token User
-# -----------------------------------------------------------------------------
 if [ -n "$EVENT_ID" ]; then
-    # Create seats and put event on sale using admin token
+    # Create seats and put event on sale using admin token so public route returns seats of created event
     SEAT_NUMBER=$(( (RANDOM % 800) + 100 ))
     BULK_SEATS_PAYLOAD="{\"seats\":[{\"sectionCode\":\"GA\",\"rowLabel\":\"A\",\"seatNumber\":\"${SEAT_NUMBER}\",\"priceCents\":5000}]}"
     http_request "Admin Add Seat" "POST" "${GATEWAY_BASE_URL}/api/v1/admin/events/${EVENT_ID}/seats/bulk" \
@@ -347,27 +326,53 @@ if [ -n "$EVENT_ID" ]; then
         "{\"status\":\"ON_SALE\"}" \
         -H "Authorization: Bearer ${ADMIN_TOKEN}" || true
 
-    if [ -n "$SEAT_ID" ]; then
-        CHK_START=$(date +%s)
-        HOLD_IDEMPOTENCY_KEY=$(uuid_v4)
-        HOLD_PAYLOAD="{\"eventId\":\"${EVENT_ID}\",\"seatIds\":[\"${SEAT_ID}\"]}"
+    CHK_START=$(date +%s)
+    http_request "Underscore Identity Headers Public Route" "GET" "${GATEWAY_BASE_URL}/api/v1/events/${EVENT_ID}/seats" \
+        -H "X_User_Id: spoofed-id-123" \
+        -H "X_User_Roles: ADMIN" || true
 
-        http_request "User Hold Seat" "POST" "${GATEWAY_BASE_URL}/api/v1/reservations" \
-            "$HOLD_PAYLOAD" \
-            -H "Authorization: Bearer ${USER_TOKEN}" \
-            -H "Idempotency-Key: ${HOLD_IDEMPOTENCY_KEY}" || true
+    SEAT_COUNT=$(python3 -c "import json, sys; data = json.loads(sys.argv[1]); items = data.get('items') or data.get('seats') or []; print(len(items))" "$HTTP_BODY" 2>/dev/null || echo "0")
 
-        RES_USER_ID=$(json_field "$HTTP_BODY" 'data.get("userId", "")')
-        RES_ID=$(json_field "$HTTP_BODY" 'data.get("reservationId", "")')
-
-        if [ "$HTTP_STATUS" = "201" ] && [ "$RES_USER_ID" = "$USER_ID" ]; then
-            finish_check "User Hold Seat" "$CHK_START" "PASS" "Hold created (${RES_ID}) and belongs to user ${USER_ID}"
+    if [ "$HTTP_STATUS" != "200" ] || [ "$SEAT_COUNT" -lt 1 ]; then
+        finish_check "Underscore Identity Headers Public Route" "$CHK_START" "FAIL" "Expected HTTP 200 with seats of created event, got HTTP ${HTTP_STATUS} (seats count: ${SEAT_COUNT}): ${HTTP_BODY}"
+    elif [ -n "${DOWNSTREAM_ECHO_URL:-}" ]; then
+        ECHO_RESP=$(curl -sS --connect-timeout 2 "${DOWNSTREAM_ECHO_URL}" 2>/dev/null || echo "")
+        if echo "$ECHO_RESP" | grep -qi "spoofed-id-123"; then
+            finish_check "Underscore Identity Headers Public Route" "$CHK_START" "FAIL" "Downstream echo received forwarded X_User_Id"
         else
-            finish_check "User Hold Seat" "$CHK_START" "FAIL" "Expected 201 for user ${USER_ID}, got HTTP ${HTTP_STATUS} (user: ${RES_USER_ID}): ${HTTP_BODY}"
+            finish_check "Underscore Identity Headers Public Route" "$CHK_START" "PASS" "Downstream echo confirmed X_User_Id and X_User_Roles were stripped (HTTP 200 with ${SEAT_COUNT} seats)"
         fi
     else
-        fail "User Hold Seat: unable to bulk create seat for event ${EVENT_ID}"
+        finish_check "Underscore Identity Headers Public Route" "$CHK_START" "PASS" "Public seats request returned 200 with ${SEAT_COUNT} seats of created event ${EVENT_ID}"
     fi
+else
+    CHK_START=$(date +%s)
+    finish_check "Underscore Identity Headers Public Route" "$CHK_START" "FAIL" "No eventId created in Check 2"
+fi
+
+# -----------------------------------------------------------------------------
+# Check 5: Hold Request through Gateway Returns 201 and Belongs to Token User
+# -----------------------------------------------------------------------------
+if [ -n "$EVENT_ID" ] && [ -n "$SEAT_ID" ]; then
+    CHK_START=$(date +%s)
+    HOLD_IDEMPOTENCY_KEY=$(uuid_v4)
+    HOLD_PAYLOAD="{\"eventId\":\"${EVENT_ID}\",\"seatIds\":[\"${SEAT_ID}\"]}"
+
+    http_request "User Hold Seat" "POST" "${GATEWAY_BASE_URL}/api/v1/reservations" \
+        "$HOLD_PAYLOAD" \
+        -H "Authorization: Bearer ${USER_TOKEN}" \
+        -H "Idempotency-Key: ${HOLD_IDEMPOTENCY_KEY}" || true
+
+    RES_USER_ID=$(json_field "$HTTP_BODY" 'data.get("userId", "")')
+    RES_ID=$(json_field "$HTTP_BODY" 'data.get("reservationId", "")')
+
+    if [ "$HTTP_STATUS" = "201" ] && [ "$RES_USER_ID" = "$USER_ID" ]; then
+        finish_check "User Hold Seat" "$CHK_START" "PASS" "Hold created (${RES_ID}) and belongs to user ${USER_ID}"
+    else
+        finish_check "User Hold Seat" "$CHK_START" "FAIL" "Expected 201 for user ${USER_ID}, got HTTP ${HTTP_STATUS} (user: ${RES_USER_ID}): ${HTTP_BODY}"
+    fi
+elif [ -n "$EVENT_ID" ]; then
+    fail "User Hold Seat: unable to bulk create seat for event ${EVENT_ID}"
 else
     fail "User Hold Seat skipped: no eventId created in Check 2"
 fi

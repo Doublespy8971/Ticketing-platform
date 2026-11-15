@@ -5,6 +5,13 @@ Authoritative seat inventory and reservation hold service for the Ticketing Plat
 ## Responsibilities
 
 - **Admin Event & Seat Management**: Create events (`POST /api/v1/admin/events`), transition event status (`PATCH /api/v1/admin/events/{eventId}/status`), and bulk-provision seats (`POST /api/v1/admin/events/{eventId}/seats/bulk`).
+- **Public Seat Availability (`GET /api/v1/events/{eventId}/seats`)**:
+  - Ingress read endpoint routed via `gateway-service` without requiring authentication or identity headers. Strictly never exposes reservation or user data.
+  - Keyset pagination with `limit` (default 200, maximum 1000; clamped to 1000 if exceeded) and `cursor` (seat ID UUID). Returns `items` (and alias `seats`) with `nextCursor`.
+  - Seats strictly ordered by `(section_code ASC, row_label ASC, seat_number ASC, seat_id ASC)`.
+  - Backed by Flyway migration `V4__seats_keyset_index.sql` composite indexes: `idx_seats_event_keyset` on `(event_id, section_code, row_label, seat_number, seat_id)` and `idx_seats_event_status_keyset` on `(event_id, status, section_code, row_label, seat_number, seat_id)` to ensure index scans with no sequential scans on 10,000+ seats.
+  - Returns `Cache-Control: max-age=1` header. Unknown `eventId` returns RFC 7807 problem details with HTTP 404 `RESOURCE_NOT_FOUND`.
+  - **Source of Truth**: PostgreSQL is the authoritative source of truth for seat status; a `HELD` seat in PostgreSQL may become `AVAILABLE` again when its hold expires or is cancelled.
 - **Two-Layer Seat Hold (`POST /api/v1/reservations`)**:
   1. Fast atomic multi-seat gate in Redis (`hold_inventory.lua`, 660-second safety-net TTL).
   2. Authoritative PostgreSQL transaction locking seats (`FOR UPDATE` in ascending `seat_id` order), inserting `reservations` (`HELD`, 600-second TTL from DB clock) and `reservation_items`, and appending `inventory.seat.reserved` to `outbox_events`.
@@ -36,4 +43,10 @@ Authoritative seat inventory and reservation hold service for the Ticketing Plat
 4. **Unrelated event types on `payment.events`**: Envelope validation in `PaymentEventService` verifies the structural envelope fields (`schemaVersion == 1`, `eventId`, `eventType`, `occurredAt`, `correlationId`, non-null `payload`) before delegating to `IdempotentEventProcessor.process(UUID, String, String, Runnable)` so that any event type other than `payment.succeeded` and `payment.failed` (such as `payment.refunded` or any future payment event type) is deduplicated, logged at `DEBUG`, and counted with `outcome="ignored"` (using `ConsumerMetrics.sanitizeEventType` to keep metric tags bounded) without being retried or dead-lettered.
 5. **Kafka listener auto-startup property**: `PaymentEventConsumer` binds `autoStartup = "${spring.kafka.listener.auto-startup:true}"` (default `true`) so existing non-Kafka integration tests can disable the Kafka listener container alongside `ticketing.outbox.enabled=false`.
 6. **Redis confirmed seat representation and DLT topic naming**: Per `docs/arch/08-redis.md` (Section 9.1 and 9.2.3) and `confirm_inventory.lua`, `RedisSeatGate.confirm` marks confirmed seats in Redis by overwriting `seat:{eventId}:{seatId}` with `"SOLD"` and no TTL (`-1`) rather than using a separate `confirmed:seats:{eventId}` set. Per `docs/arch/03-kafka.md` and `infra/kafka/create-topics.sh`, retry and dead-letter topics for `payment.events` are qualified with the consumer group (`payment.events-inventory-service-payment-cg-retry-0`, `payment.events-inventory-service-payment-cg-retry-1`, `payment.events-inventory-service-payment-cg-dlt`).
+7. **Public Seat Availability Keyset Pagination & Filtering**:
+   - `GET /api/v1/events/{eventId}/seats` supports optional filters `section` (also accepting `sectionCode`) and `status` (`AVAILABLE`, `HELD`, `SOLD`). Invalid status values return HTTP 400 `VALIDATION_ERROR`.
+   - `limit` defaults to 200 and is clamped to a maximum of 1000 (values > 1000 clamp to 1000; non-positive values default to 200).
+   - `cursor` is based on the seat ID (UUID string or URL-safe base64 encoded UUID). When provided, the cursor seat's location `(section_code, row_label, seat_number, seat_id)` is resolved in PostgreSQL and used in the keyset condition `(section_code, row_label, seat_number, seat_id) > (...)` to ensure deterministic paging without duplicates or gaps.
+   - `Cache-Control: max-age=1` header is set on all 200 responses.
+   - PostgreSQL is the source of truth for seat status; a seat marked `HELD` in PostgreSQL transitions back to `AVAILABLE` upon hold expiry. Sequential scans are prevented by `V4__seats_keyset_index.sql`.
 

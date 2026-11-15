@@ -250,6 +250,105 @@ else
 fi
 
 # ------------------------------------------------------------------------------
+# 3b) Public seat availability keyset pagination (25 seats, limit=10)
+# ------------------------------------------------------------------------------
+start_check "3b. Public seat availability keyset pagination (25 seats, limit=10)"
+if [ -n "${INVENTORY_URL}" ]; then
+    P_EVENT_NAME="Pagination Test Event $(date +%s)"
+    P_VENUE_NAME="Pagination Arena"
+    P_DROP_TIME=$(jq -r -n 'now - 3600 | todateiso8601')
+    P_EVENT_TIME=$(jq -r -n 'now + 86400 * 30 | todateiso8601')
+
+    P_CREATE_BODY=$(jq -n \
+        --arg name "${P_EVENT_NAME}" \
+        --arg venueName "${P_VENUE_NAME}" \
+        --arg eventTime "${P_EVENT_TIME}" \
+        --arg dropTime "${P_DROP_TIME}" \
+        '{name: $name, venueName: $venueName, eventTime: $eventTime, dropTime: $dropTime}')
+
+    P_CREATE_RAW=$(curl --max-time 10 --connect-timeout 3 -s -w "\n%{http_code}" -X POST "${INVENTORY_URL}/api/v1/admin/events" \
+        -H "Content-Type: application/json" \
+        -H "X-User-Roles: ADMIN" \
+        -d "${P_CREATE_BODY}")
+
+    P_CREATE_STATUS=$(echo "${P_CREATE_RAW}" | tail -n1)
+    P_CREATE_BODY_RES=$(echo "${P_CREATE_RAW}" | sed '$d')
+    P_EVENT_ID=$(echo "${P_CREATE_BODY_RES}" | jq -r '.eventId // empty')
+
+    if [ "${P_CREATE_STATUS}" = "201" ] && [ -n "${P_EVENT_ID}" ]; then
+        # Bulk create 25 seats
+        P_SEATS_BODY=$(jq -n '[range(1; 26) | {sectionCode: "SEC-P", rowLabel: "1", seatNumber: (. | tostring), priceCents: 5000}] | {seats: .}')
+        P_BULK_RAW=$(curl --max-time 10 --connect-timeout 3 -s -w "\n%{http_code}" -X POST "${INVENTORY_URL}/api/v1/admin/events/${P_EVENT_ID}/seats/bulk" \
+            -H "Content-Type: application/json" \
+            -H "X-User-Roles: ADMIN" \
+            -d "${P_SEATS_BODY}")
+
+        P_BULK_STATUS=$(echo "${P_BULK_RAW}" | tail -n1)
+        P_BULK_RES=$(echo "${P_BULK_RAW}" | sed '$d')
+        P_CREATED_COUNT=$(echo "${P_BULK_RES}" | jq -r '.createdCount // 0')
+
+        if [ "${P_BULK_STATUS}" = "201" ] && [ "${P_CREATED_COUNT}" -eq 25 ]; then
+            declare -a ALL_PAGE_SEAT_IDS=()
+            P_CURSOR=""
+            P_PAGE_COUNT=0
+            P_ERRORS=()
+
+            while true; do
+                P_PAGE_COUNT=$((P_PAGE_COUNT + 1))
+                if [ -n "${P_CURSOR}" ]; then
+                    PAGE_URL="${INVENTORY_URL}/api/v1/events/${P_EVENT_ID}/seats?limit=10&cursor=${P_CURSOR}"
+                else
+                    PAGE_URL="${INVENTORY_URL}/api/v1/events/${P_EVENT_ID}/seats?limit=10"
+                fi
+
+                P_GET_RAW=$(curl --max-time 10 --connect-timeout 3 -s -w "\n%{http_code}" -X GET "${PAGE_URL}")
+                P_GET_STATUS=$(echo "${P_GET_RAW}" | tail -n1)
+                P_GET_BODY=$(echo "${P_GET_RAW}" | sed '$d')
+
+                if [ "${P_GET_STATUS}" != "200" ]; then
+                    P_ERRORS+=("Page ${P_PAGE_COUNT} failed with HTTP ${P_GET_STATUS}: ${P_GET_BODY}")
+                    break
+                fi
+
+                PAGE_ITEM_COUNT=$(echo "${P_GET_BODY}" | jq -r '.items | length')
+                for ((idx=0; idx<PAGE_ITEM_COUNT; idx++)); do
+                    SID=$(echo "${P_GET_BODY}" | jq -r ".items[${idx}].seatId // .items[${idx}].id")
+                    if [ -n "${SID}" ] && [ "${SID}" != "null" ]; then
+                        ALL_PAGE_SEAT_IDS+=("${SID}")
+                    fi
+                done
+
+                NEXT_CURSOR=$(echo "${P_GET_BODY}" | jq -r '.nextCursor // empty')
+                if [ -z "${NEXT_CURSOR}" ] || [ "${NEXT_CURSOR}" = "null" ]; then
+                    break
+                fi
+                P_CURSOR="${NEXT_CURSOR}"
+
+                if [ "${P_PAGE_COUNT}" -gt 10 ]; then
+                    P_ERRORS+=("Pagination exceeded 10 pages")
+                    break
+                fi
+            done
+
+            TOTAL_COLLECTED="${#ALL_PAGE_SEAT_IDS[@]}"
+            DISTINCT_COLLECTED=$(printf '%s\n' "${ALL_PAGE_SEAT_IDS[@]}" | sort -u | wc -l | tr -d ' ')
+
+            if [ "${#P_ERRORS[@]}" -eq 0 ] && [ "${TOTAL_COLLECTED}" -eq 25 ] && [ "${DISTINCT_COLLECTED}" -eq 25 ]; then
+                record_pass "${CHECK_NAME} (pages=${P_PAGE_COUNT}, totalSeats=${TOTAL_COLLECTED}, distinctSeats=${DISTINCT_COLLECTED})"
+            else
+                record_fail "${CHECK_NAME}" "Pagination assertion failed: total=${TOTAL_COLLECTED}, distinct=${DISTINCT_COLLECTED}, expected 25. Errors: ${P_ERRORS[*]}"
+            fi
+        else
+            record_fail "${CHECK_NAME}" "Expected HTTP 201 with createdCount=25, got HTTP '${P_BULK_STATUS}'. Body: ${P_BULK_RES}"
+        fi
+    else
+        record_fail "${CHECK_NAME}" "Failed to create event for pagination test: HTTP '${P_CREATE_STATUS}'. Body: ${P_CREATE_BODY_RES}"
+    fi
+else
+    record_fail "${CHECK_NAME}" "Skipped because INVENTORY_URL is unset"
+fi
+
+# ------------------------------------------------------------------------------
 # 4) Hold seat 1 as user 1 (201) and hold same seat as user 2 (409 SEAT_ALREADY_TAKEN)
 # ------------------------------------------------------------------------------
 start_check "4. Hold seat 1 as user 1 (201) and user 2 conflict (409 SEAT_ALREADY_TAKEN)"

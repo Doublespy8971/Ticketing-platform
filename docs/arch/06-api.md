@@ -235,30 +235,59 @@ All `4xx` and `5xx` responses across `gateway-service`, `inventory-service`, and
 
 ### 7.4 `inventory-service` Customer Endpoints (`:8081`, Routed via `:8080`)
 
-#### 7.4.1 List Event Seats
-- **Method & Path**: `GET /api/v1/events/{eventId}/seats?sectionCode=FLOOR-A&status=AVAILABLE`
+#### 7.4.1 List Event Seats (Public Seat Availability)
+- **Method & Path**: `GET /api/v1/events/{eventId}/seats`
+- **Access**: Public ingress endpoint routed via `gateway-service` route `inventory-seats`. No authentication or identity header is required (`X-User-Id` and `X-User-Roles` are stripped by the gateway and not processed). Strictly never exposes reservation or user data.
+- **Cache Header**: `Cache-Control: max-age=1`
 - **Query Parameters**:
-  - `sectionCode` (optional `string`): Filter by venue section.
-  - `status` (optional `string`, enum: `AVAILABLE`, `HELD`, `SOLD`): Filter by seat status.
+  - `section` / `sectionCode` (optional `string`): Filter by venue section.
+  - `status` (optional `string`, enum: `AVAILABLE`, `HELD`, `SOLD`): Filter by seat status. Invalid status values return `400 Bad Request` (`VALIDATION_ERROR`).
+  - `limit` (optional `integer`, default `200`, maximum `1000`): Limit on returned seat items. Values above 1000 are clamped to 1000; non-positive values default to 200.
+  - `cursor` (optional `string`): Keyset pagination cursor based on `seat_id` (UUID).
+- **Ordering & Keyset Pagination**:
+  - Seats are strictly ordered by `(section_code ASC, row_label ASC, seat_number ASC, seat_id ASC)`.
+  - Keyset pagination is served from PostgreSQL and backed by composite B-tree indexes from Flyway migration `V4__seats_keyset_index.sql` (`idx_seats_event_keyset` on `(event_id, section_code, row_label, seat_number, seat_id)` and `idx_seats_event_status_keyset` on `(event_id, status, section_code, row_label, seat_number, seat_id)`). Reading seat availability uses index scans and never causes a sequential scan over the `seats` table even on large datasets (10,000+ seats).
+  - `nextCursor` contains the seat ID string of the last item in the page when more items remain, or `null` on the final page.
+- **Source of Truth**:
+  - PostgreSQL is the source of truth for seat status; a `HELD` seat in PostgreSQL may become `AVAILABLE` again when its reservation hold expires via `ExpirySweeper` or is released.
 - **Response `200 OK` Body**:
 ```json
 {
   "eventId": "f0e1d2c3-b4a5-4968-8796-a5b4c3d2e1f0",
   "dropTime": "2026-10-27T21:00:00Z",
-  "seats": [
+  "items": [
     {
       "seatId": "11111111-2222-4333-8444-555555555501",
+      "id": "11111111-2222-4333-8444-555555555501",
       "sectionCode": "FLOOR-A",
+      "section": "FLOOR-A",
       "rowLabel": "1",
       "seatNumber": "101",
       "priceCents": 15000,
       "currency": "USD",
       "status": "AVAILABLE"
     }
-  ]
+  ],
+  "seats": [
+    {
+      "seatId": "11111111-2222-4333-8444-555555555501",
+      "id": "11111111-2222-4333-8444-555555555501",
+      "sectionCode": "FLOOR-A",
+      "section": "FLOOR-A",
+      "rowLabel": "1",
+      "seatNumber": "101",
+      "priceCents": 15000,
+      "currency": "USD",
+      "status": "AVAILABLE"
+    }
+  ],
+  "nextCursor": "11111111-2222-4333-8444-555555555501"
 }
 ```
-- **Status Codes**: `200 OK`, `404 Not Found`.
+- **Status Codes**:
+  - `200 OK`: Seat availability returned with `Cache-Control: max-age=1`.
+  - `400 Bad Request`: `VALIDATION_ERROR` for invalid `status` values, malformed cursor strings, or non-existent cursor seats.
+  - `404 Not Found`: `RESOURCE_NOT_FOUND` if `eventId` does not exist.
 
 ---
 

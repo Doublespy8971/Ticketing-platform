@@ -317,6 +317,67 @@ public class SeatRepository {
         return jdbcTemplate.query(SELECT_ALL_SOLD_SEATS_SQL, ROW_MAPPER);
     }
 
+    private static final String SELECT_BY_ID_AND_EVENT_ID_SQL = """
+            SELECT seat_id, event_id, section_code, row_label, seat_number,
+                   price_cents, currency, status, version, created_at, updated_at
+            FROM seats
+            WHERE seat_id = ? AND event_id = ?
+            """;
+
+    public Optional<SeatRecord> findByIdAndEventId(UUID seatId, UUID eventId) {
+        Objects.requireNonNull(seatId, "seatId must not be null");
+        Objects.requireNonNull(eventId, "eventId must not be null");
+        return jdbcTemplate.query(SELECT_BY_ID_AND_EVENT_ID_SQL, ROW_MAPPER, seatId, eventId)
+                .stream()
+                .findFirst();
+    }
+
+    public List<SeatRecord> findSeatsWithKeyset(
+            UUID eventId,
+            String section,
+            String status,
+            SeatRecord cursorSeat,
+            int limit
+    ) {
+        Objects.requireNonNull(eventId, "eventId must not be null");
+        if (limit <= 0) {
+            throw new IllegalArgumentException("limit must be positive");
+        }
+
+        StringBuilder sql = new StringBuilder("""
+                SELECT seat_id, event_id, section_code, row_label, seat_number,
+                       price_cents, currency, status, version, created_at, updated_at
+                FROM seats
+                WHERE event_id = ?
+                """);
+
+        List<Object> params = new java.util.ArrayList<>();
+        params.add(eventId);
+
+        if (section != null) {
+            sql.append(" AND section_code = ?");
+            params.add(section);
+        }
+
+        if (status != null) {
+            sql.append(" AND status = ?");
+            params.add(status);
+        }
+
+        if (cursorSeat != null) {
+            sql.append(" AND (section_code, row_label, seat_number, seat_id) > (?, ?, ?, ?::uuid)");
+            params.add(cursorSeat.sectionCode());
+            params.add(cursorSeat.rowLabel());
+            params.add(cursorSeat.seatNumber());
+            params.add(cursorSeat.seatId().toString());
+        }
+
+        sql.append(" ORDER BY section_code ASC, row_label ASC, seat_number ASC, seat_id ASC LIMIT ?");
+        params.add(limit + 1);
+
+        return jdbcTemplate.query(sql.toString(), ROW_MAPPER, params.toArray());
+    }
+
     private static OffsetDateTime toOffsetDateTime(Instant instant) {
         return instant == null ? null : OffsetDateTime.ofInstant(instant, ZoneOffset.UTC);
     }
