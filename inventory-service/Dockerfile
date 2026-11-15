@@ -1,16 +1,40 @@
-FROM maven:3.9.9-eclipse-temurin-21 AS build
+FROM maven:3.9.9-eclipse-temurin-21-alpine AS build
 WORKDIR /workspace
-COPY pom.xml .
-COPY gateway-service/pom.xml gateway-service/pom.xml
-COPY order-service/pom.xml order-service/pom.xml
-COPY payment-service/pom.xml payment-service/pom.xml
-COPY inventory-service/pom.xml inventory-service/pom.xml
-RUN mvn -pl inventory-service -am dependency:go-offline -B
-COPY inventory-service/src inventory-service/src
-RUN mvn -pl inventory-service -am clean package -DskipTests -B
 
-FROM eclipse-temurin:21-jre-jammy
+# Copy root and module POMs to allow reactor resolution
+COPY pom.xml .
+COPY ticketing-common/pom.xml ticketing-common/
+COPY ticketing-outbox/pom.xml ticketing-outbox/
+COPY ticketing-consumer/pom.xml ticketing-consumer/
+COPY gateway-service/pom.xml gateway-service/
+COPY inventory-service/pom.xml inventory-service/
+COPY order-service/pom.xml order-service/
+COPY payment-service/pom.xml payment-service/
+
+# Copy sources for common dependencies and inventory-service
+COPY ticketing-common ticketing-common
+COPY ticketing-outbox ticketing-outbox
+COPY ticketing-consumer ticketing-consumer
+COPY inventory-service inventory-service
+
+# Build package using Maven cache mount
+RUN --mount=type=cache,target=/root/.m2 mvn -pl inventory-service -am clean package -DskipTests -B && \
+    cp /workspace/inventory-service/target/inventory-service-*.jar /app.jar
+
+FROM eclipse-temurin:21-jre-alpine
 WORKDIR /app
-COPY --from=build /workspace/inventory-service/target/inventory-service-*.jar app.jar
+
+RUN addgroup -S -g 10001 app && \
+    adduser -S -u 10001 -G app -s /sbin/nologin app
+
+COPY --from=build --chown=app:app /app.jar app.jar
+
+USER app:app
 EXPOSE 8081
-ENTRYPOINT ["java", "-jar", "app.jar"]
+
+ENV JAVA_TOOL_OPTIONS="-XX:MaxRAMPercentage=75 -XX:+ExitOnOutOfMemoryError"
+
+HEALTHCHECK --interval=5s --timeout=3s --retries=10 --start-period=20s \
+    CMD wget --no-verbose --tries=1 --spider http://127.0.0.1:8081/actuator/health || exit 1
+
+ENTRYPOINT ["java", "-XX:MaxRAMPercentage=75", "-XX:+ExitOnOutOfMemoryError", "-jar", "app.jar"]

@@ -4,12 +4,12 @@ WORKDIR /src
 ENV GOTOOLCHAIN=auto
 
 # Cache dependencies
-COPY go.mod go.sum ./
+COPY notification-service/go.mod notification-service/go.sum ./
 RUN go mod download
 
 # Copy source and build static binary (CGO_ENABLED=0)
-COPY cmd/ cmd/
-COPY internal/ internal/
+COPY notification-service/cmd/ cmd/
+COPY notification-service/internal/ internal/
 RUN CGO_ENABLED=0 GOOS=linux go build -ldflags="-s -w" -o /notification-service ./cmd/notification-service
 
 # Stage 2: Distroless static runtime (no shell, no package manager)

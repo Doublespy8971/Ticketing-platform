@@ -1,0 +1,165 @@
+networks:
+  ticketing-net:
+    name: ticketing-net
+
+services:
+  inventory-service:
+    image: ticketing/inventory-service:latest
+    container_name: inventory-service
+    build:
+      context: ..
+      dockerfile: inventory-service/Dockerfile
+    networks:
+      - ticketing-net
+    ports:
+      - "8081:8081"
+    environment:
+      SERVER_PORT: 8081
+      POSTGRES_URL: jdbc:postgresql://postgres-inventory:5432/inventory_db
+      POSTGRES_USER: ${POSTGRES_USER:-ticketing}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-ticketing_secret}
+      REDIS_HOST: redis
+      REDIS_PORT: 6379
+      KAFKA_BOOTSTRAP_SERVERS: kafka:9092
+      OUTBOX_ENABLED: "true"
+    depends_on:
+      postgres-inventory:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      kafka:
+        condition: service_healthy
+      kafka-init:
+        condition: service_completed_successfully
+    restart: "no"
+    deploy:
+      resources:
+        limits:
+          memory: 512m
+
+  order-service:
+    image: ticketing/order-service:latest
+    container_name: order-service
+    build:
+      context: ..
+      dockerfile: order-service/Dockerfile
+    networks:
+      - ticketing-net
+    ports:
+      - "8082:8082"
+    environment:
+      SERVER_PORT: 8082
+      POSTGRES_URL: jdbc:postgresql://postgres-order:5432/order_db
+      POSTGRES_USER: ${POSTGRES_USER:-ticketing}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-ticketing_secret}
+      KAFKA_BOOTSTRAP_SERVERS: kafka:9092
+      OUTBOX_ENABLED: "true"
+    depends_on:
+      postgres-order:
+        condition: service_healthy
+      kafka:
+        condition: service_healthy
+      kafka-init:
+        condition: service_completed_successfully
+    restart: "no"
+    deploy:
+      resources:
+        limits:
+          memory: 512m
+
+  payment-service:
+    image: ticketing/payment-service:latest
+    container_name: payment-service
+    build:
+      context: ..
+      dockerfile: payment-service/Dockerfile
+    networks:
+      - ticketing-net
+    ports:
+      - "8083:8083"
+    environment:
+      SERVER_PORT: 8083
+      POSTGRES_URL: jdbc:postgresql://postgres-payment:5432/payment_db
+      POSTGRES_USER: ${POSTGRES_USER:-ticketing}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-ticketing_secret}
+      KAFKA_BOOTSTRAP_SERVERS: kafka:9092
+      OUTBOX_ENABLED: "true"
+      MOCK_PAYMENT_FAILURE_RATE: "0"
+    depends_on:
+      postgres-payment:
+        condition: service_healthy
+      kafka:
+        condition: service_healthy
+      kafka-init:
+        condition: service_completed_successfully
+    restart: "no"
+    deploy:
+      resources:
+        limits:
+          memory: 512m
+
+  notification-service:
+    image: ticketing/notification-service:latest
+    container_name: notification-service
+    build:
+      context: ..
+      dockerfile: notification-service/Dockerfile
+    networks:
+      - ticketing-net
+    ports:
+      - "8084:8084"
+    environment:
+      SERVER_PORT: 8084
+      REDIS_HOST: redis
+      REDIS_PORT: 6379
+      KAFKA_BOOTSTRAP_SERVERS: kafka:9092
+      KAFKA_TOPIC: order.events
+      KAFKA_GROUP_ID: notification-service-order-cg
+    depends_on:
+      redis:
+        condition: service_healthy
+      kafka:
+        condition: service_healthy
+      kafka-init:
+        condition: service_completed_successfully
+      order-service:
+        condition: service_healthy
+    restart: "no"
+    deploy:
+      resources:
+        limits:
+          memory: 256m
+
+  gateway-service:
+    image: ticketing/gateway-service:latest
+    container_name: gateway-service
+    build:
+      context: ..
+      dockerfile: gateway-service/Dockerfile
+    networks:
+      - ticketing-net
+    ports:
+      - "8080:8080"
+    environment:
+      SERVER_PORT: 8080
+      REDIS_HOST: redis
+      REDIS_PORT: 6379
+      INVENTORY_SERVICE_URL: http://inventory-service:8081
+      ORDER_SERVICE_URL: http://order-service:8082
+      PAYMENT_SERVICE_URL: http://payment-service:8083
+      SPRING_PROFILES_ACTIVE: local
+      JWT_SECRET: ${JWT_SECRET:-dev-only-hs256-secret-key-minimum-32-bytes-long!}
+    depends_on:
+      redis:
+        condition: service_healthy
+      inventory-service:
+        condition: service_healthy
+      order-service:
+        condition: service_healthy
+      payment-service:
+        condition: service_healthy
+    restart: "no"
+    deploy:
+      resources:
+        limits:
+          memory: 512m
