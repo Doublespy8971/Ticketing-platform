@@ -3,7 +3,9 @@ package main
 import (
 	"context"
 	"crypto/tls"
+	"encoding/json"
 	"errors"
+	"flag"
 	"fmt"
 	"log/slog"
 	"net"
@@ -24,6 +26,14 @@ import (
 )
 
 func main() {
+	healthCheckFlag := flag.Bool("healthcheck", false, "run HTTP health check against /health and exit 0 if UP, 1 otherwise")
+	flag.Parse()
+
+	if *healthCheckFlag {
+		runHealthCheck()
+		return
+	}
+
 	// Configure structured JSON logging to stdout
 	logger := slog.New(slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{
 		Level: slog.LevelInfo,
@@ -220,3 +230,32 @@ func main() {
 
 	logger.Info("Graceful shutdown completed successfully")
 }
+
+func runHealthCheck() {
+	port := os.Getenv("SERVER_PORT")
+	if port == "" {
+		port = "8084"
+	}
+	client := &http.Client{
+		Timeout: 2 * time.Second,
+	}
+	resp, err := client.Get(fmt.Sprintf("http://127.0.0.1:%s/health", port))
+	if err != nil {
+		os.Exit(1)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		os.Exit(1)
+	}
+	var res struct {
+		Status string `json:"status"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&res); err != nil {
+		os.Exit(1)
+	}
+	if res.Status != "UP" {
+		os.Exit(1)
+	}
+	os.Exit(0)
+}
+

@@ -178,6 +178,44 @@ All configuration is provided via environment variables with defaults for local 
 make run-notification
 ```
 
+### Docker Build & Run
+
+#### Multi-Stage Distroless Image
+The container image uses a multi-stage build:
+1. **Builder**: Pinned `golang:1.23.2-alpine`, producing a static binary (`CGO_ENABLED=0`) with symbol/DWARF tables stripped (`-ldflags="-s -w"`).
+2. **Runtime**: Hardened Google Distroless static runtime (`gcr.io/distroless/static-debian12:nonroot`) pinned by multi-arch index digest (`sha256:afa5c872c891853ca7fcf1f12c3edb23f7eeef36189728842dd51042ff57f7ab`). Contains zero shell, package manager, or unnecessary utilities. Runs as unprivileged user `nonroot:nonroot` (UID/GID 65532:65532).
+3. **Health Check**: Configured with exec form `CMD ["/notification-service", "-healthcheck"]` probing `http://127.0.0.1:8084/health` with a 2-second timeout, exiting 0 when status is `UP` and 1 otherwise.
+
+#### Building the Image
+```bash
+docker build -t ticketing/notification-service:latest -f notification-service/Dockerfile notification-service
+```
+
+#### Running the Container
+Connect to the shared Docker network where Kafka and Redis are reachable:
+```bash
+docker run -d \
+  --name notification-service \
+  --network ticketing-net \
+  -p 8084:8084 \
+  -e KAFKA_BOOTSTRAP_SERVERS=kafka:9092 \
+  -e KAFKA_TOPIC=order.events \
+  -e KAFKA_CONSUMER_GROUP=notification-service-order-cg \
+  -e REDIS_HOST=redis \
+  -e REDIS_PORT=6379 \
+  -e SERVER_PORT=8084 \
+  ticketing/notification-service:latest
+```
+
+#### Verifying Container Health
+```bash
+# Check container status and Docker HEALTHCHECK output
+docker inspect --format='{{json .State.Health}}' notification-service | jq .
+
+# Direct probe via binary healthcheck flag
+docker exec notification-service /notification-service -healthcheck
+```
+
 ### Running Tests
 ```bash
 cd notification-service

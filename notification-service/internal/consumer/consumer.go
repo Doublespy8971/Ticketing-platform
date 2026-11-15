@@ -256,9 +256,19 @@ func (c *Consumer) ProcessMessage(ctx context.Context, msg kafka.Message) (err e
 	backoff := c.initialBackoff
 
 	for attempt := 1; attempt <= c.maxAttempts; attempt++ {
+		if ctx.Err() != nil {
+			c.releaseClaimFreshContext(claimedEventID, metrics.ReleaseReasonCancelled)
+			return ctx.Err()
+		}
+
 		sendErr = c.sender.Send(ctx, *notif)
 		if sendErr == nil {
 			break
+		}
+
+		if errors.Is(sendErr, context.Canceled) || ctx.Err() != nil {
+			c.releaseClaimFreshContext(claimedEventID, metrics.ReleaseReasonCancelled)
+			return ctx.Err()
 		}
 
 		if attempt < c.maxAttempts {
