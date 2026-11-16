@@ -5,7 +5,8 @@ APP_SERVICES := gateway-service inventory-service order-service payment-service 
 
 .PHONY: infra-up infra-down infra-reset infra-topics infra-psql-inventory infra-psql-order infra-psql-payment infra-redis-cli \
         smoke-inventory smoke-order smoke-payment smoke-gateway run-gateway smoke-notification run-notification \
-        stack-build stack-up stack-down stack-reset stack-logs stack-ps smoke-all smoke-selftest
+        stack-build stack-up stack-down stack-reset stack-logs stack-ps smoke-all smoke-selftest \
+        e2e e2e-fast e2e-chaos e2e-full
 
 infra-up:
 	@test -f infra/.env || cp infra/.env.example infra/.env
@@ -152,6 +153,21 @@ smoke-all:
 
 smoke-selftest:
 	bash scripts/test-kafka-delivery.sh
+
+e2e:
+	mvn -pl e2e-tests -Pe2e verify
+
+e2e-fast:
+	mvn -pl e2e-tests -Pe2e -Dgroups=fast verify
+
+e2e-chaos:
+	mvn -pl e2e-tests -Pe2e -Dgroups=chaos verify
+
+e2e-full:
+	$(MAKE) stack-reset
+	$(MAKE) e2e
+	@echo "E2E report written to: $$(pwd)/e2e-tests/target/e2e-report.md"
+
 
 
 
