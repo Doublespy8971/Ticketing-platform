@@ -112,6 +112,7 @@ All custom metrics use the `ticketing_` prefix, lowercase `snake_case`, and base
 | `payment_provider_calls_total` | `Counter` | `service`, `operation` (`charge`, `refund`), `outcome` (`succeeded`, `declined`, `error`) | `payment-service` | Total calls to the payment provider. |
 | `payment_provider_duration_seconds` | `Timer` | `service`, `operation` (`charge`, `refund`) | `payment-service` | Duration of payment provider calls. |
 | `payment_events_handled_total` | `Counter` | `service`, `event_type`, `outcome` (`applied`, `noop`, `ignored`) | `payment-service` | Total order events handled by payment-service partitioned by event type and outcome. |
+| `payment_refund_declined_total` | `Counter` | `service`, `failure_code` (`REFUND_DECLINED`, `CARD_DECLINED`, `other`) | `payment-service` | Total payment refunds declined by the payment provider. |
 | `gateway_requests_total` | `Counter` | `service`, `route`, `status_class` (`2xx`, `3xx`, `4xx`, `5xx`, `cancelled`, `other`) | `gateway-service` | Total incoming requests routed through the gateway (cancelled requests counted once with `status_class: "cancelled"`). |
 | `gateway_rate_limited_total` | `Counter` | `service`, `route` | `gateway-service` | Total requests rejected by the Redis rate limiter (HTTP 429). |
 | `gateway_auth_failures_total` | `Counter` | `service`, `reason` (`missing`, `invalid`, `expired`, `forbidden`) | `gateway-service` | Total authentication and authorization rejections at the gateway. |
@@ -178,6 +179,7 @@ All custom metrics use the `ticketing_` prefix, lowercase `snake_case`, and base
 | `tok_success` | Charge | Always succeeds immediately regardless of configured decline rate or Random seed. | `SUCCEEDED` (outcome `SUCCEEDED`, provider ref `mock_ch_*`) |
 | `tok_decline` | Charge | Deterministically declined by card issuer regardless of decline rate. | `DECLINED` (failure code `CARD_DECLINED`, `Payment declined by card issuer`) |
 | `tok_error` | Charge | Throws `ProviderUnavailableException` on the first delivery attempt per idempotency key; succeeds on subsequent retry attempts. | Transient exception, routed to Kafka retry topics (`-retry-0`, `-retry-1`) |
+| `tok_refund_decline` | Charge + Refund | Charge succeeds immediately (`SUCCEEDED`); subsequent compensating refund is deterministically declined by the provider. | Charge: `SUCCEEDED` (outcome `SUCCEEDED`, provider ref `mock_ch_*`); Refund: `DECLINED` (failure code `REFUND_DECLINED`, `Refund declined by payment provider`) |
 
 Non-magic tokens (e.g. `"pm_tok_visa"`) succeed or decline based on the configured random decline rate.
 

@@ -4,7 +4,6 @@ import ch.qos.logback.classic.Logger;
 import ch.qos.logback.classic.LoggerContext;
 import ch.qos.logback.classic.spi.ILoggingEvent;
 import ch.qos.logback.core.read.ListAppender;
-import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.ticketing.common.correlation.CorrelationConstants;
 import com.ticketing.common.events.EventEnvelope;
@@ -21,6 +20,7 @@ import com.ticketing.payment.domain.PaymentRepository;
 import com.ticketing.payment.domain.PaymentStatus;
 import com.ticketing.payment.service.PaymentService;
 import com.ticketing.payment.service.provider.MockPaymentProvider;
+import io.micrometer.core.instrument.MeterRegistry;
 import org.apache.kafka.clients.admin.AdminClient;
 import org.apache.kafka.clients.admin.AdminClientConfig;
 import org.apache.kafka.clients.admin.NewTopic;
@@ -33,7 +33,6 @@ import org.apache.kafka.clients.producer.ProducerRecord;
 import org.apache.kafka.common.TopicPartition;
 import org.apache.kafka.common.serialization.StringDeserializer;
 import org.junit.jupiter.api.AfterEach;
-import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
@@ -155,6 +154,9 @@ class PaymentIntegrationTest {
     @Autowired
     private KafkaTemplate<String, String> kafkaTemplate;
 
+    @Autowired
+    private MeterRegistry meterRegistry;
+
     private ListAppender<ILoggingEvent> logAppender;
 
     @BeforeEach
@@ -187,7 +189,6 @@ class PaymentIntegrationTest {
     void successfulCharge() throws Exception {
         UUID orderId = UUID.randomUUID();
         UUID userId = UUID.randomUUID();
-        UUID eventId = UUID.randomUUID();
 
         publishOrderPaymentRequested(orderId, userId, "pm_tok_visa_success", 25000);
 
@@ -267,11 +268,14 @@ class PaymentIntegrationTest {
         assertThat(awaitCondition(() -> paymentRepository.findByOrderId(orderId).isPresent(), Duration.ofSeconds(10)))
                 .isTrue();
 
+        double duplicatesBefore = getConsumerDuplicateCount();
+
         // Second delivery of exact same message
         sendToKafka(Topics.ORDER_EVENTS, orderId.toString(), rawJson);
 
-        // Allow some time for Kafka consumer to process duplicate
-        try { Thread.sleep(1000); } catch (InterruptedException ignored) {}
+        // Poll for duplicate metric incrementing instead of Thread.sleep
+        assertThat(awaitCondition(() -> getConsumerDuplicateCount() >= duplicatesBefore + 1, Duration.ofSeconds(10)))
+                .isTrue();
 
         Integer paymentCount = jdbcTemplate.queryForObject(
                 "SELECT COUNT(*) FROM payments WHERE order_id = ?", Integer.class, orderId
@@ -282,6 +286,7 @@ class PaymentIntegrationTest {
         assertThat(paymentCount).isEqualTo(1);
         assertThat(outboxCount).isEqualTo(1);
         assertThat(mockPaymentProvider.getEffectiveChargeCount()).isEqualTo(1);
+        assertThat(mockPaymentProvider.getRawChargeInvocationCount()).isEqualTo(1);
     }
 
     // =========================================================================
@@ -292,9 +297,11 @@ class PaymentIntegrationTest {
     void twoDifferentEventIdsSameOrder() {
         UUID orderId = UUID.randomUUID();
         UUID userId = UUID.randomUUID();
+        UUID event1Id = UUID.randomUUID();
+        UUID event2Id = UUID.randomUUID();
 
-        String event1 = buildPaymentRequestedEnvelopeJson(UUID.randomUUID(), orderId, userId, "pm_tok_visa", 10000);
-        String event2 = buildPaymentRequestedEnvelopeJson(UUID.randomUUID(), orderId, userId, "pm_tok_visa", 10000);
+        String event1 = buildPaymentRequestedEnvelopeJson(event1Id, orderId, userId, "pm_tok_visa", 10000);
+        String event2 = buildPaymentRequestedEnvelopeJson(event2Id, orderId, userId, "pm_tok_visa", 10000);
 
         sendToKafka(Topics.ORDER_EVENTS, orderId.toString(), event1);
         assertThat(awaitCondition(() -> paymentRepository.findByOrderId(orderId).isPresent(), Duration.ofSeconds(10)))
@@ -302,7 +309,9 @@ class PaymentIntegrationTest {
 
         sendToKafka(Topics.ORDER_EVENTS, orderId.toString(), event2);
 
-        try { Thread.sleep(1000); } catch (InterruptedException ignored) {}
+        // Poll for second eventId processed in processed_events instead of Thread.sleep
+        assertThat(awaitCondition(() -> countProcessedEvents(event2Id) > 0, Duration.ofSeconds(10)))
+                .isTrue();
 
         Integer paymentCount = jdbcTemplate.queryForObject(
                 "SELECT COUNT(*) FROM payments WHERE order_id = ?", Integer.class, orderId
@@ -313,6 +322,7 @@ class PaymentIntegrationTest {
         assertThat(paymentCount).isEqualTo(1);
         assertThat(outboxCount).isEqualTo(1);
         assertThat(mockPaymentProvider.getEffectiveChargeCount()).isEqualTo(1);
+        assertThat(mockPaymentProvider.getRawChargeInvocationCount()).isEqualTo(1);
     }
 
     // =========================================================================
@@ -360,6 +370,7 @@ class PaymentIntegrationTest {
         );
         assertThat(paymentCount).isEqualTo(1);
         assertThat(outboxCount).isEqualTo(1);
+        assertThat(mockPaymentProvider.getEffectiveChargeCount()).isEqualTo(1);
     }
 
     // =========================================================================
@@ -371,11 +382,23 @@ class PaymentIntegrationTest {
         UUID orderId = UUID.randomUUID();
         UUID userId = UUID.randomUUID();
 
+        long initialRetry0 = getTopicTotalEndOffset(ORDER_RETRY_0);
+
         publishOrderPaymentRequested(orderId, userId, MockPaymentProvider.MAGIC_TOKEN_ERROR, 20000);
 
-        // Await payment reaching SUCCEEDED after retry
-        assertThat(awaitCondition(() -> paymentRepository.findByOrderId(orderId).isPresent(), Duration.ofSeconds(15)))
+        // Assert retry topic end offset increased before payment becomes SUCCEEDED
+        assertThat(awaitCondition(() -> getTopicTotalEndOffset(ORDER_RETRY_0) >= initialRetry0 + 1, Duration.ofSeconds(10)))
                 .isTrue();
+
+        // At this moment, the initial delivery failed and was forwarded to retry topic
+        Optional<PaymentRecord> early = paymentRepository.findByOrderId(orderId);
+        assertThat(early.isEmpty() || early.get().status() != PaymentStatus.SUCCEEDED).isTrue();
+
+        // Await payment reaching SUCCEEDED after retry
+        assertThat(awaitCondition(() -> {
+            Optional<PaymentRecord> p = paymentRepository.findByOrderId(orderId);
+            return p.isPresent() && p.get().status() == PaymentStatus.SUCCEEDED;
+        }, Duration.ofSeconds(15))).isTrue();
 
         PaymentRecord payment = paymentRepository.findByOrderId(orderId).orElseThrow();
         assertThat(payment.status()).isEqualTo(PaymentStatus.SUCCEEDED);
@@ -481,16 +504,19 @@ class PaymentIntegrationTest {
 
         PaymentRecord payment = paymentRepository.findByOrderId(orderId).orElseThrow();
 
-        publishOrderRefundRequested(orderId, payment.paymentId(), userId, 15000, "LATE_PAYMENT_EXPIRED_HOLD");
+        UUID refundEvent1 = UUID.randomUUID();
+        publishOrderRefundRequested(refundEvent1, orderId, payment.paymentId(), userId, 15000, "LATE_PAYMENT_EXPIRED_HOLD");
         assertThat(awaitCondition(() -> {
             Optional<PaymentRecord> p = paymentRepository.findByOrderId(orderId);
             return p.isPresent() && p.get().status() == PaymentStatus.REFUNDED;
         }, Duration.ofSeconds(10))).isTrue();
 
         // Second refund with a fresh eventId
-        publishOrderRefundRequested(orderId, payment.paymentId(), userId, 15000, "LATE_PAYMENT_EXPIRED_HOLD");
+        UUID refundEvent2 = UUID.randomUUID();
+        publishOrderRefundRequested(refundEvent2, orderId, payment.paymentId(), userId, 15000, "LATE_PAYMENT_EXPIRED_HOLD");
 
-        try { Thread.sleep(1000); } catch (InterruptedException ignored) {}
+        // Poll for refundEvent2 row in processed_events instead of Thread.sleep
+        assertThat(awaitCondition(() -> countProcessedEvents(refundEvent2) > 0, Duration.ofSeconds(10))).isTrue();
 
         Integer refundOutboxCount = jdbcTemplate.queryForObject(
                 "SELECT COUNT(*) FROM outbox_events WHERE aggregate_id = ? AND event_type = ?",
@@ -516,9 +542,11 @@ class PaymentIntegrationTest {
         PaymentRecord payment = paymentRepository.findByOrderId(orderId).orElseThrow();
         assertThat(payment.status()).isEqualTo(PaymentStatus.FAILED);
 
-        publishOrderRefundRequested(orderId, payment.paymentId(), userId, 15000, "LATE_PAYMENT_EXPIRED_HOLD");
+        UUID refundEventId = UUID.randomUUID();
+        publishOrderRefundRequested(refundEventId, orderId, payment.paymentId(), userId, 15000, "LATE_PAYMENT_EXPIRED_HOLD");
 
-        try { Thread.sleep(1000); } catch (InterruptedException ignored) {}
+        // Poll for refundEventId row in processed_events instead of Thread.sleep
+        assertThat(awaitCondition(() -> countProcessedEvents(refundEventId) > 0, Duration.ofSeconds(10))).isTrue();
 
         PaymentRecord current = paymentRepository.findByOrderId(orderId).orElseThrow();
         assertThat(current.status()).isEqualTo(PaymentStatus.FAILED);
@@ -607,6 +635,9 @@ class PaymentIntegrationTest {
         UUID orderId = UUID.randomUUID();
         UUID userId = UUID.randomUUID();
 
+        // Snapshot end offsets of PAYMENT_EVENTS before action
+        Map<TopicPartition, Long> startOffsets = getTopicEndOffsets(Topics.PAYMENT_EVENTS);
+
         publishOrderPaymentRequested(orderId, userId, "pm_tok_visa", 15000);
         assertThat(awaitCondition(() -> paymentRepository.findByOrderId(orderId).isPresent(), Duration.ofSeconds(10)))
                 .isTrue();
@@ -625,8 +656,8 @@ class PaymentIntegrationTest {
         assertThat(awaitCondition(() -> paymentRepository.findByOrderId(failedOrderId).isPresent(), Duration.ofSeconds(10)))
                 .isTrue();
 
-        // Poll payment.events and verify records
-        List<ConsumerRecord<String, String>> received = pollRecordsFromTopic(Topics.PAYMENT_EVENTS, Duration.ofSeconds(10));
+        // Poll payment.events from snapshot offsets and filter by key
+        List<ConsumerRecord<String, String>> received = pollRecordsFromTopic(Topics.PAYMENT_EVENTS, startOffsets, Duration.ofSeconds(10));
 
         List<ConsumerRecord<String, String>> orderRecords = received.stream()
                 .filter(r -> orderId.toString().equals(r.key()))
@@ -677,6 +708,254 @@ class PaymentIntegrationTest {
     }
 
     // =========================================================================
+    // 16. Invalid order.payment.requested lands in DLT without touching retries
+    // =========================================================================
+    @Test
+    @DisplayName("16. order.payment.requested with reservationId != orderId, 4-letter currency, 101-character token lands in DLT without touching retry topics")
+    void invalidPaymentRequestedLandsInDlt() {
+        long initialRetry0 = getTopicTotalEndOffset(ORDER_RETRY_0);
+        long initialRetry1 = getTopicTotalEndOffset(ORDER_RETRY_1);
+        long initialDlt = getTopicTotalEndOffset(ORDER_DLT);
+        int initialRawCharges = mockPaymentProvider.getRawChargeInvocationCount();
+
+        UUID orderId = UUID.randomUUID();
+        UUID reservationId = UUID.randomUUID(); // reservationId != orderId
+        UUID userId = UUID.randomUUID();
+        String token101 = "pm_tok_" + "x".repeat(94); // exactly 101 chars
+
+        PaymentRequestedPayload payload = new PaymentRequestedPayload(
+                orderId,
+                reservationId,
+                userId,
+                UUID.randomUUID(),
+                25000L,
+                "USDD", // 4-letter currency
+                token101,
+                Instant.now(),
+                Instant.now().plusSeconds(600)
+        );
+        EventEnvelope<PaymentRequestedPayload> envelope = new EventEnvelope<>(
+                UUID.randomUUID(),
+                EventTypes.ORDER_PAYMENT_REQUESTED,
+                Instant.now(),
+                UUID.randomUUID().toString(),
+                1,
+                payload
+        );
+        try {
+            sendToKafka(Topics.ORDER_EVENTS, orderId.toString(), objectMapper.writeValueAsString(envelope));
+        } catch (Exception e) {
+            throw new RuntimeException(e);
+        }
+
+        assertThat(awaitCondition(() -> getTopicTotalEndOffset(ORDER_DLT) >= initialDlt + 1, Duration.ofSeconds(10)))
+                .isTrue();
+
+        assertThat(getTopicTotalEndOffset(ORDER_RETRY_0)).isEqualTo(initialRetry0);
+        assertThat(getTopicTotalEndOffset(ORDER_RETRY_1)).isEqualTo(initialRetry1);
+        assertThat(mockPaymentProvider.getRawChargeInvocationCount()).isEqualTo(initialRawCharges);
+        assertThat(paymentRepository.findByOrderId(orderId)).isEmpty();
+
+        Integer outboxCount = jdbcTemplate.queryForObject(
+                "SELECT COUNT(*) FROM outbox_events WHERE aggregate_id = ?", Integer.class, orderId
+        );
+        assertThat(outboxCount).isEqualTo(0);
+    }
+
+    // =========================================================================
+    // 17. Refund request with 100-character reason succeeds, payload <= 64 chars
+    // =========================================================================
+    @Test
+    @DisplayName("17. Refund request with 100-character reason succeeds, payment becomes REFUNDED, payload reason <= 64 chars")
+    void refundWithLongReasonTruncated() throws Exception {
+        UUID orderId = UUID.randomUUID();
+        UUID userId = UUID.randomUUID();
+
+        publishOrderPaymentRequested(orderId, userId, "pm_tok_visa", 15000);
+        assertThat(awaitCondition(() -> paymentRepository.findByOrderId(orderId).isPresent(), Duration.ofSeconds(10)))
+                .isTrue();
+
+        PaymentRecord payment = paymentRepository.findByOrderId(orderId).orElseThrow();
+        assertThat(payment.status()).isEqualTo(PaymentStatus.SUCCEEDED);
+
+        String longReason = "REASON_".repeat(15); // 105 characters (> 100 chars)
+        assertThat(longReason.length()).isGreaterThan(100);
+
+        publishOrderRefundRequested(orderId, payment.paymentId(), userId, 15000, longReason);
+
+        assertThat(awaitCondition(() -> {
+            Optional<PaymentRecord> p = paymentRepository.findByOrderId(orderId);
+            return p.isPresent() && p.get().status() == PaymentStatus.REFUNDED;
+        }, Duration.ofSeconds(10))).isTrue();
+
+        PaymentRecord refundedPayment = paymentRepository.findByOrderId(orderId).orElseThrow();
+        assertThat(refundedPayment.refundReason()).isNotNull();
+        assertThat(refundedPayment.refundReason().length()).isLessThanOrEqualTo(64);
+        assertThat(refundedPayment.refundReason()).isEqualTo(longReason.substring(0, 64));
+
+        List<Map<String, Object>> outboxRows = jdbcTemplate.queryForList(
+                "SELECT * FROM outbox_events WHERE aggregate_id = ? AND event_type = ?",
+                orderId, EventTypes.PAYMENT_REFUNDED
+        );
+        assertThat(outboxRows).hasSize(1);
+        PaymentRefundedPayload payload = objectMapper.readValue(
+                outboxRows.get(0).get("payload").toString(), PaymentRefundedPayload.class
+        );
+        assertThat(payload.reason()).isNotNull();
+        assertThat(payload.reason().length()).isLessThanOrEqualTo(64);
+        assertThat(payload.reason()).isEqualTo(longReason.substring(0, 64));
+    }
+
+    // =========================================================================
+    // 18. Mock-declined refund leaves payment SUCCEEDED and lands in DLT
+    // =========================================================================
+    @Test
+    @DisplayName("18. Mock-declined refund leaves payment SUCCEEDED, 0 payment.refunded outbox rows, increments payment_refund_declined_total, lands in DLT")
+    void mockDeclinedRefundLeavesPaymentSucceededAndLandsInDlt() {
+        UUID orderId = UUID.randomUUID();
+        UUID userId = UUID.randomUUID();
+
+        long initialRetry0 = getTopicTotalEndOffset(ORDER_RETRY_0);
+        long initialRetry1 = getTopicTotalEndOffset(ORDER_RETRY_1);
+        double declinedCountBefore = getMetricCount("payment_refund_declined_total", "failure_code", "REFUND_DECLINED");
+
+        // Charge succeeds with tok_refund_decline
+        publishOrderPaymentRequested(orderId, userId, MockPaymentProvider.MAGIC_TOKEN_REFUND_DECLINE, 18000);
+        assertThat(awaitCondition(() -> paymentRepository.findByOrderId(orderId).isPresent(), Duration.ofSeconds(10)))
+                .isTrue();
+
+        PaymentRecord payment = paymentRepository.findByOrderId(orderId).orElseThrow();
+        assertThat(payment.status()).isEqualTo(PaymentStatus.SUCCEEDED);
+
+        long dltBeforeRefund = getTopicTotalEndOffset(ORDER_DLT);
+
+        // Request refund
+        publishOrderRefundRequested(orderId, payment.paymentId(), userId, 18000, "LATE_PAYMENT_EXPIRED_HOLD");
+
+        assertThat(awaitCondition(() -> getTopicTotalEndOffset(ORDER_DLT) >= dltBeforeRefund + 1, Duration.ofSeconds(10)))
+                .isTrue();
+
+        // Non-retryable: retry topics unchanged
+        assertThat(getTopicTotalEndOffset(ORDER_RETRY_0)).isEqualTo(initialRetry0);
+        assertThat(getTopicTotalEndOffset(ORDER_RETRY_1)).isEqualTo(initialRetry1);
+
+        // Payment remains in SUCCEEDED
+        PaymentRecord currentPayment = paymentRepository.findByOrderId(orderId).orElseThrow();
+        assertThat(currentPayment.status()).isEqualTo(PaymentStatus.SUCCEEDED);
+        assertThat(currentPayment.refundId()).isNull();
+
+        // 0 payment.refunded outbox rows
+        Integer refundOutboxCount = jdbcTemplate.queryForObject(
+                "SELECT COUNT(*) FROM outbox_events WHERE aggregate_id = ? AND event_type = ?",
+                Integer.class, orderId, EventTypes.PAYMENT_REFUNDED
+        );
+        assertThat(refundOutboxCount).isEqualTo(0);
+
+        // Metric incremented
+        assertThat(awaitCondition(() -> getMetricCount("payment_refund_declined_total", "failure_code", "REFUND_DECLINED") >= declinedCountBefore + 1, Duration.ofSeconds(5)))
+                .isTrue();
+    }
+
+    // =========================================================================
+    // 19. Record without Kafka header uses JSON correlationId
+    // =========================================================================
+    @Test
+    @DisplayName("19. Record without Kafka correlation header but with correlationId in JSON body produces outbox rows with that correlation ID")
+    void recordWithoutKafkaHeaderUsesJsonCorrelationId() {
+        UUID orderId = UUID.randomUUID();
+        UUID userId = UUID.randomUUID();
+        UUID expectedCorrelationId = UUID.randomUUID();
+
+        PaymentRequestedPayload payload = new PaymentRequestedPayload(
+                orderId,
+                orderId,
+                userId,
+                UUID.randomUUID(),
+                19000L,
+                "USD",
+                "pm_tok_visa",
+                Instant.now(),
+                Instant.now().plusSeconds(600)
+        );
+        EventEnvelope<PaymentRequestedPayload> envelope = new EventEnvelope<>(
+                UUID.randomUUID(),
+                EventTypes.ORDER_PAYMENT_REQUESTED,
+                Instant.now(),
+                expectedCorrelationId.toString(),
+                1,
+                payload
+        );
+
+        // Send WITHOUT Kafka correlation headers
+        try {
+            String json = objectMapper.writeValueAsString(envelope);
+            ProducerRecord<String, String> record = new ProducerRecord<>(Topics.ORDER_EVENTS, orderId.toString(), json);
+            kafkaTemplate.send(record).get(5, TimeUnit.SECONDS);
+        } catch (Exception e) {
+            throw new RuntimeException(e);
+        }
+
+        assertThat(awaitCondition(() -> paymentRepository.findByOrderId(orderId).isPresent(), Duration.ofSeconds(10)))
+                .isTrue();
+
+        List<Map<String, Object>> outboxRows = jdbcTemplate.queryForList(
+                "SELECT correlation_id FROM outbox_events WHERE aggregate_id = ? AND event_type = ?",
+                orderId, EventTypes.PAYMENT_SUCCEEDED
+        );
+        assertThat(outboxRows).hasSize(1);
+        assertThat(outboxRows.get(0).get("correlation_id")).isEqualTo(expectedCorrelationId);
+    }
+
+    // =========================================================================
+    // 20. Record with non-UUID correlationId goes directly to DLT
+    // =========================================================================
+    @Test
+    @DisplayName("20. Record with non-UUID correlationId goes directly to DLT")
+    void recordWithNonUuidCorrelationIdGoesToDlt() {
+        long initialRetry0 = getTopicTotalEndOffset(ORDER_RETRY_0);
+        long initialRetry1 = getTopicTotalEndOffset(ORDER_RETRY_1);
+        long initialDlt = getTopicTotalEndOffset(ORDER_DLT);
+        int initialRawCharges = mockPaymentProvider.getRawChargeInvocationCount();
+
+        UUID orderId = UUID.randomUUID();
+        UUID userId = UUID.randomUUID();
+
+        PaymentRequestedPayload payload = new PaymentRequestedPayload(
+                orderId,
+                orderId,
+                userId,
+                UUID.randomUUID(),
+                19000L,
+                "USD",
+                "pm_tok_visa",
+                Instant.now(),
+                Instant.now().plusSeconds(600)
+        );
+        EventEnvelope<PaymentRequestedPayload> envelope = new EventEnvelope<>(
+                UUID.randomUUID(),
+                EventTypes.ORDER_PAYMENT_REQUESTED,
+                Instant.now(),
+                "not-a-valid-uuid-12345", // non-UUID correlationId
+                1,
+                payload
+        );
+
+        try {
+            sendToKafka(Topics.ORDER_EVENTS, orderId.toString(), objectMapper.writeValueAsString(envelope));
+        } catch (Exception e) {
+            throw new RuntimeException(e);
+        }
+
+        assertThat(awaitCondition(() -> getTopicTotalEndOffset(ORDER_DLT) >= initialDlt + 1, Duration.ofSeconds(10)))
+                .isTrue();
+
+        assertThat(getTopicTotalEndOffset(ORDER_RETRY_0)).isEqualTo(initialRetry0);
+        assertThat(getTopicTotalEndOffset(ORDER_RETRY_1)).isEqualTo(initialRetry1);
+        assertThat(mockPaymentProvider.getRawChargeInvocationCount()).isEqualTo(initialRawCharges);
+        assertThat(paymentRepository.findByOrderId(orderId)).isEmpty();
+    }
+
+    // =========================================================================
     // Helper Methods
     // =========================================================================
 
@@ -686,7 +965,11 @@ class PaymentIntegrationTest {
     }
 
     private void publishOrderRefundRequested(UUID orderId, UUID paymentId, UUID userId, long amountCents, String reason) {
-        String json = buildRefundRequestedEnvelopeJson(UUID.randomUUID(), orderId, paymentId, userId, amountCents, reason);
+        publishOrderRefundRequested(UUID.randomUUID(), orderId, paymentId, userId, amountCents, reason);
+    }
+
+    private void publishOrderRefundRequested(UUID eventId, UUID orderId, UUID paymentId, UUID userId, long amountCents, String reason) {
+        String json = buildRefundRequestedEnvelopeJson(eventId, orderId, paymentId, userId, amountCents, reason);
         sendToKafka(Topics.ORDER_EVENTS, orderId.toString(), json);
     }
 
@@ -753,6 +1036,24 @@ class PaymentIntegrationTest {
         }
     }
 
+    private int countProcessedEvents(UUID eventId) {
+        Integer count = jdbcTemplate.queryForObject(
+                "SELECT COUNT(*) FROM processed_events WHERE event_id = ? AND consumer_group = ?",
+                Integer.class, eventId, CONSUMER_GROUP
+        );
+        return count != null ? count : 0;
+    }
+
+    private double getConsumerDuplicateCount() {
+        var counter = meterRegistry.find("consumer_events_duplicate_total").counter();
+        return counter != null ? counter.count() : 0.0;
+    }
+
+    private double getMetricCount(String metricName, String tagKey, String tagValue) {
+        var counter = meterRegistry.find(metricName).tag(tagKey, tagValue).counter();
+        return counter != null ? counter.count() : 0.0;
+    }
+
     private long getTopicTotalEndOffset(String topic) {
         Properties props = new Properties();
         props.put(ConsumerConfig.BOOTSTRAP_SERVERS_CONFIG, KAFKA.getBootstrapServers());
@@ -768,7 +1069,21 @@ class PaymentIntegrationTest {
         }
     }
 
-    private List<ConsumerRecord<String, String>> pollRecordsFromTopic(String topic, Duration timeout) {
+    private Map<TopicPartition, Long> getTopicEndOffsets(String topic) {
+        Properties props = new Properties();
+        props.put(ConsumerConfig.BOOTSTRAP_SERVERS_CONFIG, KAFKA.getBootstrapServers());
+        props.put(ConsumerConfig.KEY_DESERIALIZER_CLASS_CONFIG, StringDeserializer.class);
+        props.put(ConsumerConfig.VALUE_DESERIALIZER_CLASS_CONFIG, StringDeserializer.class);
+        props.put(ConsumerConfig.GROUP_ID_CONFIG, "offset-checker-" + UUID.randomUUID());
+        try (KafkaConsumer<String, String> consumer = new KafkaConsumer<>(props)) {
+            List<TopicPartition> partitions = consumer.partitionsFor(topic).stream()
+                    .map(p -> new TopicPartition(p.topic(), p.partition()))
+                    .toList();
+            return consumer.endOffsets(partitions);
+        }
+    }
+
+    private List<ConsumerRecord<String, String>> pollRecordsFromTopic(String topic, Map<TopicPartition, Long> startOffsets, Duration timeout) {
         Properties props = new Properties();
         props.put(ConsumerConfig.BOOTSTRAP_SERVERS_CONFIG, KAFKA.getBootstrapServers());
         props.put(ConsumerConfig.KEY_DESERIALIZER_CLASS_CONFIG, StringDeserializer.class);
@@ -778,7 +1093,18 @@ class PaymentIntegrationTest {
 
         List<ConsumerRecord<String, String>> result = new ArrayList<>();
         try (KafkaConsumer<String, String> consumer = new KafkaConsumer<>(props)) {
-            consumer.subscribe(List.of(topic));
+            List<TopicPartition> partitions = consumer.partitionsFor(topic).stream()
+                    .map(p -> new TopicPartition(p.topic(), p.partition()))
+                    .toList();
+            consumer.assign(partitions);
+            if (startOffsets != null) {
+                for (TopicPartition tp : partitions) {
+                    Long offset = startOffsets.get(tp);
+                    if (offset != null) {
+                        consumer.seek(tp, offset);
+                    }
+                }
+            }
             long deadline = System.currentTimeMillis() + timeout.toMillis();
             while (System.currentTimeMillis() < deadline) {
                 ConsumerRecords<String, String> records = consumer.poll(Duration.ofMillis(300));
@@ -815,4 +1141,3 @@ class PaymentIntegrationTest {
         return supplier.getAsBoolean();
     }
 }
-

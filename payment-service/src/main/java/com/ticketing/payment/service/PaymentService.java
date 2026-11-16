@@ -2,6 +2,7 @@ package com.ticketing.payment.service;
 
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
+import com.ticketing.common.correlation.CorrelationConstants;
 import com.ticketing.common.events.EventEnvelope;
 import com.ticketing.common.events.PaymentFailedPayload;
 import com.ticketing.common.events.PaymentRefundedPayload;
@@ -22,6 +23,7 @@ import com.ticketing.payment.service.provider.PaymentProvider;
 import com.ticketing.payment.service.provider.PaymentResult;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
+import org.slf4j.MDC;
 import org.springframework.stereotype.Service;
 
 import java.time.Instant;
@@ -76,15 +78,36 @@ public class PaymentService {
 
     public void processOrderEvent(String rawJson) {
         EventEnvelope<JsonNode> envelope = envelopeParser.parse(rawJson);
-        String eventType = envelope.eventType();
-        UUID eventId = envelope.eventId();
 
-        switch (eventType) {
-            case EventTypes.ORDER_PAYMENT_REQUESTED -> handleOrderPaymentRequested(envelope);
-            case EventTypes.ORDER_REFUND_REQUESTED -> handleOrderRefundRequested(envelope);
-            default -> {
-                log.debug("Acknowledging and ignoring unhandled eventType={} for eventId={}", eventType, eventId);
-                metrics.recordEventHandled(eventType, "ignored");
+        String correlationId = envelope.correlationId();
+        if (correlationId == null || correlationId.isBlank()) {
+            throw new NonRetryableEventException("Missing correlationId in event envelope");
+        }
+        try {
+            UUID.fromString(correlationId);
+        } catch (IllegalArgumentException ex) {
+            throw new NonRetryableEventException("Invalid correlationId in event envelope: " + correlationId, ex);
+        }
+
+        String previousCorrelationId = MDC.get(CorrelationConstants.MDC_KEY);
+        MDC.put(CorrelationConstants.MDC_KEY, correlationId);
+        try {
+            String eventType = envelope.eventType();
+            UUID eventId = envelope.eventId();
+
+            switch (eventType) {
+                case EventTypes.ORDER_PAYMENT_REQUESTED -> handleOrderPaymentRequested(envelope);
+                case EventTypes.ORDER_REFUND_REQUESTED -> handleOrderRefundRequested(envelope);
+                default -> {
+                    log.debug("Acknowledging and ignoring unhandled eventType={} for eventId={}", eventType, eventId);
+                    metrics.recordEventHandled(eventType, "ignored");
+                }
+            }
+        } finally {
+            if (previousCorrelationId != null) {
+                MDC.put(CorrelationConstants.MDC_KEY, previousCorrelationId);
+            } else {
+                MDC.remove(CorrelationConstants.MDC_KEY);
             }
         }
     }
@@ -97,10 +120,8 @@ public class PaymentService {
             throw new NonRetryableEventException("Malformed order.payment.requested payload: " + ex.getMessage(), ex);
         }
 
-        if (payload == null || payload.orderId() == null || payload.userId() == null
-                || payload.amountCents() <= 0 || payload.currency() == null || payload.paymentMethodToken() == null) {
-            throw new NonRetryableEventException("Invalid order.payment.requested payload: missing required fields");
-        }
+        // 1. Pre-charge validation before touching the provider or database
+        PaymentPayloadValidator.validatePaymentRequested(payload);
 
         UUID orderId = payload.orderId();
         UUID eventId = envelope.eventId();
@@ -108,7 +129,7 @@ public class PaymentService {
 
         log.info("Processing order.payment.requested for orderId={}, eventId={}", orderId, eventId);
 
-        // 1. First check whether a payment row for the order already exists (read without lock)
+        // 2. Check whether a payment row for the order already exists (read without lock)
         Optional<PaymentRecord> existing = paymentRepository.findByOrderId(orderId);
         if (existing.isPresent()) {
             log.info("Payment for orderId={} already exists (status={}); skipping provider charge",
@@ -120,7 +141,7 @@ public class PaymentService {
             return;
         }
 
-        // 2. Call provider before the transaction with idempotencyKey equal to orderId
+        // 3. Call provider before the transaction with idempotencyKey equal to orderId
         long startNanos = System.nanoTime();
         PaymentResult result;
         try {
@@ -133,7 +154,7 @@ public class PaymentService {
             throw ex; // Technical error propagates to retry topics
         }
 
-        // 3. Processor transaction
+        // 4. Processor transaction
         boolean processed = idempotentEventProcessor.process(eventId, CONSUMER_GROUP, eventType, () -> {
             invokeInsideTransactionHook();
 
@@ -215,22 +236,22 @@ public class PaymentService {
             throw new NonRetryableEventException("Malformed order.refund.requested payload: " + ex.getMessage(), ex);
         }
 
-        if (payload == null || payload.orderId() == null || payload.amountCents() <= 0 || payload.currency() == null) {
-            throw new NonRetryableEventException("Invalid order.refund.requested payload: missing required fields");
-        }
+        // 1. Pre-refund validation before touching provider or database
+        PaymentPayloadValidator.validateRefundRequested(payload);
+        String truncatedReason = PaymentPayloadValidator.sanitizeRefundReason(payload.reason());
 
         UUID orderId = payload.orderId();
         UUID eventId = envelope.eventId();
         String eventType = envelope.eventType();
 
-        // 1. Look up payment by order id
+        // 2. Look up payment by order id
         Optional<PaymentRecord> paymentOpt = paymentRepository.findByOrderId(orderId);
         if (paymentOpt.isEmpty()) {
             throw new NonRetryableEventException("Payment not found for orderId: " + orderId);
         }
         PaymentRecord payment = paymentOpt.get();
 
-        // 2. A payment that is FAILED or already REFUNDED is a no-op
+        // 3. A payment that is FAILED or already REFUNDED is a no-op
         if (payment.status() == PaymentStatus.FAILED || payment.status() == PaymentStatus.REFUNDED) {
             log.info("Payment for orderId={} is already in terminal non-refundable status={}; skipping refund",
                     orderId, payment.status());
@@ -239,24 +260,40 @@ public class PaymentService {
             return;
         }
 
-        // 3. A refund amount or currency that differs from payment's throws NonRetryableEventException
+        // 4. A refund amount or currency that differs from payment's throws NonRetryableEventException
         if (payload.amountCents() != payment.amountCents() || !payload.currency().equalsIgnoreCase(payment.currency())) {
             throw new NonRetryableEventException("Refund amount or currency does not match original payment for orderId: " + orderId);
         }
 
-        // 4. For SUCCEEDED payment: call provider refund with idempotencyKey equal to paymentId before transaction
+        // 5. For SUCCEEDED payment: call provider refund with idempotencyKey equal to paymentId before transaction
         long startNanos = System.nanoTime();
+        PaymentResult result;
         try {
-            paymentProvider.refund(payment.paymentId(), payment.providerReference(), payload.amountCents(), payload.currency());
+            result = paymentProvider.refund(
+                    payment.paymentId(),
+                    payment.providerReference(),
+                    payload.amountCents(),
+                    payload.currency(),
+                    payment.paymentMethodToken()
+            );
             metrics.recordProviderDuration("refund", System.nanoTime() - startNanos);
-            metrics.recordProviderCall("refund", "succeeded");
+            metrics.recordProviderCall("refund", result.outcome() == PaymentResult.Outcome.SUCCEEDED ? "succeeded" : "declined");
         } catch (Exception ex) {
             metrics.recordProviderDuration("refund", System.nanoTime() - startNanos);
             metrics.recordProviderCall("refund", "error");
-            throw ex;
+            throw ex; // Technical error propagates to retry topics
         }
 
-        // 5. In processor transaction: lock payment row, move SUCCEEDED to REFUNDED with refunded_at from DB clock
+        // If refund is DECLINED: do not mark refunded, do not write outbox, log ERROR, increment metric, route to DLT
+        if (result.outcome() == PaymentResult.Outcome.DECLINED) {
+            log.error("Payment refund declined by provider for paymentId={}, failureCode={}, failureMessage={}",
+                    payment.paymentId(), result.failureCode(), result.failureMessage());
+            metrics.recordRefundDeclined(result.failureCode());
+            throw new NonRetryableEventException(
+                    "Payment refund declined for paymentId=" + payment.paymentId() + ": " + result.failureCode());
+        }
+
+        // 6. In processor transaction: lock payment row, move SUCCEEDED to REFUNDED with refunded_at from DB clock
         boolean processed = idempotentEventProcessor.process(eventId, CONSUMER_GROUP, eventType, () -> {
             invokeInsideTransactionHook();
 
@@ -267,11 +304,8 @@ public class PaymentService {
             }
 
             UUID refundId = UUID.randomUUID();
-            String reason = (payload.reason() != null && !payload.reason().isBlank())
-                    ? payload.reason()
-                    : "LATE_PAYMENT_EXPIRED_HOLD";
 
-            Optional<Instant> refundedAtOpt = paymentRepository.updateRefunded(payment.paymentId(), refundId, reason);
+            Optional<Instant> refundedAtOpt = paymentRepository.updateRefunded(payment.paymentId(), refundId, truncatedReason);
             if (refundedAtOpt.isEmpty()) {
                 log.info("Payment {} was already refunded; skipping outbox", payment.paymentId());
                 return;
@@ -286,7 +320,7 @@ public class PaymentService {
                     payment.userId(),
                     payment.amountCents(),
                     payment.currency(),
-                    reason,
+                    truncatedReason,
                     refundedAt
             );
             outboxWriter.append(orderId, EventTypes.PAYMENT_REFUNDED, outboxPayload);
@@ -300,4 +334,3 @@ public class PaymentService {
         }
     }
 }
-

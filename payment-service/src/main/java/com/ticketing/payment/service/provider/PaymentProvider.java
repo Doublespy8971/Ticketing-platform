@@ -9,5 +9,9 @@ public interface PaymentProvider {
 
     PaymentResult refund(UUID idempotencyKey, String providerReference, long amountCents, String currency)
             throws ProviderUnavailableException;
-}
 
+    default PaymentResult refund(UUID idempotencyKey, String providerReference, long amountCents, String currency, String paymentMethodToken)
+            throws ProviderUnavailableException {
+        return refund(idempotencyKey, providerReference, amountCents, currency);
+    }
+}

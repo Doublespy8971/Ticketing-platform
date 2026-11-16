@@ -19,6 +19,7 @@ public class PaymentMetrics {
     public static final String METRIC_PROVIDER_DURATION = "payment_provider_duration_seconds";
     public static final String METRIC_EVENTS_HANDLED = "payment_events_handled_total";
     public static final String METRIC_PAYMENTS_PROCESSED = "ticketing_payments_processed_total";
+    public static final String METRIC_REFUND_DECLINED = "payment_refund_declined_total";
 
     private static final Set<String> WHITELISTED_EVENT_TYPES = Set.of(
             EventTypes.INVENTORY_SEAT_RESERVED,
@@ -33,6 +34,14 @@ public class PaymentMetrics {
             EventTypes.PAYMENT_SUCCEEDED,
             EventTypes.PAYMENT_FAILED,
             EventTypes.PAYMENT_REFUNDED
+    );
+
+    private static final Set<String> WHITELISTED_REFUND_FAILURE_CODES = Set.of(
+            "REFUND_DECLINED",
+            "CARD_DECLINED",
+            "INSUFFICIENT_FUNDS",
+            "EXPIRED_CARD",
+            "CHARGE_ALREADY_REFUNDED"
     );
 
     private final MeterRegistry meterRegistry;
@@ -89,5 +98,17 @@ public class PaymentMetrics {
                         .register(meterRegistry)
         ).increment();
     }
-}
 
+    public void recordRefundDeclined(String failureCode) {
+        String code = (failureCode != null && WHITELISTED_REFUND_FAILURE_CODES.contains(failureCode))
+                ? failureCode
+                : "other";
+        String key = "refund_declined:" + code;
+        counters.computeIfAbsent(key, k ->
+                Counter.builder(METRIC_REFUND_DECLINED)
+                        .description("Total payment refunds declined by payment provider")
+                        .tag("failure_code", code)
+                        .register(meterRegistry)
+        ).increment();
+    }
+}
