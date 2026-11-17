@@ -6,9 +6,11 @@ import java.net.http.HttpRequest;
 import java.net.http.HttpResponse;
 import java.nio.charset.StandardCharsets;
 import java.time.Duration;
+import java.util.ArrayList;
 import java.util.Collections;
 import java.util.HashSet;
 import java.util.LinkedHashMap;
+import java.util.List;
 import java.util.Map;
 import java.util.Set;
 import java.util.regex.Matcher;
@@ -18,7 +20,7 @@ import java.util.regex.Pattern;
  * Scrapes {@code notification-service} Prometheus metrics from {@code :8084/metrics}
  * and exposes per-{@code (event_type, outcome)} counter snapshots and diffs.
  */
-public final class Notifications {
+public final class Notifications implements InvariantAuditor.NotificationAccess {
 
     private static final Pattern LABEL_PATTERN = Pattern.compile("(\\w+)=\"([^\"]*)\"");
 
@@ -35,6 +37,23 @@ public final class Notifications {
     public record CounterKey(String eventType, String outcome) {}
 
     public record NotificationSnapshot(Map<CounterKey, Long> counters) {
+        public static NotificationSnapshot empty() {
+            return new NotificationSnapshot(Map.of());
+        }
+
+        public static NotificationSnapshot ofCounts(long confirmedSent, long cancelledSent, long duplicateCount, long failedCount) {
+            Map<CounterKey, Long> map = new LinkedHashMap<>();
+            map.put(new CounterKey("order.confirmed", "sent"), confirmedSent);
+            map.put(new CounterKey("order.cancelled", "sent"), cancelledSent);
+            if (duplicateCount != 0L) {
+                map.put(new CounterKey("order.confirmed", "duplicate"), duplicateCount);
+            }
+            if (failedCount != 0L) {
+                map.put(new CounterKey("order.confirmed", "failed"), failedCount);
+            }
+            return new NotificationSnapshot(Collections.unmodifiableMap(map));
+        }
+
         public long count(String eventType, String outcome) {
             return counters.getOrDefault(new CounterKey(eventType, outcome), 0L);
         }
@@ -55,6 +74,13 @@ public final class Notifications {
             return sent("order.confirmed") + sent("order.cancelled");
         }
 
+        public long totalDuplicate() {
+            return counters.entrySet().stream()
+                    .filter(e -> "duplicate".equals(e.getKey().outcome()))
+                    .mapToLong(Map.Entry::getValue)
+                    .sum();
+        }
+
         public long totalFailed() {
             return counters.entrySet().stream()
                     .filter(e -> "failed".equals(e.getKey().outcome()))
@@ -63,6 +89,7 @@ public final class Notifications {
         }
     }
 
+    @Override
     public NotificationSnapshot snapshot() {
         String url = config.notificationBaseUrl() + "/metrics";
         HttpRequest req = HttpRequest.newBuilder(URI.create(url))
@@ -84,6 +111,10 @@ public final class Notifications {
         return diff(before, snapshot());
     }
 
+    /**
+     * Computes the signed difference {@code after - before} for every counter key.
+     * Never clamps negative values to 0 so counter resets are preserved and detected.
+     */
     public static NotificationSnapshot diff(NotificationSnapshot before, NotificationSnapshot after) {
         Set<CounterKey> allKeys = new HashSet<>();
         if (before != null) {
@@ -96,9 +127,31 @@ public final class Notifications {
         for (CounterKey key : allKeys) {
             long b = before != null ? before.counters().getOrDefault(key, 0L) : 0L;
             long a = after != null ? after.counters().getOrDefault(key, 0L) : 0L;
-            deltaMap.put(key, Math.max(0L, a - b));
+            deltaMap.put(key, a - b);
         }
         return new NotificationSnapshot(Collections.unmodifiableMap(deltaMap));
+    }
+
+    /**
+     * Detects any counter that decreased between {@code before} and {@code after}
+     * (indicating an unexpected {@code notification-service} restart or counter reset).
+     */
+    public static List<String> findCounterResets(NotificationSnapshot before, NotificationSnapshot after) {
+        if (before == null || after == null) {
+            return List.of();
+        }
+        List<String> resets = new ArrayList<>();
+        for (Map.Entry<CounterKey, Long> entry : before.counters().entrySet()) {
+            CounterKey key = entry.getKey();
+            long b = entry.getValue() != null ? entry.getValue() : 0L;
+            long a = after.counters().getOrDefault(key, 0L);
+            if (a < b) {
+                resets.add(String.format(
+                        "notification-service counter reset detected for {event_type=%s, outcome=%s}: before=%d, after=%d (delta=%d)",
+                        key.eventType(), key.outcome(), b, a, a - b));
+            }
+        }
+        return resets;
     }
 
     public static NotificationSnapshot parsePrometheusText(String body) {

@@ -1,5 +1,7 @@
 package com.ticketing.e2e.support;
 
+import org.apache.kafka.common.TopicPartition;
+
 import java.sql.Connection;
 import java.sql.DriverManager;
 import java.sql.PreparedStatement;
@@ -11,7 +13,9 @@ import java.util.ArrayList;
 import java.util.Collection;
 import java.util.Collections;
 import java.util.HashSet;
+import java.util.LinkedHashMap;
 import java.util.List;
+import java.util.Map;
 import java.util.Optional;
 import java.util.Set;
 import java.util.UUID;
@@ -24,7 +28,7 @@ import java.util.UUID;
  * scenarios do not have to wait 10 minutes (600s).
  * <p>
  * Also supports an in-memory fake data source ({@link InMemoryStore}) for unit-testing
- * {@link InvariantAuditor} with deliberately corrupted fixture data.
+ * {@link InvariantAuditor} across all invariants I1 to I8 with deliberately corrupted fixture data.
  */
 public final class Db {
 
@@ -57,6 +61,10 @@ public final class Db {
         return new Db(store);
     }
 
+    public InMemoryStore memoryStore() {
+        return memoryStore;
+    }
+
     public static final class InMemoryStore {
         public Instant currentTime = Instant.now();
         public final List<EventRow> events = new ArrayList<>();
@@ -69,6 +77,77 @@ public final class Db {
         public final List<OutboxRow> inventoryOutbox = new ArrayList<>();
         public final List<OutboxRow> orderOutbox = new ArrayList<>();
         public final List<OutboxRow> paymentOutbox = new ArrayList<>();
+
+        // Optional in-memory state for I3 REFUND_PENDING registry, I7 DLT, and I8 Kafka/Notification checks
+        public final Set<UUID> allowedRefundPendingOrderIds = new HashSet<>();
+        public long dltTotalDelta = 0L;
+        public long expectedDeadLetters = 0L;
+        public long expectedDuplicateNotifications = 0L;
+        public boolean useCustomKafkaOrderEvents = false;
+        public final List<KafkaProbe.ConsumedEvent> kafkaOrderEvents = new ArrayList<>();
+        public Notifications.NotificationSnapshot notificationsBefore = Notifications.NotificationSnapshot.empty();
+        public Notifications.NotificationSnapshot notificationsAfter = null;
+
+        public InvariantAuditor.KafkaAccess toKafkaAccess() {
+            return new InvariantAuditor.KafkaAccess() {
+                @Override
+                public KafkaProbe.DltDiff diffDltOffsets(KafkaProbe.DltSnapshot before) {
+                    Map<String, Long> byTopic = new LinkedHashMap<>();
+                    Map<TopicPartition, Long> byPart = new LinkedHashMap<>();
+                    if (dltTotalDelta > 0) {
+                        String dlt = "order.events-payment-service-order-cg-dlt";
+                        byTopic.put(dlt, dltTotalDelta);
+                        byPart.put(new TopicPartition(dlt, 0), dltTotalDelta);
+                    }
+                    return new KafkaProbe.DltDiff(dltTotalDelta, byTopic, byPart);
+                }
+
+                @Override
+                public List<KafkaProbe.ConsumedEvent> readOrderEventsSince(Map<TopicPartition, Long> startOffsets) {
+                    if (useCustomKafkaOrderEvents) {
+                        return List.copyOf(kafkaOrderEvents);
+                    }
+                    List<KafkaProbe.ConsumedEvent> synthesized = new ArrayList<>();
+                    long offset = 0L;
+                    for (OutboxRow row : orderOutbox) {
+                        if (row.publishedAt() != null) {
+                            synthesized.add(new KafkaProbe.ConsumedEvent(
+                                    row.topic(),
+                                    0,
+                                    offset++,
+                                    row.aggregateId() != null ? row.aggregateId().toString() : null,
+                                    row.payloadJson(),
+                                    Map.of("event-type", row.eventType()),
+                                    row.eventId(),
+                                    row.eventType(),
+                                    row.correlationId() != null ? row.correlationId().toString() : null,
+                                    null
+                            ));
+                        }
+                    }
+                    return synthesized;
+                }
+            };
+        }
+
+        public InvariantAuditor.NotificationAccess toNotificationAccess() {
+            return () -> {
+                if (notificationsAfter != null) {
+                    return notificationsAfter;
+                }
+                long confirmedCount = orderOutbox.stream()
+                        .filter(r -> r.publishedAt() != null && "order.confirmed".equals(r.eventType()))
+                        .map(OutboxRow::eventId)
+                        .distinct()
+                        .count();
+                long cancelledCount = orderOutbox.stream()
+                        .filter(r -> r.publishedAt() != null && "order.cancelled".equals(r.eventType()))
+                        .map(OutboxRow::eventId)
+                        .distinct()
+                        .count();
+                return Notifications.NotificationSnapshot.ofCounts(confirmedCount, cancelledCount, 0L, 0L);
+            };
+        }
     }
 
     public record EventRow(UUID eventId, String name, String status, Instant createdAt) {}

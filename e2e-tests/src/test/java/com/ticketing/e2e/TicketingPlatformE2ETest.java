@@ -27,15 +27,18 @@ import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.TestMethodOrder;
 import org.junit.jupiter.api.extension.ExtendWith;
 
+import java.io.IOException;
 import java.lang.reflect.Method;
+import java.nio.charset.StandardCharsets;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.nio.file.StandardOpenOption;
 import java.time.Duration;
 import java.time.Instant;
 import java.util.ArrayList;
 import java.util.Arrays;
-import java.util.Collections;
 import java.util.Comparator;
 import java.util.HashSet;
-import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Random;
@@ -48,7 +51,6 @@ import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.Future;
 import java.util.concurrent.TimeUnit;
-import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.stream.Collectors;
 
@@ -63,6 +65,13 @@ import static org.assertj.core.api.Assertions.assertThat;
 @TestMethodOrder(MethodOrderer.OrderAnnotation.class)
 class TicketingPlatformE2ETest {
 
+    private static final Set<String> TERMINAL_ORDER_STATUSES = Set.of(
+            "CONFIRMED",
+            "CANCELLED_EXPIRED",
+            "CANCELLED_PAYMENT_FAILED",
+            "CANCELLED_REFUNDED"
+    );
+
     private static E2EConfig config;
     private static Stack stack;
     private static Api api;
@@ -73,53 +82,172 @@ class TicketingPlatformE2ETest {
     private static InvariantAuditor auditor;
     private static ObjectMapper objectMapper;
     private static ScenarioReportRecorder reportRecorder;
+    private static Thread shutdownHook;
 
     private static KafkaProbe.DltSnapshot suiteStartDltSnapshot;
     private static Notifications.NotificationSnapshot suiteStartNotifications;
     private static Map<TopicPartition, Long> suiteStartOrderEventOffsets;
+    private static final Set<UUID> baselineOrderOutboxEventIds = ConcurrentHashMap.newKeySet();
     private static final Set<UUID> suiteEventIds = ConcurrentHashMap.newKeySet();
+    private static final Map<UUID, Long> declaredRefundPendingOrders = new ConcurrentHashMap<>();
     private static long totalExpectedDeadLettersAcrossSuite = 0L;
+    private static long totalExpectedDuplicateNotificationsAcrossSuite = 0L;
 
     @BeforeAll
     static void beforeAll() {
         printTestMethods("START");
         config = E2EConfig.load();
-        stack = new Stack(config);
+        kafkaProbe = new KafkaProbe(config);
+        stack = new Stack(config, kafkaProbe);
         api = new Api(config);
         db = new Db(config);
-        kafkaProbe = new KafkaProbe(config);
         notifications = new Notifications(config);
         quiescence = new Quiescence(db, kafkaProbe);
-        auditor = new InvariantAuditor(db);
+        auditor = new InvariantAuditor(db, kafkaProbe, notifications);
         objectMapper = new ObjectMapper().registerModule(new JavaTimeModule());
         reportRecorder = new ScenarioReportRecorder();
 
-        // Ensure complete quiescence before capturing suite baselines
-        quiescence.markScenarioStart(Instant.now());
-        quiescence.awaitForEvents(List.of(), Duration.ofSeconds(60));
+        shutdownHook = new Thread(() -> {
+            if (stack != null) {
+                stack.restoreTouchedContainersOnShutdown();
+            }
+        }, "e2e-stack-restore-shutdown-hook");
+        Runtime.getRuntime().addShutdownHook(shutdownHook);
+
+        // Load any previously registered S11 REFUND_PENDING orders that still exist in order_db
+        loadPersistedRefundPendingRegistry();
+
+        // Fail fast if the stack contains active HELD reservations or non-terminal orders from earlier runs
+        verifyCleanStackBeforeSuite();
+
+        // Ensure complete quiescence before capturing suite baselines using database clock
+        Instant dbNow = db.currentTimestampInInventoryDb();
+        quiescence.markScenarioStart(dbNow);
+        quiescence.awaitForEvents(List.of(), Duration.ofSeconds(60), true);
+
+        // Record baseline outbox eventIds present before this suite run
+        baselineOrderOutboxEventIds.clear();
+        for (Db.OutboxRow row : db.findOrderOutboxByAggregateIds(null)) {
+            if ("order.confirmed".equals(row.eventType()) || "order.cancelled".equals(row.eventType())) {
+                baselineOrderOutboxEventIds.add(row.eventId());
+            }
+        }
+
         suiteStartDltSnapshot = kafkaProbe.snapshotDltOffsets();
         suiteStartNotifications = notifications.snapshot();
         suiteStartOrderEventOffsets = kafkaProbe.endOffsets(KafkaProbe.TOPIC_ORDER_EVENTS);
+        totalExpectedDeadLettersAcrossSuite = 0L;
+        totalExpectedDuplicateNotificationsAcrossSuite = 0L;
     }
 
     @AfterAll
     static void afterAll() {
+        Throwable restoreError = null;
         try {
             if (stack != null) {
                 stack.restoreAndWaitAllHealthy(Duration.ofSeconds(60));
             }
-            if (reportRecorder != null && config != null) {
-                // Record any @Disabled scenarios so the report matrix includes all S1-S13
-                recordDisabledScenariosIfAny();
-                reportRecorder.writeReports(config.workspaceRoot());
-            }
-        } catch (Exception e) {
-            System.err.println("Warning during @AfterAll cleanup/report writing: " + e.getMessage());
+        } catch (Throwable t) {
+            restoreError = t;
         } finally {
+            try {
+                if (reportRecorder != null && config != null) {
+                    recordDisabledScenariosIfAny();
+                    reportRecorder.writeReports(config.workspaceRoot());
+                }
+            } catch (Exception e) {
+                System.err.println("Error writing E2E reports in @AfterAll: " + e.getMessage());
+                if (restoreError == null) {
+                    restoreError = e;
+                }
+            }
+            if (shutdownHook != null) {
+                try {
+                    Runtime.getRuntime().removeShutdownHook(shutdownHook);
+                } catch (IllegalStateException ignored) {
+                }
+            }
             if (kafkaProbe != null) {
                 kafkaProbe.close();
             }
             printTestMethods("END");
+        }
+        if (restoreError != null) {
+            if (restoreError instanceof RuntimeException re) {
+                throw re;
+            }
+            if (restoreError instanceof Error err) {
+                throw err;
+            }
+            throw new IllegalStateException("Teardown failed during @AfterAll", restoreError);
+        }
+    }
+
+    private static void verifyCleanStackBeforeSuite() {
+        List<Db.ReservationRow> activeHeldReservations = db.findReservations(null).stream()
+                .filter(r -> "HELD".equals(r.status()))
+                .toList();
+
+        List<Db.OrderRow> nonTerminalOrders = db.findOrders(null).stream()
+                .filter(o -> !TERMINAL_ORDER_STATUSES.contains(o.status()))
+                .filter(o -> !("REFUND_PENDING".equals(o.status()) && declaredRefundPendingOrders.containsKey(o.orderId())))
+                .toList();
+
+        if (!activeHeldReservations.isEmpty() || !nonTerminalOrders.isEmpty()) {
+            throw new AssertionError(String.format(
+                    "Dirty stack detected before E2E suite start! Found %d active HELD reservation(s) and %d non-terminal order(s) from earlier runs.%n"
+                            + "  Active HELD reservations: %s%n"
+                            + "  Non-terminal orders: %s%n"
+                            + "Please run 'make stack-reset' to reset the stack before running the E2E suite.",
+                    activeHeldReservations.size(),
+                    nonTerminalOrders.size(),
+                    activeHeldReservations,
+                    nonTerminalOrders
+            ));
+        }
+    }
+
+    private static Path refundPendingRegistryFile() {
+        return config.workspaceRoot().resolve("e2e-tests/target/s11-allowed-refund-pending.txt");
+    }
+
+    private static void loadPersistedRefundPendingRegistry() {
+        declaredRefundPendingOrders.clear();
+        Path file = refundPendingRegistryFile();
+        if (!Files.isRegularFile(file)) {
+            return;
+        }
+        try {
+            Map<UUID, Db.OrderRow> existingOrders = db.findOrders(null).stream()
+                    .collect(Collectors.toMap(Db.OrderRow::orderId, o -> o, (a, b) -> a));
+            for (String line : Files.readAllLines(file, StandardCharsets.UTF_8)) {
+                String trimmed = line.trim();
+                if (trimmed.isEmpty()) continue;
+                String[] parts = trimmed.split(":");
+                UUID orderId = UUID.fromString(parts[0]);
+                long dltCount = parts.length > 1 ? Long.parseLong(parts[1]) : 1L;
+                Db.OrderRow existing = existingOrders.get(orderId);
+                if (existing != null && "REFUND_PENDING".equals(existing.status())) {
+                    declaredRefundPendingOrders.put(orderId, dltCount);
+                    quiescence.registerAllowedRefundPendingOrder(orderId);
+                }
+            }
+        } catch (Exception ignored) {
+        }
+    }
+
+    private static void registerExpectedRefundPendingOrder(UUID orderId, long declaredDeadLetters) {
+        declaredRefundPendingOrders.put(orderId, declaredDeadLetters);
+        quiescence.registerAllowedRefundPendingOrder(orderId);
+        try {
+            Path file = refundPendingRegistryFile();
+            if (file.getParent() != null) {
+                Files.createDirectories(file.getParent());
+            }
+            String line = orderId + ":" + declaredDeadLetters + System.lineSeparator();
+            Files.writeString(file, line, StandardCharsets.UTF_8,
+                    StandardOpenOption.CREATE, StandardOpenOption.APPEND);
+        } catch (IOException ignored) {
         }
     }
 
@@ -144,12 +272,15 @@ class TicketingPlatformE2ETest {
                         ? m.getAnnotation(Tag.class).value()
                         : "chaos";
                 String id = m.getName().toUpperCase().split("_")[0];
-                reportRecorder.record(new ScenarioReportRecorder.ScenarioRecord(
-                        id, displayName, tag, "DISABLED", 0L,
-                        0, 0, 0, 0, 0,
-                        Map.of(), 0, 0, 0, 0L, 0L, 0L, Map.of(),
-                        "Disabled due to genuine product bug: " + reason
-                ));
+                if (!reportRecorder.hasRecord(id)) {
+                    reportRecorder.record(new ScenarioReportRecorder.ScenarioRecord(
+                            id, displayName, tag, "DISABLED", 0L,
+                            0, 0, 0, 0, 0, 0,
+                            0, Map.of(), 0, Map.of(),
+                            0, 0, 0, 0L, 0L, 0L, 0L, Map.of(),
+                            "Disabled due to genuine product bug: " + reason
+                    ));
+                }
             }
         }
     }
@@ -202,9 +333,36 @@ class TicketingPlatformE2ETest {
             long expectedDeadLetters,
             Notifications.NotificationSnapshot notifBefore,
             String notes) {
+        return finishAndAuditScenario(
+                scenarioId, scenarioName, tag, scenarioStart, eventId,
+                usersCount, holdsAttempted, holdsAccepted, holdsRejected, holdsRateLimited, 0,
+                orderEventsStartOffsets, dltBefore, expectedDeadLetters, notifBefore,
+                0L, false, notes
+        );
+    }
+
+    private InvariantAuditor.AuditResult finishAndAuditScenario(
+            String scenarioId,
+            String scenarioName,
+            String tag,
+            Instant scenarioStart,
+            UUID eventId,
+            int usersCount,
+            int holdsAttempted,
+            int holdsAccepted,
+            int holdsRejected,
+            int holdsRateLimited,
+            int holdsFailedOrLost,
+            Map<TopicPartition, Long> orderEventsStartOffsets,
+            KafkaProbe.DltSnapshot dltBefore,
+            long expectedDeadLetters,
+            Notifications.NotificationSnapshot notifBefore,
+            long expectedDuplicateNotifications,
+            boolean allowRefundPendingResting,
+            String notes) {
 
         quiescence.markScenarioStart(scenarioStart);
-        quiescence.await(eventId, Duration.ofSeconds(60));
+        quiescence.await(eventId, Duration.ofSeconds(60), allowRefundPendingResting);
         Notifications.NotificationSnapshot notifAfter = notifications.snapshot();
         Notifications.NotificationSnapshot notifDiff = Notifications.diff(notifBefore, notifAfter);
         KafkaProbe.DltDiff dltDiff = kafkaProbe.diffDltOffsets(dltBefore);
@@ -217,32 +375,37 @@ class TicketingPlatformE2ETest {
                 dltBefore,
                 expectedDeadLetters,
                 notifBefore,
-                notifAfter
+                notifAfter,
+                expectedDuplicateNotifications,
+                declaredRefundPendingOrders.keySet()
         );
         InvariantAuditor.AuditResult auditResult = auditor.auditScenario(ctx);
-        long durationMs = Duration.between(scenarioStart, Instant.now()).toMillis();
+        long durationMs = Duration.between(scenarioStart, db.currentTimestampInInventoryDb()).toMillis();
 
         reportRecorder.record(ScenarioReportRecorder.fromEventAudit(
                 scenarioId,
                 scenarioName,
                 tag,
                 auditResult.allPassed() ? "PASS" : "FAIL",
-                durationMs,
+                Math.max(0L, durationMs),
                 usersCount,
                 holdsAttempted,
                 holdsAccepted,
                 holdsRejected,
                 holdsRateLimited,
+                holdsFailedOrLost,
                 eventId,
                 db,
                 notifDiff,
                 dltDiff.totalDelta(),
+                expectedDeadLetters,
                 auditResult,
                 notes
         ));
 
         auditResult.assertAllPassed();
         totalExpectedDeadLettersAcrossSuite += expectedDeadLetters;
+        totalExpectedDuplicateNotificationsAcrossSuite += expectedDuplicateNotifications;
         return auditResult;
     }
 
@@ -255,7 +418,7 @@ class TicketingPlatformE2ETest {
     @DisplayName("S1: Happy path through the gateway — hold 2 seats, checkout tok_success, verify SOLD/AVAILABLE filters and notification")
     void s1_happyPathThroughGateway() {
         logSeed("S1", 0x510001L);
-        Instant start = Instant.now();
+        Instant start = db.currentTimestampInInventoryDb();
         Map<TopicPartition, Long> orderOffsetsBefore = kafkaProbe.endOffsets(KafkaProbe.TOPIC_ORDER_EVENTS);
         KafkaProbe.DltSnapshot dltBefore = kafkaProbe.snapshotDltOffsets();
         Notifications.NotificationSnapshot notifBefore = notifications.snapshot();
@@ -334,7 +497,7 @@ class TicketingPlatformE2ETest {
     @DisplayName("S2: Declined payment — tok_decline cancels order, releases seat back to AVAILABLE, and second buyer purchases it")
     void s2_declinedPaymentReleasesSeatForSecondBuyer() {
         logSeed("S2", 0x520002L);
-        Instant start = Instant.now();
+        Instant start = db.currentTimestampInInventoryDb();
         Map<TopicPartition, Long> orderOffsetsBefore = kafkaProbe.endOffsets(KafkaProbe.TOPIC_ORDER_EVENTS);
         KafkaProbe.DltSnapshot dltBefore = kafkaProbe.snapshotDltOffsets();
         Notifications.NotificationSnapshot notifBefore = notifications.snapshot();
@@ -417,7 +580,7 @@ class TicketingPlatformE2ETest {
     @DisplayName("S3: Hold expiry — unpaid hold expires via forceReservationExpiry, cancels order, emits notification, and frees seat")
     void s3_holdExpiryReleasesSeatAndCancelsOrder() {
         logSeed("S3", 0x530003L);
-        Instant start = Instant.now();
+        Instant start = db.currentTimestampInInventoryDb();
         Map<TopicPartition, Long> orderOffsetsBefore = kafkaProbe.endOffsets(KafkaProbe.TOPIC_ORDER_EVENTS);
         KafkaProbe.DltSnapshot dltBefore = kafkaProbe.snapshotDltOffsets();
         Notifications.NotificationSnapshot notifBefore = notifications.snapshot();
@@ -474,7 +637,7 @@ class TicketingPlatformE2ETest {
     @DisplayName("S4: Late payment saga compensation — payment-service stopped while hold expires and seat sells to Buyer 2, then late charge is refunded")
     void s4_latePaymentCompensationAndRefund() {
         logSeed("S4", 0x540004L);
-        Instant start = Instant.now();
+        Instant start = db.currentTimestampInInventoryDb();
         Map<TopicPartition, Long> orderOffsetsBefore = kafkaProbe.endOffsets(KafkaProbe.TOPIC_ORDER_EVENTS);
         KafkaProbe.DltSnapshot dltBefore = kafkaProbe.snapshotDltOffsets();
         Notifications.NotificationSnapshot notifBefore = notifications.snapshot();
@@ -504,7 +667,11 @@ class TicketingPlatformE2ETest {
                     .until(() -> db.countUnpublishedOutbox("order_db", event.eventId()) == 0
                             && kafkaProbe.totalConsumerGroupLag("payment-service-order-cg") >= 1L);
 
+            // Prove payment request is unconsumed before forcing expiry: lag > 0 and no payment row exists
             assertThat(kafkaProbe.totalConsumerGroupLag("payment-service-order-cg")).isGreaterThanOrEqualTo(1L);
+            assertThat(db.findPaymentsByOrderIds(Set.of(order1Id)))
+                    .as("No payment row may exist for order1 while payment-service is stopped before forcing expiry")
+                    .isEmpty();
 
             // 3. Force-expire Buyer 1's reservation while payment-service is stopped
             db.forceReservationExpiry(order1Id);
@@ -598,22 +765,28 @@ class TicketingPlatformE2ETest {
     @DisplayName("S5: No oversell under load — 200 users across 64 threads contend for 20 seats, 5 declined holds re-bought in wave 2")
     void s5_noOversellUnderHighContentionLoad() throws Exception {
         Random rnd = logSeed("S5", 0x550005L);
-        Instant start = Instant.now();
+        Instant start = db.currentTimestampInInventoryDb();
         Map<TopicPartition, Long> orderOffsetsBefore = kafkaProbe.endOffsets(KafkaProbe.TOPIC_ORDER_EVENTS);
         KafkaProbe.DltSnapshot dltBefore = kafkaProbe.snapshotDltOffsets();
         Notifications.NotificationSnapshot notifBefore = notifications.snapshot();
 
         int totalSeats = 20;
         int wave1UsersCount = 200;
+        // createOnSaleEvent mints 1 admin token via POST /api/v1/auth/token; we mint 4 user tokens via gateway
+        // (total 5 tokens via gateway endpoint) and sign the remaining tokens locally so the token endpoint's
+        // rate limit is never consumed by test setup.
         Fixtures.EventFixture event = Fixtures.createOnSaleEvent(api, totalSeats, 9_500L, "USD");
         suiteEventIds.add(event.eventId());
         List<UUID> allSeatIds = event.seatIds();
 
-        // Pre-create 200 distinct users and their random 1-2 seat selections deterministically
         List<Fixtures.UserFixture> wave1Users = new ArrayList<>(wave1UsersCount);
         List<List<UUID>> wave1SeatChoices = new ArrayList<>(wave1UsersCount);
         for (int i = 0; i < wave1UsersCount; i++) {
-            wave1Users.add(Fixtures.newUser(api));
+            if (i < 4) {
+                wave1Users.add(Fixtures.newUser(api));
+            } else {
+                wave1Users.add(Fixtures.newUserLocal(api));
+            }
             int count = (i < 20) ? 1 : (1 + rnd.nextInt(2));
             if (i < 20) {
                 // Guarantee every one of the 20 seats is targeted by at least one single-seat request
@@ -630,7 +803,13 @@ class TicketingPlatformE2ETest {
         record HoldAttemptResult(Fixtures.UserFixture user, List<UUID> seats, Api.ApiResponse response) {}
 
         ExecutorService pool = Executors.newFixedThreadPool(64);
-        List<HoldAttemptResult> wave1Results;
+        int holdsAttemptedTotal = wave1UsersCount;
+        int holds201Count = 0;
+        int holds409Count = 0;
+        int holds429Count = 0;
+        int holdsErrorCount = 0;
+        int totalSimulatedUsers = wave1UsersCount;
+
         try {
             CountDownLatch readyLatch = new CountDownLatch(64);
             CountDownLatch startLatch = new CountDownLatch(1);
@@ -652,9 +831,17 @@ class TicketingPlatformE2ETest {
             readyLatch.await(10, TimeUnit.SECONDS);
             startLatch.countDown();
 
-            wave1Results = new ArrayList<>(wave1UsersCount);
+            List<HoldAttemptResult> wave1Results = new ArrayList<>(wave1UsersCount);
             for (Future<HoldAttemptResult> f : futures) {
                 wave1Results.add(f.get(30, TimeUnit.SECONDS));
+            }
+
+            for (HoldAttemptResult r : wave1Results) {
+                int st = r.response().status();
+                if (st == 201) holds201Count++;
+                else if (st == 409) holds409Count++;
+                else if (st == 429) holds429Count++;
+                else holdsErrorCount++;
             }
 
             int holds201 = 0;
@@ -738,12 +925,15 @@ class TicketingPlatformE2ETest {
 
             // Second wave: new users hold and buy every released seat (1 seat per user)
             int wave2Accepted = 0;
+            totalSimulatedUsers += releasedSeatsFromDeclines.size();
+            holdsAttemptedTotal += releasedSeatsFromDeclines.size();
             for (UUID releasedSeatId : releasedSeatsFromDeclines) {
-                Fixtures.UserFixture wave2User = Fixtures.newUser(api);
+                Fixtures.UserFixture wave2User = Fixtures.newUserLocal(api);
                 Api.ApiResponse w2Hold = api.holdSeats(
                         wave2User.bearerToken(), event.eventId(), List.of(releasedSeatId), UUID.randomUUID());
                 assertThat(w2Hold.status()).isEqualTo(201);
                 wave2Accepted++;
+                holds201Count++;
                 UUID w2OrderId = UUID.fromString(w2Hold.json().get("reservationId").asText());
                 awaitOrderMaterialized(wave2User, w2OrderId, Duration.ofSeconds(15));
                 Api.ApiResponse w2Checkout = api.checkout(
@@ -776,8 +966,8 @@ class TicketingPlatformE2ETest {
             finishAndAuditScenario(
                     "S5", "No oversell under load (200 users, 64 threads, 20 seats)", "fast",
                     start, event.eventId(),
-                    wave1UsersCount + releasedSeatsFromDeclines.size(),
-                    wave1UsersCount + releasedSeatsFromDeclines.size(),
+                    totalSimulatedUsers,
+                    holdsAttemptedTotal,
                     total201s,
                     holds409,
                     holds429,
@@ -785,9 +975,74 @@ class TicketingPlatformE2ETest {
                     String.format("Wave 1: %d accepted (201), %d rejected (409), %d rate-limited (429); 5 declined & re-bought in Wave 2 (%d seats).",
                             holds201, holds409, holds429, wave2Accepted)
             );
+        } catch (Throwable t) {
+            // If S5 fails (e.g. INV-001 where holds under 64-thread contention return 5xx),
+            // expire any HELD reservations created in Wave 1 so subsequent scenarios and S13 reach
+            // terminal quiescence cleanly, record S5 as FAIL in the report, and rethrow the failure.
+            try {
+                cleanupHeldReservationsOnScenarioFailure(event.eventId(), start);
+                Notifications.NotificationSnapshot notifAfter = notifications.snapshot();
+                Notifications.NotificationSnapshot notifDiff = Notifications.diff(notifBefore, notifAfter);
+                KafkaProbe.DltDiff dltDiff = kafkaProbe.diffDltOffsets(dltBefore);
+                InvariantAuditor.ScenarioContext ctx = new InvariantAuditor.ScenarioContext(
+                        event.eventId(), start, kafkaProbe, orderOffsetsBefore,
+                        dltBefore, 0L, notifBefore, notifAfter, 0L, declaredRefundPendingOrders.keySet()
+                );
+                InvariantAuditor.AuditResult auditResult = auditor.auditScenario(ctx);
+                long durationMs = Duration.between(start, db.currentTimestampInInventoryDb()).toMillis();
+                String failMsg = t.getMessage() != null ? t.getMessage().replaceAll("\\s+", " ").trim() : t.toString();
+                reportRecorder.record(ScenarioReportRecorder.fromEventAudit(
+                        "S5",
+                        "No oversell under load (200 users, 64 threads, 20 seats)",
+                        "fast",
+                        "FAIL",
+                        Math.max(0L, durationMs),
+                        totalSimulatedUsers,
+                        holdsAttemptedTotal,
+                        holds201Count,
+                        holds409Count,
+                        holds429Count,
+                        holdsErrorCount,
+                        event.eventId(),
+                        db,
+                        notifDiff,
+                        dltDiff.totalDelta(),
+                        0L,
+                        auditResult,
+                        "Scenario failed assertion (INV-001): " + failMsg
+                ));
+            } catch (Exception cleanupEx) {
+                System.err.println("Warning during S5 failure cleanup/recording: " + cleanupEx.getMessage());
+            }
+            throw t;
         } finally {
             pool.shutdownNow();
         }
+    }
+
+    private void cleanupHeldReservationsOnScenarioFailure(UUID eventId, Instant scenarioStart) {
+        List<Db.ReservationRow> reservations = db.findReservations(eventId);
+        List<UUID> heldIds = reservations.stream()
+                .filter(r -> "HELD".equals(r.status()))
+                .map(Db.ReservationRow::reservationId)
+                .toList();
+        if (!heldIds.isEmpty()) {
+            // Wait for orders of those HELD reservations to materialize before expiring them
+            Awaitility.await("Materialize orders for HELD reservations before failure cleanup")
+                    .atMost(Duration.ofSeconds(15))
+                    .pollInterval(Duration.ofMillis(200))
+                    .until(() -> {
+                        Set<UUID> existingOrderIds = db.findOrders(eventId).stream()
+                                .map(Db.OrderRow::orderId)
+                                .collect(Collectors.toSet());
+                        return existingOrderIds.containsAll(heldIds);
+                    });
+            for (UUID resId : heldIds) {
+                db.forceReservationExpiry(resId);
+            }
+        }
+        quiescence.markScenarioStart(scenarioStart);
+        quiescence.await(eventId, Duration.ofSeconds(30));
     }
 
     // =========================================================================
@@ -796,10 +1051,10 @@ class TicketingPlatformE2ETest {
     @Test
     @Order(6)
     @Tag("fast")
-    @DisplayName("S6: Duplicate and replayed events — replaying payment.succeeded (same & new eventId) and inventory.seat.reserved causes zero side effects")
+    @DisplayName("S6: Duplicate and replayed events — replaying payment.succeeded, inventory.seat.reserved, order.payment.requested, and order.confirmed causes zero side effects")
     void s6_duplicateAndReplayedEventsAreIdempotent() throws Exception {
         logSeed("S6", 0x560006L);
-        Instant start = Instant.now();
+        Instant start = db.currentTimestampInInventoryDb();
         Map<TopicPartition, Long> orderOffsetsBefore = kafkaProbe.endOffsets(KafkaProbe.TOPIC_ORDER_EVENTS);
         Map<TopicPartition, Long> payOffsetsBefore = kafkaProbe.endOffsets(KafkaProbe.TOPIC_PAYMENT_EVENTS);
         Map<TopicPartition, Long> invOffsetsBefore = kafkaProbe.endOffsets(KafkaProbe.TOPIC_INVENTORY_EVENTS);
@@ -820,13 +1075,15 @@ class TicketingPlatformE2ETest {
         awaitOrderStatusViaGateway(buyer, orderId, "CONFIRMED", Duration.ofSeconds(20));
         quiescence.await(event.eventId(), Duration.ofSeconds(30));
 
-        // Snapshot outbox counts and notifications after happy-path order is CONFIRMED
+        // Snapshot outbox counts, payments table, and notifications after happy-path order is CONFIRMED
         int invOutboxCountBefore = db.findInventoryOutboxByAggregateIds(Set.of(orderId)).size();
         int ordOutboxCountBefore = db.findOrderOutboxByAggregateIds(Set.of(orderId)).size();
         int payOutboxCountBefore = db.findPaymentOutboxByAggregateIds(Set.of(orderId)).size();
+        List<Db.PaymentRow> paymentsBeforeReplays = db.findPaymentsByOrderIds(Set.of(orderId));
+        assertThat(paymentsBeforeReplays).hasSize(1);
         Notifications.NotificationSnapshot notifAfterConfirm = notifications.snapshot();
 
-        // Find the original payment.succeeded and inventory.seat.reserved records from Kafka
+        // Find the original payment.succeeded, inventory.seat.reserved, order.payment.requested, and order.confirmed records from Kafka
         KafkaProbe.ConsumedEvent origPaySucceeded = kafkaProbe.readSince(KafkaProbe.TOPIC_PAYMENT_EVENTS, payOffsetsBefore)
                 .stream()
                 .filter(e -> orderId.toString().equals(e.key()) && "payment.succeeded".equals(e.eventType()))
@@ -838,6 +1095,17 @@ class TicketingPlatformE2ETest {
                 .filter(e -> orderId.toString().equals(e.key()) && "inventory.seat.reserved".equals(e.eventType()))
                 .findFirst()
                 .orElseThrow(() -> new AssertionError("Original inventory.seat.reserved not found on inventory.events"));
+
+        List<KafkaProbe.ConsumedEvent> orderEvents = kafkaProbe.readSince(KafkaProbe.TOPIC_ORDER_EVENTS, orderOffsetsBefore);
+        KafkaProbe.ConsumedEvent origPaymentRequested = orderEvents.stream()
+                .filter(e -> orderId.toString().equals(e.key()) && "order.payment.requested".equals(e.eventType()))
+                .findFirst()
+                .orElseThrow(() -> new AssertionError("Original order.payment.requested not found on order.events"));
+
+        KafkaProbe.ConsumedEvent origOrderConfirmed = orderEvents.stream()
+                .filter(e -> orderId.toString().equals(e.key()) && "order.confirmed".equals(e.eventType()))
+                .findFirst()
+                .orElseThrow(() -> new AssertionError("Original order.confirmed not found on order.events"));
 
         // (a) Produce exact copy of already-processed payment.succeeded (same eventId)
         kafkaProbe.produceRaw(
@@ -881,24 +1149,60 @@ class TicketingPlatformE2ETest {
                 )
         );
 
-        // Wait for all consumer groups to consume the 3 replayed messages and reach lag 0
-        quiescence.await(event.eventId(), Duration.ofSeconds(30));
+        // (d) Replay order.payment.requested onto order.events with key orderId
+        kafkaProbe.produceRaw(
+                KafkaProbe.TOPIC_ORDER_EVENTS,
+                orderId.toString(),
+                origPaymentRequested.rawValue(),
+                Map.of(
+                        "event-type", "order.payment.requested",
+                        "event-id", origPaymentRequested.eventId().toString(),
+                        "schema-version", "1",
+                        "X-Correlation-Id", UUID.randomUUID().toString()
+                )
+        );
 
-        // Assert no state change, no new outbox rows anywhere, no duplicate notifications, no DLT growth
+        // (e) Replay order.confirmed onto order.events with key orderId
+        kafkaProbe.produceRaw(
+                KafkaProbe.TOPIC_ORDER_EVENTS,
+                orderId.toString(),
+                origOrderConfirmed.rawValue(),
+                Map.of(
+                        "event-type", "order.confirmed",
+                        "event-id", origOrderConfirmed.eventId().toString(),
+                        "schema-version", "1",
+                        "X-Correlation-Id", UUID.randomUUID().toString()
+                )
+        );
+
+        // Wait for all consumer groups to consume the replayed messages and reach lag 0,
+        // and for notification-service to record the duplicate order.confirmed event
+        quiescence.await(event.eventId(), Duration.ofSeconds(30));
+        Awaitility.await("notification-service duplicate counter increments by 1 for replayed order.confirmed")
+                .atMost(Duration.ofSeconds(15))
+                .pollInterval(Duration.ofMillis(200))
+                .until(() -> notifications.diff(notifAfterConfirm).duplicate("order.confirmed") == 1L);
+
+        // Assert no state change, no new outbox rows anywhere, payments table unchanged,
+        // notification duplicate counter +1 while sent counter unchanged (+0), and 0 DLT growth
         assertThat(db.findInventoryOutboxByAggregateIds(Set.of(orderId))).hasSize(invOutboxCountBefore);
         assertThat(db.findOrderOutboxByAggregateIds(Set.of(orderId))).hasSize(ordOutboxCountBefore);
         assertThat(db.findPaymentOutboxByAggregateIds(Set.of(orderId))).hasSize(payOutboxCountBefore);
+        assertThat(db.findPaymentsByOrderIds(Set.of(orderId))).isEqualTo(paymentsBeforeReplays);
 
         Notifications.NotificationSnapshot notifAfterReplays = notifications.snapshot();
-        assertThat(Notifications.diff(notifAfterConfirm, notifAfterReplays).totalSent()).isEqualTo(0L);
+        Notifications.NotificationSnapshot replayNotifDiff = Notifications.diff(notifAfterConfirm, notifAfterReplays);
+        assertThat(replayNotifDiff.totalSent()).isEqualTo(0L);
+        assertThat(replayNotifDiff.duplicate("order.confirmed")).isEqualTo(1L);
         assertThat(kafkaProbe.diffDltOffsets(dltBefore).totalDelta()).isEqualTo(0L);
 
         finishAndAuditScenario(
                 "S6", "Duplicate and replayed Kafka events", "fast",
                 start, event.eventId(),
-                1, 1, 1, 0, 0,
+                1, 1, 1, 0, 0, 0,
                 orderOffsetsBefore, dltBefore, 0L, notifBefore,
-                "Replayed payment.succeeded (same & new eventId) and inventory.seat.reserved: 0 new outbox rows, 0 extra notifications, 0 DLT."
+                1L, false,
+                "Replayed payment.succeeded (same & new eventId), inventory.seat.reserved, order.payment.requested, and order.confirmed: 0 new outbox rows, payments unchanged, notification duplicate=+1, sent=+0, 0 DLT."
         );
     }
 
@@ -908,10 +1212,10 @@ class TicketingPlatformE2ETest {
     @Test
     @Order(7)
     @Tag("chaos")
-    @DisplayName("S7: Crash recovery — kill -9 payment-service after checkout 202, then kill -9 inventory-service and order-service under concurrent traffic")
+    @DisplayName("S7: Crash recovery — kill -9 payment-service with payment in flight, then kill -9 inventory-service with holds in flight and order-service with checkouts in flight")
     void s7_crashRecoveryUnderSigkill() throws Exception {
         Random rnd = logSeed("S7", 0x570007L);
-        Instant start = Instant.now();
+        Instant start = db.currentTimestampInInventoryDb();
         Map<TopicPartition, Long> orderOffsetsBefore = kafkaProbe.endOffsets(KafkaProbe.TOPIC_ORDER_EVENTS);
         KafkaProbe.DltSnapshot dltBefore = kafkaProbe.snapshotDltOffsets();
         Notifications.NotificationSnapshot notifBefore = notifications.snapshot();
@@ -923,10 +1227,11 @@ class TicketingPlatformE2ETest {
         int holdsAccepted = 0;
         int holdsRejected = 0;
         int holdsRateLimited = 0;
+        int holdsFailedOrLost = 0;
 
         ExecutorService pool = Executors.newFixedThreadPool(24);
         try {
-            // Part 1: kill -9 payment-service right after checkout returns 202 and restart it
+            // Part 1: Verify payment is in flight (no payment row yet and lag > 0) before SIGKILL on payment-service
             Fixtures.UserFixture user0 = Fixtures.newUser(api);
             Map<UUID, Fixtures.UserFixture> usersById = new ConcurrentHashMap<>();
             usersById.put(user0.userId(), user0);
@@ -939,8 +1244,23 @@ class TicketingPlatformE2ETest {
             UUID order0Id = UUID.fromString(hold0.json().get("reservationId").asText());
             awaitOrderMaterialized(user0, order0Id, Duration.ofSeconds(15));
 
+            // Pause payment-service so the checkout event is published to order.events and guaranteed in-flight before SIGKILL
+            stack.pause("payment-service");
             Api.ApiResponse checkout0 = api.checkout(user0.bearerToken(), order0Id, UUID.randomUUID(), Fixtures.TOK_SUCCESS);
             assertThat(checkout0.status()).isEqualTo(202);
+
+            Awaitility.await("order.payment.requested published with consumer lag > 0 before SIGKILL")
+                    .atMost(Duration.ofSeconds(15))
+                    .pollInterval(Duration.ofMillis(200))
+                    .until(() -> db.countUnpublishedOutbox("order_db", event.eventId()) == 0
+                            && kafkaProbe.totalConsumerGroupLag("payment-service-order-cg") >= 1L);
+
+            assertThat(db.findPaymentsByOrderIds(Set.of(order0Id)))
+                    .as("Payment for order0 must still be in flight (no payment row yet) before SIGKILL")
+                    .isEmpty();
+            assertThat(kafkaProbe.totalConsumerGroupLag("payment-service-order-cg"))
+                    .as("payment-service consumer group lag must be > 0 before SIGKILL")
+                    .isGreaterThan(0L);
 
             stack.kill("payment-service");
             stack.start("payment-service");
@@ -949,12 +1269,12 @@ class TicketingPlatformE2ETest {
             awaitOrderStatusViaGateway(user0, order0Id, "CONFIRMED", Duration.ofSeconds(30));
             assertThat(db.findPaymentsByOrderIds(Set.of(order0Id))).hasSize(1);
 
-            // Part 2: kill -9 inventory-service and order-service one after the other during concurrent traffic
+            // Part 2a: Kill -9 inventory-service while hold requests are actually in flight (using a latch)
             int trafficUsersCount = 45;
             List<Fixtures.UserFixture> trafficUsers = new ArrayList<>(trafficUsersCount);
             List<UUID> targetSeats = new ArrayList<>(trafficUsersCount);
             for (int i = 0; i < trafficUsersCount; i++) {
-                Fixtures.UserFixture u = Fixtures.newUser(api);
+                Fixtures.UserFixture u = Fixtures.newUserLocal(api);
                 trafficUsers.add(u);
                 usersById.put(u.userId(), u);
                 // Seat index 1..15
@@ -962,67 +1282,166 @@ class TicketingPlatformE2ETest {
                 targetSeats.add(seatId);
             }
 
-            AtomicInteger completedCalls = new AtomicInteger(0);
+            int latchThreshold = 8;
+            CountDownLatch holdsDispatchedLatch = new CountDownLatch(latchThreshold);
+            CountDownLatch secondWaveGate = new CountDownLatch(1);
+            AtomicInteger completedHolds = new AtomicInteger(0);
             List<Future<Api.ApiResponse>> holdFutures = new ArrayList<>(trafficUsersCount);
+
             for (int i = 0; i < trafficUsersCount; i++) {
+                final int idx = i;
                 final Fixtures.UserFixture u = trafficUsers.get(i);
                 final UUID seatId = targetSeats.get(i);
                 holdFutures.add(pool.submit(() -> {
                     try {
+                        if (idx >= 16) {
+                            secondWaveGate.await(5, TimeUnit.SECONDS);
+                        }
+                        holdsDispatchedLatch.countDown();
                         return api.holdSeats(u.bearerToken(), event.eventId(), List.of(seatId), UUID.randomUUID());
                     } finally {
-                        completedCalls.incrementAndGet();
+                        completedHolds.incrementAndGet();
                     }
                 }));
             }
 
-            // Kill and restart inventory-service while hold requests are in flight
+            // Wait until N hold requests have been dispatched and assert that requests are still in flight before SIGKILL
+            assertThat(holdsDispatchedLatch.await(10, TimeUnit.SECONDS)).isTrue();
+            assertThat(completedHolds.get())
+                    .as("Hold requests must still be in flight when inventory-service is killed")
+                    .isLessThan(trafficUsersCount);
+            secondWaveGate.countDown();
+
             stack.kill("inventory-service");
             stack.start("inventory-service");
             stack.waitUntilHealthy("inventory-service", Duration.ofSeconds(60));
 
-            // Kill and restart order-service right after
-            stack.kill("order-service");
-            stack.start("order-service");
-            stack.waitUntilHealthy("order-service", Duration.ofSeconds(60));
-
             List<UUID> received201ReservationIds = new ArrayList<>();
+            received201ReservationIds.add(order0Id);
+
             for (Future<Api.ApiResponse> f : holdFutures) {
                 holdsAttempted++;
                 Api.ApiResponse resp = f.get(30, TimeUnit.SECONDS);
                 int status = resp.status();
-                // Gateway may return 502/503/504 (or 0 if socket reset mid-response) during SIGKILL outage, never 500
-                assertThat(status)
-                        .as("Unexpected HTTP status during crash recovery: %d body=%s", status, resp.body())
-                        .isIn(201, 409, 429, 502, 503, 504, 0);
-                if (status == 201) {
-                    holdsAccepted++;
-                    received201ReservationIds.add(UUID.fromString(resp.json().get("reservationId").asText()));
-                } else if (status == 409) {
-                    holdsRejected++;
-                } else if (status == 429) {
-                    holdsRateLimited++;
+                // During the declared SIGKILL outage window, gateway 502/503/504 or local transportError (status 0) is expected, never 500
+                if (resp.transportError()) {
+                    assertThat(status).isEqualTo(0);
+                    holdsFailedOrLost++;
+                } else {
+                    assertThat(status)
+                            .as("Unexpected HTTP status during inventory-service crash recovery: %d body=%s", status, resp.body())
+                            .isIn(201, 409, 429, 502, 503, 504);
+                    if (status == 201) {
+                        holdsAccepted++;
+                        received201ReservationIds.add(UUID.fromString(resp.json().get("reservationId").asText()));
+                    } else if (status == 409) {
+                        holdsRejected++;
+                    } else if (status == 429) {
+                        holdsRateLimited++;
+                    } else {
+                        holdsFailedOrLost++;
+                    }
                 }
             }
 
-            // Assert every 201 hold has a reservation row in inventory_db
-            Set<UUID> dbReservationIds = db.findReservations(event.eventId()).stream()
+            // Ensure we have at least 6 HELD reservations so Part 2b has multiple checkouts in flight when order-service is killed
+            List<Db.SeatRow> availableAfterHoldKill = db.findSeats(event.eventId()).stream()
+                    .filter(s -> "AVAILABLE".equals(s.status()))
+                    .toList();
+            int currentHeldCount = (int) db.findReservations(event.eventId()).stream()
+                    .filter(r -> "HELD".equals(r.status()))
+                    .count();
+            for (int i = 0; currentHeldCount < 6 && i < availableAfterHoldKill.size(); i++) {
+                Fixtures.UserFixture extraUser = trafficUsers.get(i);
+                holdsAttempted++;
+                Api.ApiResponse extraHold = api.holdSeats(
+                        extraUser.bearerToken(), event.eventId(), List.of(availableAfterHoldKill.get(i).seatId()), UUID.randomUUID());
+                if (extraHold.status() == 201) {
+                    holdsAccepted++;
+                    currentHeldCount++;
+                    received201ReservationIds.add(UUID.fromString(extraHold.json().get("reservationId").asText()));
+                } else if (extraHold.status() == 409) {
+                    holdsRejected++;
+                }
+            }
+
+            // Reconcile 201 responses with reservation rows in inventory_db:
+            // Every HTTP 201 must exist in inventory_db; any additional reservation row in inventory_db is a hold
+            // that committed right before SIGKILL dropped its HTTP response.
+            List<Db.ReservationRow> allReservationsNow = db.findReservations(event.eventId());
+            Set<UUID> dbReservationIds = allReservationsNow.stream()
                     .map(Db.ReservationRow::reservationId)
                     .collect(Collectors.toSet());
-            assertThat(dbReservationIds).containsAll(received201ReservationIds);
+            assertThat(dbReservationIds)
+                    .as("Every HTTP 201 reservationId must exist in inventory_db.reservations")
+                    .containsAll(received201ReservationIds);
+            int crashLostHttp201s = dbReservationIds.size() - received201ReservationIds.size();
+            assertThat(crashLostHttp201s).isGreaterThanOrEqualTo(0);
 
-            // For every HELD reservation in inventory_db (including any committed right as SIGKILL hit),
-            // wait for order materialization and complete checkout so the scenario reaches quiescence cleanly
-            List<Db.ReservationRow> heldReservations = db.findReservations(event.eventId()).stream()
+            // Wait for all HELD reservations to materialize in order_db
+            List<Db.ReservationRow> heldReservations = allReservationsNow.stream()
                     .filter(r -> "HELD".equals(r.status()))
                     .toList();
             for (Db.ReservationRow held : heldReservations) {
                 Fixtures.UserFixture owner = usersById.get(held.userId());
                 assertThat(owner).isNotNull();
                 awaitOrderMaterialized(owner, held.reservationId(), Duration.ofSeconds(30));
-                Api.ApiResponse cResp = api.checkout(
-                        owner.bearerToken(), held.reservationId(), UUID.randomUUID(), Fixtures.TOK_SUCCESS);
-                assertThat(cResp.status()).isEqualTo(202);
+            }
+
+            // Part 2b: Kill -9 order-service while checkout requests are actually in flight (using a latch)
+            int checkoutCount = heldReservations.size();
+            CountDownLatch checkoutsDispatchedLatch = new CountDownLatch(Math.min(2, checkoutCount));
+            CountDownLatch checkoutSecondWaveGate = new CountDownLatch(1);
+            AtomicInteger completedCheckouts = new AtomicInteger(0);
+            List<Future<Api.ApiResponse>> checkoutFutures = new ArrayList<>(checkoutCount);
+
+            for (int i = 0; i < checkoutCount; i++) {
+                final int idx = i;
+                final Db.ReservationRow held = heldReservations.get(i);
+                final Fixtures.UserFixture owner = usersById.get(held.userId());
+                checkoutFutures.add(pool.submit(() -> {
+                    try {
+                        if (idx >= 3) {
+                            checkoutSecondWaveGate.await(5, TimeUnit.SECONDS);
+                        }
+                        checkoutsDispatchedLatch.countDown();
+                        return api.checkout(owner.bearerToken(), held.reservationId(), UUID.randomUUID(), Fixtures.TOK_SUCCESS);
+                    } finally {
+                        completedCheckouts.incrementAndGet();
+                    }
+                }));
+            }
+
+            assertThat(checkoutsDispatchedLatch.await(10, TimeUnit.SECONDS)).isTrue();
+            assertThat(completedCheckouts.get())
+                    .as("Checkout requests must still be in flight when order-service is killed")
+                    .isLessThan(checkoutCount);
+            checkoutSecondWaveGate.countDown();
+
+            stack.kill("order-service");
+            stack.start("order-service");
+            stack.waitUntilHealthy("order-service", Duration.ofSeconds(60));
+
+            for (Future<Api.ApiResponse> cf : checkoutFutures) {
+                Api.ApiResponse cResp = cf.get(30, TimeUnit.SECONDS);
+                if (cResp.transportError()) {
+                    assertThat(cResp.status()).isEqualTo(0);
+                } else {
+                    assertThat(cResp.status())
+                            .as("Unexpected HTTP status during order-service crash recovery: %d body=%s", cResp.status(), cResp.body())
+                            .isIn(202, 409, 429, 502, 503, 504);
+                }
+            }
+
+            // Retry checkout for any HELD reservation whose checkout failed during order-service SIGKILL
+            for (Db.ReservationRow held : heldReservations) {
+                Fixtures.UserFixture owner = usersById.get(held.userId());
+                Db.OrderRow currentOrder = db.findOrderById(held.reservationId()).orElseThrow();
+                if ("RESERVED".equals(currentOrder.status())) {
+                    Api.ApiResponse retryCheckout = api.checkout(
+                            owner.bearerToken(), held.reservationId(), UUID.randomUUID(), Fixtures.TOK_SUCCESS);
+                    assertThat(retryCheckout.status()).isIn(202, 409);
+                }
             }
 
             for (Db.ReservationRow held : heldReservations) {
@@ -1034,12 +1453,20 @@ class TicketingPlatformE2ETest {
             stack.restoreAndWaitAllHealthy(Duration.ofSeconds(60));
         }
 
+        int finalDbReservations = db.findReservations(event.eventId()).size();
+        int lostHttp201Count = finalDbReservations - holdsAccepted;
+        String reconciliationNote = String.format(
+                "SIGKILL on payment-service (in-flight payment), inventory-service (in-flight holds), and order-service (in-flight checkouts) recovered cleanly; HTTP 201s=%d, DB reservations=%d (%d committed in DB whose HTTP response was lost to SIGKILL).",
+                holdsAccepted, finalDbReservations, lostHttp201Count
+        );
+
         finishAndAuditScenario(
                 "S7", "Crash recovery (SIGKILL payment, inventory, and order services)", "chaos",
                 start, event.eventId(),
-                46, holdsAttempted, holdsAccepted, holdsRejected, holdsRateLimited,
+                46, holdsAttempted, holdsAccepted, holdsRejected, holdsRateLimited, holdsFailedOrLost,
                 orderOffsetsBefore, dltBefore, 0L, notifBefore,
-                "SIGKILL on payment-service, inventory-service, and order-service recovered cleanly with 0 lost reservations or duplicate charges."
+                0L, false,
+                reconciliationNote
         );
     }
 
@@ -1052,7 +1479,7 @@ class TicketingPlatformE2ETest {
     @DisplayName("S8: Broker outage — stop kafka for 15s while 30 orders are in flight, then start kafka and verify full outbox drain")
     void s8_kafkaBrokerOutageOutboxResilience() {
         logSeed("S8", 0x580008L);
-        Instant start = Instant.now();
+        Instant start = db.currentTimestampInInventoryDb();
         Map<TopicPartition, Long> orderOffsetsBefore = kafkaProbe.endOffsets(KafkaProbe.TOPIC_ORDER_EVENTS);
         KafkaProbe.DltSnapshot dltBefore = kafkaProbe.snapshotDltOffsets();
         Notifications.NotificationSnapshot notifBefore = notifications.snapshot();
@@ -1063,7 +1490,7 @@ class TicketingPlatformE2ETest {
 
         List<Fixtures.UserFixture> users = new ArrayList<>(orderCount);
         for (int i = 0; i < orderCount; i++) {
-            users.add(Fixtures.newUser(api));
+            users.add(Fixtures.newUserLocal(api));
         }
 
         List<UUID> firstHalfOrders = new ArrayList<>(15);
@@ -1152,7 +1579,7 @@ class TicketingPlatformE2ETest {
     @DisplayName("S9: Idempotent checkout through the gateway — concurrent same Idempotency-Key and concurrent different keys create only 1 payment each")
     void s9_idempotentCheckoutThroughGateway() throws Exception {
         logSeed("S9", 0x590009L);
-        Instant start = Instant.now();
+        Instant start = db.currentTimestampInInventoryDb();
         Map<TopicPartition, Long> orderOffsetsBefore = kafkaProbe.endOffsets(KafkaProbe.TOPIC_ORDER_EVENTS);
         KafkaProbe.DltSnapshot dltBefore = kafkaProbe.snapshotDltOffsets();
         Notifications.NotificationSnapshot notifBefore = notifications.snapshot();
@@ -1193,14 +1620,23 @@ class TicketingPlatformE2ETest {
             Api.ApiResponse respA1 = sameKey1.get(15, TimeUnit.SECONDS);
             Api.ApiResponse respA2 = sameKey2.get(15, TimeUnit.SECONDS);
 
-            // At least one must be 202; the concurrent duplicate is either 202 (replay if serialized) or 409 (IN_PROGRESS)
+            // At least one must be 202; if both are 202, at least one must carry X-Idempotent-Replay: true;
+            // otherwise one is 202 and one is 409 with errorCode IDEMPOTENCY_REQUEST_IN_PROGRESS and Retry-After: 1
             List<Integer> statusesA = List.of(respA1.status(), respA2.status());
             assertThat(statusesA).contains(202);
             for (Api.ApiResponse r : List.of(respA1, respA2)) {
                 assertThat(r.status()).isIn(202, 409);
                 if (r.status() == 409) {
                     assertThat(r.headerValue("Retry-After")).isEqualTo("1");
+                    assertThat(r.errorCode()).isEqualTo("IDEMPOTENCY_REQUEST_IN_PROGRESS");
                 }
+            }
+            if (respA1.status() == 202 && respA2.status() == 202) {
+                assertThat(List.of(respA1.headerValue("X-Idempotent-Replay"), respA2.headerValue("X-Idempotent-Replay")))
+                        .as("When two identical-key requests both return 202, at least one must carry X-Idempotent-Replay: true")
+                        .contains("true");
+            } else {
+                assertThat(statusesA).containsExactlyInAnyOrder(202, 409);
             }
 
             // Subsequent replay with the same Idempotency-Key and same body returns 202 with X-Idempotent-Replay: true
@@ -1208,9 +1644,10 @@ class TicketingPlatformE2ETest {
             assertThat(replayResp.status()).isEqualTo(202);
             assertThat(replayResp.headerValue("X-Idempotent-Replay")).isEqualTo("true");
 
-            // Reusing the same Idempotency-Key with a DIFFERENT body returns 422 IDEMPOTENCY_PAYLOAD_MISMATCH
+            // Reusing the same Idempotency-Key with a DIFFERENT body returns 422 IDEMPOTENCY_KEY_PAYLOAD_MISMATCH
             Api.ApiResponse mismatchResp = api.checkout(user1.bearerToken(), order1Id, sharedKey, Fixtures.TOK_DECLINE);
             assertThat(mismatchResp.status()).isEqualTo(422);
+            assertThat(mismatchResp.errorCode()).isEqualTo("IDEMPOTENCY_KEY_PAYLOAD_MISMATCH");
 
             // Case B: Different Idempotency-Keys simultaneously on Order 2
             CountDownLatch latchB = new CountDownLatch(1);
@@ -1230,6 +1667,8 @@ class TicketingPlatformE2ETest {
             // Exactly one wins the row lock (202) and the other sees PAYMENT_PENDING (409 INVALID_ORDER_STATE)
             assertThat(List.of(respB1.status(), respB2.status()))
                     .containsExactlyInAnyOrder(202, 409);
+            Api.ApiResponse conflictB = respB1.status() == 409 ? respB1 : respB2;
+            assertThat(conflictB.errorCode()).isEqualTo("INVALID_ORDER_STATE");
 
             awaitOrderStatusViaGateway(user1, order1Id, "CONFIRMED", Duration.ofSeconds(20));
             awaitOrderStatusViaGateway(user2, order2Id, "CONFIRMED", Duration.ofSeconds(20));
@@ -1245,7 +1684,7 @@ class TicketingPlatformE2ETest {
                 start, event.eventId(),
                 2, 2, 2, 0, 0,
                 orderOffsetsBefore, dltBefore, 0L, notifBefore,
-                "Same-key concurrent + replay returned 202 (Idempotent-Replay: true), payload mismatch returned 422, different-key concurrent returned [202, 409]; 1 payment per order."
+                "Same-key concurrent + replay returned 202 (X-Idempotent-Replay: true), payload mismatch returned 422, different-key concurrent returned [202, 409 INVALID_ORDER_STATE]; 1 payment per order."
         );
     }
 
@@ -1258,7 +1697,7 @@ class TicketingPlatformE2ETest {
     @DisplayName("S10: Technical provider error — tok_error retries via retry topic and reaches CONFIRMED with 1 charge and 0 DLT")
     void s10_technicalProviderErrorRetriesAndSucceeds() {
         logSeed("S10", 0x5A0010L);
-        Instant start = Instant.now();
+        Instant start = db.currentTimestampInInventoryDb();
         Map<TopicPartition, Long> orderOffsetsBefore = kafkaProbe.endOffsets(KafkaProbe.TOPIC_ORDER_EVENTS);
         String retryTopic = "order.events-payment-service-order-cg-retry-0";
         Map<TopicPartition, Long> retryOffsetsBefore = kafkaProbe.endOffsets(retryTopic);
@@ -1284,14 +1723,12 @@ class TicketingPlatformE2ETest {
         assertThat(payments).hasSize(1);
         assertThat(payments.get(0).status()).isEqualTo("SUCCEEDED");
 
-        // Verify retry topic offset grew by at least 1
-        Map<TopicPartition, Long> retryOffsetsAfter = kafkaProbe.endOffsets(retryTopic);
-        long retryDelta = retryOffsetsAfter.entrySet().stream()
-                .mapToLong(e -> e.getValue() - retryOffsetsBefore.getOrDefault(e.getKey(), 0L))
-                .sum();
-        assertThat(retryDelta)
-                .as("Expected retry topic %s offset to grow on tok_error", retryTopic)
-                .isGreaterThanOrEqualTo(1L);
+        // Verify retry topic record by key (count by key equal to 1)
+        long retryRecordCountForOrder = kafkaProbe.countByKey(
+                retryTopic, retryOffsetsBefore, orderId.toString(), "order.payment.requested");
+        assertThat(retryRecordCountForOrder)
+                .as("Expected retry topic %s to contain exactly 1 record with key=%s", retryTopic, orderId)
+                .isEqualTo(1L);
 
         // Verify DLT unchanged
         assertThat(kafkaProbe.diffDltOffsets(dltBefore).totalDelta()).isEqualTo(0L);
@@ -1301,7 +1738,7 @@ class TicketingPlatformE2ETest {
                 start, event.eventId(),
                 1, 1, 1, 0, 0,
                 orderOffsetsBefore, dltBefore, 0L, notifBefore,
-                "tok_error triggered retry topic (" + retryTopic + " delta=" + retryDelta + "), succeeded on retry with 1 charge and 0 DLT."
+                "tok_error triggered retry topic (" + retryTopic + " countByKey=" + retryRecordCountForOrder + "), succeeded on retry with 1 charge and 0 DLT."
         );
     }
 
@@ -1311,11 +1748,10 @@ class TicketingPlatformE2ETest {
     @Test
     @Order(11)
     @Tag("chaos")
-    @org.junit.jupiter.api.Disabled("Product bug PAYMENT-001: MockPaymentProvider.refund() ignores tok_refund_decline and PaymentService.handleOrderRefundRequested() ignores PaymentResult status — see e2e-tests/FINDINGS.md")
     @DisplayName("S11: Refund declined — late payment with tok_refund_decline keeps payment SUCCEEDED, order REFUND_PENDING, and routes to DLT")
     void s11_refundDeclinedRoutesToDeadLetterTopic() {
         logSeed("S11", 0x5B0011L);
-        Instant start = Instant.now();
+        Instant start = db.currentTimestampInInventoryDb();
         Map<TopicPartition, Long> orderOffsetsBefore = kafkaProbe.endOffsets(KafkaProbe.TOPIC_ORDER_EVENTS);
         KafkaProbe.DltSnapshot dltBefore = kafkaProbe.snapshotDltOffsets();
         Notifications.NotificationSnapshot notifBefore = notifications.snapshot();
@@ -1341,18 +1777,30 @@ class TicketingPlatformE2ETest {
                     .until(() -> db.countUnpublishedOutbox("order_db", event.eventId()) == 0
                             && kafkaProbe.totalConsumerGroupLag("payment-service-order-cg") >= 1L);
 
+            assertThat(db.findPaymentsByOrderIds(Set.of(orderId))).isEmpty();
+
             db.forceReservationExpiry(orderId);
             awaitOrderStatusViaGateway(buyer, orderId, "CANCELLED_EXPIRED", Duration.ofSeconds(25));
+
+            // Register orderId as expected to rest in REFUND_PENDING with 1 declared dead-letter record
+            registerExpectedRefundPendingOrder(orderId, 1L);
 
             stack.start("payment-service");
             stack.waitUntilHealthy("payment-service", Duration.ofSeconds(60));
 
-            quiescence.await(event.eventId(), Duration.ofSeconds(60));
+            // Wait for the declined refund to route to order.events-payment-service-order-cg-dlt and reach quiescence
+            Awaitility.await("order.refund.requested routed to order.events-payment-service-order-cg-dlt")
+                    .atMost(Duration.ofSeconds(30))
+                    .pollInterval(Duration.ofMillis(250))
+                    .until(() -> kafkaProbe.diffDltOffsets(dltBefore)
+                            .deltaByTopic().getOrDefault("order.events-payment-service-order-cg-dlt", 0L) == 1L);
+
+            quiescence.await(event.eventId(), Duration.ofSeconds(60), true);
 
             // Expected per S11 specification:
             // - payment stays SUCCEEDED
             // - order stays REFUND_PENDING
-            // - event lands in order.events-payment-service-order-cg-dlt after retries (1 DLT record)
+            // - event lands in order.events-payment-service-order-cg-dlt (1 DLT record)
             // - no payment.refunded is emitted
             List<Db.PaymentRow> payments = db.findPaymentsByOrderIds(Set.of(orderId));
             assertThat(payments).hasSize(1);
@@ -1380,11 +1828,12 @@ class TicketingPlatformE2ETest {
         }
 
         finishAndAuditScenario(
-                "S11", "Refund declined (tok_refund_decline)", "chaos",
+                "S11", "Refund declined (tok_refund_decline) routes to DLT", "chaos",
                 start, event.eventId(),
-                1, 1, 1, 0, 0,
+                1, 1, 1, 0, 0, 0,
                 orderOffsetsBefore, dltBefore, 1L, notifBefore,
-                "Refund declined routed to DLT."
+                0L, true,
+                "Late payment with tok_refund_decline kept payment SUCCEEDED, order REFUND_PENDING, emitted 0 payment.refunded, and routed 1 order.refund.requested to DLT."
         );
     }
 
@@ -1394,10 +1843,10 @@ class TicketingPlatformE2ETest {
     @Test
     @Order(12)
     @Tag("fast")
-    @DisplayName("S12: Gateway protection — RBAC 403 on admin routes, spoofed X-User-Id neutralization, and per-user rate limit isolation")
+    @DisplayName("S12: Gateway protection — RBAC 403 on admin routes, spoofed X-User-Roles and X-User-Id neutralization, cross-user order isolation, and per-user rate limit isolation")
     void s12_gatewayProtectionRbacHeaderSpoofingAndRateLimitIsolation() {
         logSeed("S12", 0x5C0012L);
-        Instant start = Instant.now();
+        Instant start = db.currentTimestampInInventoryDb();
         Map<TopicPartition, Long> orderOffsetsBefore = kafkaProbe.endOffsets(KafkaProbe.TOPIC_ORDER_EVENTS);
         KafkaProbe.DltSnapshot dltBefore = kafkaProbe.snapshotDltOffsets();
         Notifications.NotificationSnapshot notifBefore = notifications.snapshot();
@@ -1409,7 +1858,7 @@ class TicketingPlatformE2ETest {
         Fixtures.UserFixture userB = Fixtures.newUser(api);
         Fixtures.UserFixture userC = Fixtures.newUser(api);
 
-        // 1. User token rejected on admin routes (403 Forbidden)
+        // 1. User token rejected on admin routes (403 Forbidden), including when spoofing X-User-Roles: ADMIN
         Api.ApiResponse forbiddenCreate = api.createEvent(
                 userA.bearerToken(), "Unauthorized Event", "Arena", Instant.now(), Instant.now().plusSeconds(3600));
         assertThat(forbiddenCreate.status()).isEqualTo(403);
@@ -1417,20 +1866,45 @@ class TicketingPlatformE2ETest {
         Api.ApiResponse forbiddenStatus = api.setEventStatus(userA.bearerToken(), event.eventId(), "CANCELLED");
         assertThat(forbiddenStatus.status()).isEqualTo(403);
 
-        // 2. Spoofed X-User-Id header on a request signed by User B attempting to check out User A's order
+        Api.ApiResponse spoofedAdminRoleCreate = api.createEventWithHeaders(
+                userA.bearerToken(), "Spoofed Role Event", "Arena", Instant.now(), Instant.now().plusSeconds(3600),
+                Map.of("X-User-Roles", "ADMIN"));
+        assertThat(spoofedAdminRoleCreate.status()).isEqualTo(403);
+        assertThat(spoofedAdminRoleCreate.errorCode()).isEqualTo("FORBIDDEN");
+
+        Api.ApiResponse spoofedAdminRoleStatus = api.setEventStatusWithHeaders(
+                userA.bearerToken(), event.eventId(), "CANCELLED",
+                Map.of("X-User-Roles", "ADMIN"));
+        assertThat(spoofedAdminRoleStatus.status()).isEqualTo(403);
+        assertThat(spoofedAdminRoleStatus.errorCode()).isEqualTo("FORBIDDEN");
+
+        // 2. Ownership check: User B cannot read or check out User A's order (with or without spoofed X-User-Id)
         Api.ApiResponse holdA = api.holdSeats(userA.bearerToken(), event.eventId(), List.of(event.seatIds().get(0)), UUID.randomUUID());
         assertThat(holdA.status()).isEqualTo(201);
         UUID orderAId = UUID.fromString(holdA.json().get("reservationId").asText());
         awaitOrderMaterialized(userA, orderAId, Duration.ofSeconds(15));
 
+        Api.ApiResponse crossUserRead = api.getOrder(userB.bearerToken(), orderAId);
+        assertThat(crossUserRead.status()).isEqualTo(403);
+        assertThat(crossUserRead.errorCode()).isEqualTo("FORBIDDEN");
+
+        Api.ApiResponse spoofedRead = api.getOrderWithHeaders(
+                userB.bearerToken(), orderAId, Map.of("X-User-Id", userA.userId().toString()));
+        assertThat(spoofedRead.status()).isEqualTo(403);
+        assertThat(spoofedRead.errorCode()).isEqualTo("FORBIDDEN");
+
         UUID unknownOrderId = UUID.randomUUID();
         Api.ApiResponse unknownOrderCheckout = api.checkout(
                 userB.bearerToken(), unknownOrderId, UUID.randomUUID(), Fixtures.TOK_SUCCESS);
+        Api.ApiResponse crossUserCheckout = api.checkout(
+                userB.bearerToken(), orderAId, UUID.randomUUID(), Fixtures.TOK_SUCCESS);
         Api.ApiResponse spoofedCheckout = api.checkoutWithSpoofedHeaders(
                 userB.bearerToken(), orderAId, UUID.randomUUID(), Fixtures.TOK_SUCCESS,
                 Map.of("X-User-Id", userA.userId().toString()));
 
-        // Both return 409 ORDER_NOT_READY without leaking whether the order exists for another user
+        // All return 409 ORDER_NOT_READY without leaking whether the order exists for another user
+        assertThat(crossUserCheckout.status()).isEqualTo(409);
+        assertThat(crossUserCheckout.errorCode()).isEqualTo("ORDER_NOT_READY");
         assertThat(spoofedCheckout.status()).isEqualTo(unknownOrderCheckout.status()).isEqualTo(409);
         assertThat(spoofedCheckout.json().path("errorCode").asText())
                 .isEqualTo(unknownOrderCheckout.json().path("errorCode").asText())
@@ -1466,9 +1940,9 @@ class TicketingPlatformE2ETest {
         finishAndAuditScenario(
                 "S12", "Gateway protection (RBAC, header spoofing, rate-limit isolation)", "fast",
                 start, event.eventId(),
-                3, 2, 2, 0, rateLimitedCount,
+                3, 2, 2, 0, 0,
                 orderOffsetsBefore, dltBefore, 0L, notifBefore,
-                "RBAC returned 403, spoofed X-User-Id returned 409 ORDER_NOT_READY matching unknown order, User C hit 429 (" + rateLimitedCount + "x) while User B succeeded."
+                "RBAC & spoofed X-User-Roles: ADMIN returned 403, User B read of User A order returned 403, User B checkout of User A order returned 409 ORDER_NOT_READY, User C GET burst hit 429 (" + rateLimitedCount + "x) while User B hold+checkout succeeded."
         );
     }
 
@@ -1478,13 +1952,15 @@ class TicketingPlatformE2ETest {
     @Test
     @Order(13)
     @Tag("fast")
-    @DisplayName("S13: Final global audit — verify I1–I8 across all data in all databases, 0 consumer lag everywhere, and exact DLT delta")
+    @Tag("chaos")
+    @DisplayName("S13: Final global audit — verify I1–I8 across all rows of inventory_db, order_db, and payment_db, zero lag across all 13 Kafka consumer groups, exact DLT delta, and exact notification counter equality")
     void s13_finalGlobalAuditAcrossAllDatabases() {
         logSeed("S13", 0x5D0013L);
-        Instant start = Instant.now();
+        Instant start = db.currentTimestampInInventoryDb();
 
-        // 1. Wait for complete global quiescence across all databases and Kafka consumer groups
-        quiescence.awaitForEvents(suiteEventIds, Duration.ofSeconds(60));
+        // 1. Wait for complete global quiescence across ALL events in inventory_db, order_db, payment_db, and Kafka
+        List<UUID> allEventIdsInDb = db.findEvents(null).stream().map(Db.EventRow::eventId).toList();
+        quiescence.awaitForEvents(allEventIdsInDb, Duration.ofSeconds(60), true);
 
         // 2. Assert 0 consumer group lag everywhere
         Map<String, Long> allLags = kafkaProbe.allConsumerGroupLags();
@@ -1501,73 +1977,43 @@ class TicketingPlatformE2ETest {
                         totalExpectedDeadLettersAcrossSuite, globalDltDiff.deltaByTopic())
                 .isEqualTo(totalExpectedDeadLettersAcrossSuite);
 
-        // 4. Run InvariantAuditor over all data created by the suite across all databases
-        InvariantAuditor.AuditResult globalDbAudit = auditor.auditDatabaseForEvents(
-                suiteEventIds.isEmpty() ? null : suiteEventIds);
-
-        // Also verify I7 (global DLT) and I8 (global notification diff across all suite events)
+        // 4. Run InvariantAuditor over ALL rows of all three databases (eventIds = null)
         Notifications.NotificationSnapshot suiteEndNotifications = notifications.snapshot();
         Notifications.NotificationSnapshot globalNotifDiff = Notifications.diff(suiteStartNotifications, suiteEndNotifications);
 
-        List<Db.OrderRow> suiteOrders = new ArrayList<>();
-        for (UUID evId : suiteEventIds) {
-            suiteOrders.addAll(db.findOrders(evId));
-        }
-        Set<UUID> suiteOrderIds = suiteOrders.stream().map(Db.OrderRow::orderId).collect(Collectors.toSet());
-        List<Db.OutboxRow> suiteOrderOutbox = db.findOrderOutboxByAggregateIds(suiteOrderIds);
+        InvariantAuditor.AuditResult fullGlobalAudit = auditor.auditGlobalAllRows(
+                kafkaProbe,
+                suiteStartOrderEventOffsets,
+                suiteStartDltSnapshot,
+                totalExpectedDeadLettersAcrossSuite,
+                suiteStartNotifications,
+                suiteEndNotifications,
+                totalExpectedDuplicateNotificationsAcrossSuite,
+                declaredRefundPendingOrders.keySet(),
+                baselineOrderOutboxEventIds
+        );
 
-        long expectedConfirmedNotifs = suiteOrderOutbox.stream()
-                .filter(r -> "order.confirmed".equals(r.eventType()))
-                .map(Db.OutboxRow::eventId)
-                .distinct()
-                .count();
-        long expectedCancelledNotifs = suiteOrderOutbox.stream()
-                .filter(r -> "order.cancelled".equals(r.eventType()))
-                .map(Db.OutboxRow::eventId)
-                .distinct()
-                .count();
-
-        List<String> i7Violations = globalDltDiff.totalDelta() == totalExpectedDeadLettersAcrossSuite
-                ? List.of()
-                : List.of("Global DLT delta " + globalDltDiff.totalDelta() + " != " + totalExpectedDeadLettersAcrossSuite);
-        List<String> i8Violations = new ArrayList<>();
-        if (globalNotifDiff.totalFailed() > 0) {
-            i8Violations.add("Global failed notifications: " + globalNotifDiff.totalFailed());
-        }
-        if (globalNotifDiff.sent("order.confirmed") < expectedConfirmedNotifs) {
-            i8Violations.add("Global confirmed notifications (" + globalNotifDiff.sent("order.confirmed")
-                    + ") < suite confirmed outbox events (" + expectedConfirmedNotifs + ")");
-        }
-        if (globalNotifDiff.sent("order.cancelled") < expectedCancelledNotifs) {
-            i8Violations.add("Global cancelled notifications (" + globalNotifDiff.sent("order.cancelled")
-                    + ") < suite cancelled outbox events (" + expectedCancelledNotifs + ")");
-        }
-
-        Map<String, List<String>> fullViolations = new LinkedHashMap<>(globalDbAudit.violationsByInvariant());
-        fullViolations.put("I7", i7Violations);
-        fullViolations.put("I8", i8Violations);
-        InvariantAuditor.AuditResult fullGlobalAudit = new InvariantAuditor.AuditResult(Collections.unmodifiableMap(fullViolations));
-
-        long durationMs = Duration.between(start, Instant.now()).toMillis();
-        int totalSuiteReservations = suiteEventIds.stream()
-                .mapToInt(evId -> db.findReservations(evId).size())
-                .sum();
+        long durationMs = Duration.between(start, db.currentTimestampInInventoryDb()).toMillis();
 
         reportRecorder.record(ScenarioReportRecorder.fromEventsAudit(
-                "S13", "Final global audit across all databases and topics", "fast",
+                "S13",
+                "Final global audit across all rows of all three databases, Kafka consumer groups, DLTs, and notifications",
+                "fast,chaos",
                 fullGlobalAudit.allPassed() ? "PASS" : "FAIL",
-                durationMs,
-                0,
-                totalSuiteReservations,
-                totalSuiteReservations,
+                Math.max(0L, durationMs),
                 0,
                 0,
-                suiteEventIds.isEmpty() ? null : suiteEventIds,
+                0,
+                0,
+                0,
+                0,
+                null,
                 db,
                 globalNotifDiff,
                 globalDltDiff.totalDelta(),
+                totalExpectedDeadLettersAcrossSuite,
                 fullGlobalAudit,
-                "Audited all suite rows across inventory_db, order_db, payment_db, all 13 Kafka consumer groups (lag=0), and notification-service counters."
+                "Audited all rows across inventory_db, order_db, and payment_db, all 13 Kafka consumer groups (lag=0), DLT delta, and exact notification-service counter equality."
         ));
 
         fullGlobalAudit.assertAllPassed();

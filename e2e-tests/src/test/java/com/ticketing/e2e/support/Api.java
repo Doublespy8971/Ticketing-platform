@@ -11,7 +11,6 @@ import java.net.http.HttpClient;
 import java.net.http.HttpHeaders;
 import java.net.http.HttpRequest;
 import java.net.http.HttpResponse;
-import java.net.http.HttpTimeoutException;
 import java.nio.charset.StandardCharsets;
 import java.time.Duration;
 import java.time.Instant;
@@ -24,7 +23,9 @@ import java.util.UUID;
 
 /**
  * HTTP client wrapper targeting {@code gateway-service} (:8080) using {@link java.net.http.HttpClient}.
- * Never throws on non-2xx responses.
+ * Never throws on non-2xx responses and never fabricates HTTP status codes (such as 502/504)
+ * when a local connection/transport error occurs; instead returns {@code status=0} with
+ * {@code transportError=true}.
  */
 public final class Api {
 
@@ -47,7 +48,18 @@ public final class Api {
 
     public record SeatSpec(String sectionCode, String rowLabel, String seatNumber, long priceCents) {}
 
-    public record ApiResponse(int status, HttpHeaders headers, String body, JsonNode json) {
+    public record ApiResponse(
+            int status,
+            HttpHeaders headers,
+            String body,
+            JsonNode json,
+            boolean transportError,
+            String transportErrorMessage
+    ) {
+        public ApiResponse(int status, HttpHeaders headers, String body, JsonNode json) {
+            this(status, headers, body, json, false, null);
+        }
+
         public Optional<String> header(String name) {
             return headers != null ? headers.firstValue(name) : Optional.empty();
         }
@@ -77,9 +89,8 @@ public final class Api {
 
     /**
      * Obtains a Bearer JWT from the gateway's dev token endpoint ({@code POST /api/v1/auth/token}).
-     * If the dev token endpoint's IP rate limiter (10 burst, 1 req/s) returns 429 during bulk fixture
-     * creation (e.g., 200 users in S5), falls back to signing the identical HS256 JWT locally with
-     * {@code JWT_SECRET}.
+     * If the dev token endpoint's IP rate limiter (10 burst, 1 req/s) returns 429, falls back to
+     * signing the identical HS256 JWT locally with {@code JWT_SECRET}.
      */
     public String obtainToken(UUID userId, List<String> roles) {
         ApiResponse resp = requestToken(userId, roles, 3600);
@@ -90,7 +101,8 @@ public final class Api {
             return mintHs256Jwt(userId, roles, 3600);
         }
         throw new IllegalStateException("Failed to obtain token from gateway /api/v1/auth/token: HTTP "
-                + resp.status() + " body=" + resp.body());
+                + resp.status() + " body=" + resp.body()
+                + (resp.transportError() ? " transportError=" + resp.transportErrorMessage() : ""));
     }
 
     public String mintHs256Jwt(UUID userId, List<String> roles, long ttlSeconds) {
@@ -119,17 +131,35 @@ public final class Api {
     }
 
     public ApiResponse createEvent(String bearerToken, String name, String venueName, Instant dropTime, Instant eventTime) {
+        return createEventWithHeaders(bearerToken, name, venueName, dropTime, eventTime, Map.of());
+    }
+
+    public ApiResponse createEventWithHeaders(
+            String bearerToken,
+            String name,
+            String venueName,
+            Instant dropTime,
+            Instant eventTime,
+            Map<String, String> extraHeaders) {
         Map<String, Object> body = new LinkedHashMap<>();
         body.put("name", name);
         body.put("venueName", venueName);
         body.put("dropTime", dropTime.toString());
         body.put("eventTime", eventTime.toString());
-        return postJson("/api/v1/admin/events", body, authHeaders(bearerToken, null, Map.of()));
+        return postJson("/api/v1/admin/events", body, authHeaders(bearerToken, null, extraHeaders));
     }
 
     public ApiResponse setEventStatus(String bearerToken, UUID eventId, String status) {
+        return setEventStatusWithHeaders(bearerToken, eventId, status, Map.of());
+    }
+
+    public ApiResponse setEventStatusWithHeaders(
+            String bearerToken,
+            UUID eventId,
+            String status,
+            Map<String, String> extraHeaders) {
         Map<String, Object> body = Map.of("status", status);
-        return patchJson("/api/v1/admin/events/" + eventId + "/status", body, authHeaders(bearerToken, null, Map.of()));
+        return patchJson("/api/v1/admin/events/" + eventId + "/status", body, authHeaders(bearerToken, null, extraHeaders));
     }
 
     public ApiResponse setEventOnSale(String bearerToken, UUID eventId) {
@@ -258,11 +288,12 @@ public final class Api {
                 } catch (Exception ignored) {
                 }
             }
-            return new ApiResponse(resp.statusCode(), resp.headers(), respBody, parsed);
-        } catch (HttpTimeoutException e) {
-            return new ApiResponse(504, null, "{\"status\":504,\"errorCode\":\"GATEWAY_TIMEOUT\"}", null);
+            return new ApiResponse(resp.statusCode(), resp.headers(), respBody, parsed, false, null);
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            return new ApiResponse(0, null, "", null, true, e.getClass().getSimpleName() + ": " + e.getMessage());
         } catch (Exception e) {
-            return new ApiResponse(502, null, "{\"status\":502,\"errorCode\":\"BAD_GATEWAY\"}", null);
+            return new ApiResponse(0, null, "", null, true, e.getClass().getSimpleName() + ": " + e.getMessage());
         }
     }
 

@@ -5,6 +5,7 @@ import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fasterxml.jackson.datatype.jsr310.JavaTimeModule;
 import org.apache.kafka.clients.admin.AdminClient;
 import org.apache.kafka.clients.admin.AdminClientConfig;
+import org.apache.kafka.clients.admin.ConsumerGroupDescription;
 import org.apache.kafka.clients.admin.ListConsumerGroupOffsetsResult;
 import org.apache.kafka.clients.admin.ListOffsetsResult;
 import org.apache.kafka.clients.admin.OffsetSpec;
@@ -17,6 +18,7 @@ import org.apache.kafka.clients.consumer.OffsetAndMetadata;
 import org.apache.kafka.clients.producer.KafkaProducer;
 import org.apache.kafka.clients.producer.ProducerConfig;
 import org.apache.kafka.clients.producer.ProducerRecord;
+import org.apache.kafka.common.ConsumerGroupState;
 import org.apache.kafka.common.TopicPartition;
 import org.apache.kafka.common.TopicPartitionInfo;
 import org.apache.kafka.common.header.Header;
@@ -39,7 +41,7 @@ import java.util.concurrent.TimeUnit;
 /**
  * Kafka inspection and probing helper using {@link AdminClient}, {@link KafkaConsumer}, and {@link KafkaProducer}.
  */
-public final class KafkaProbe implements AutoCloseable {
+public final class KafkaProbe implements InvariantAuditor.KafkaAccess, AutoCloseable {
 
     public static final String TOPIC_INVENTORY_EVENTS = "inventory.events";
     public static final String TOPIC_ORDER_EVENTS = "order.events";
@@ -142,6 +144,40 @@ public final class KafkaProbe implements AutoCloseable {
         }
     }
 
+    public boolean areConsumerGroupsStableWithMember(Collection<String> groupIds) {
+        if (groupIds == null || groupIds.isEmpty()) {
+            return true;
+        }
+        try {
+            return doAreConsumerGroupsStableWithMember(groupIds);
+        } catch (Exception first) {
+            resetAdminClient();
+            try {
+                return doAreConsumerGroupsStableWithMember(groupIds);
+            } catch (Exception second) {
+                return false;
+            }
+        }
+    }
+
+    private boolean doAreConsumerGroupsStableWithMember(Collection<String> groupIds) throws Exception {
+        Map<String, ConsumerGroupDescription> descriptions =
+                adminClient.describeConsumerGroups(groupIds).all().get(5, TimeUnit.SECONDS);
+        for (String groupId : groupIds) {
+            ConsumerGroupDescription desc = descriptions.get(groupId);
+            if (desc == null) {
+                return false;
+            }
+            if (desc.state() != ConsumerGroupState.STABLE) {
+                return false;
+            }
+            if (desc.members() == null || desc.members().isEmpty()) {
+                return false;
+            }
+        }
+        return true;
+    }
+
     public record ConsumedEvent(
             String topic,
             int partition,
@@ -216,6 +252,7 @@ public final class KafkaProbe implements AutoCloseable {
         return new DltSnapshot(endOffsets(DLT_TOPICS));
     }
 
+    @Override
     public DltDiff diffDltOffsets(DltSnapshot before) {
         Map<TopicPartition, Long> after = endOffsets(DLT_TOPICS);
         Map<String, Long> byTopic = new LinkedHashMap<>();
@@ -227,7 +264,7 @@ public final class KafkaProbe implements AutoCloseable {
         }
         for (Map.Entry<TopicPartition, Long> entry : after.entrySet()) {
             TopicPartition tp = entry.getKey();
-            long beforeVal = before.offsets().getOrDefault(tp, 0L);
+            long beforeVal = before != null && before.offsets() != null ? before.offsets().getOrDefault(tp, 0L) : 0L;
             long delta = Math.max(0L, entry.getValue() - beforeVal);
             if (delta > 0) {
                 byPartition.put(tp, delta);
@@ -238,8 +275,14 @@ public final class KafkaProbe implements AutoCloseable {
         return new DltDiff(total, byTopic, byPartition);
     }
 
+    @Override
+    public List<ConsumedEvent> readOrderEventsSince(Map<TopicPartition, Long> startOffsets) {
+        return readSince(TOPIC_ORDER_EVENTS, startOffsets);
+    }
+
     /**
      * Reads all records on {@code topic} between {@code startOffsets} (inclusive) and {@code endOffsets} (exclusive).
+     * Throws {@link IllegalStateException} if the consumer cannot reach the target end offset of every active partition.
      */
     public List<ConsumedEvent> readRange(
             String topic,
@@ -276,7 +319,7 @@ public final class KafkaProbe implements AutoCloseable {
                 consumer.seek(tp, start);
             }
 
-            long deadlineMs = System.currentTimeMillis() + 8_000L;
+            long deadlineMs = System.currentTimeMillis() + 15_000L;
             while (System.currentTimeMillis() < deadlineMs) {
                 boolean allDone = true;
                 for (TopicPartition tp : activePartitions) {
@@ -296,6 +339,19 @@ public final class KafkaProbe implements AutoCloseable {
                         results.add(parseRecord(rec));
                     }
                 }
+            }
+
+            List<String> incompletePartitions = new ArrayList<>();
+            for (TopicPartition tp : activePartitions) {
+                long position = consumer.position(tp);
+                long targetEnd = endOffsets.get(tp);
+                if (position < targetEnd) {
+                    incompletePartitions.add(tp + " (position=" + position + " < endOffset=" + targetEnd + ")");
+                }
+            }
+            if (!incompletePartitions.isEmpty()) {
+                throw new IllegalStateException("KafkaProbe.readRange failed to reach target endOffsets on topic "
+                        + topic + " for partitions: " + incompletePartitions);
             }
         }
         return results;

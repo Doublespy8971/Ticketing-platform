@@ -42,6 +42,10 @@ public final class Fixtures {
         return new Fixtures(api).newUser();
     }
 
+    public static UserFixture newUserLocal(Api api) {
+        return new Fixtures(api).newUserLocal();
+    }
+
     public static EventFixture createOnSaleEvent(Api api, int seatCount, long priceCents, String currency) {
         return new Fixtures(api).createOnSaleEvent(seatCount, priceCents);
     }
@@ -53,6 +57,12 @@ public final class Fixtures {
     public UserFixture newUser() {
         UUID userId = UUID.randomUUID();
         String token = api.obtainToken(userId, List.of("USER"));
+        return new UserFixture(userId, token);
+    }
+
+    public UserFixture newUserLocal() {
+        UUID userId = UUID.randomUUID();
+        String token = api.mintHs256Jwt(userId, List.of("USER"), 3600);
         return new UserFixture(userId, token);
     }
 

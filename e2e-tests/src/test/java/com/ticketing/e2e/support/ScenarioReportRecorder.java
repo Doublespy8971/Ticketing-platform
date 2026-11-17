@@ -8,6 +8,7 @@ import java.time.Instant;
 import java.time.ZoneOffset;
 import java.time.format.DateTimeFormatter;
 import java.util.ArrayList;
+import java.util.Collection;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
@@ -16,10 +17,49 @@ import java.util.UUID;
 /**
  * Collects per-scenario execution metrics and invariant results, and renders a
  * human-readable Markdown report to {@code e2e-tests/target/e2e-report.md}
- * (and optionally {@code docs/e2e-report.md} when {@code -De2e.publishReport=true}).
- * Never writes secrets or JWT tokens to the report.
+ * (and {@code docs/e2e-report.md} only when {@code -De2e.publishReport=true} AND the run contained no failures).
+ * Never writes secrets or JWT tokens to the report, and never emits hardcoded status strings.
  */
 public final class ScenarioReportRecorder {
+
+    public record CatalogScenario(String id, String name, String tag) {}
+
+    public static final List<CatalogScenario> SCENARIO_CATALOG = List.of(
+            new CatalogScenario("S1", "Happy path through the gateway", "fast"),
+            new CatalogScenario("S2", "Declined payment and seat re-purchase", "fast"),
+            new CatalogScenario("S3", "Hold expiry and seat reclamation", "fast"),
+            new CatalogScenario("S4", "Late payment saga compensation", "chaos"),
+            new CatalogScenario("S5", "No oversell under load (200 users, 64 threads, 20 seats)", "fast"),
+            new CatalogScenario("S6", "Duplicate and replayed Kafka events", "fast"),
+            new CatalogScenario("S7", "Crash recovery (SIGKILL payment, inventory, and order services)", "chaos"),
+            new CatalogScenario("S8", "Kafka broker 15s outage with 30 in-flight orders", "chaos"),
+            new CatalogScenario("S9", "Idempotent checkout through the gateway", "fast"),
+            new CatalogScenario("S10", "Technical provider error (tok_error) retry recovery", "fast"),
+            new CatalogScenario("S11", "Refund declined (tok_refund_decline) routes to DLT", "chaos"),
+            new CatalogScenario("S12", "Gateway protection (RBAC, header spoofing, rate-limit isolation)", "fast"),
+            new CatalogScenario("S13", "Final global audit across all rows of all three databases, Kafka consumer groups, DLTs, and notifications", "fast,chaos")
+    );
+
+    public record InvariantSpec(String code, String title, String description) {}
+
+    public static final List<InvariantSpec> INVARIANT_SPECS = List.of(
+            new InvariantSpec("I1", "Oversell",
+                    "Every (event, seat) has at most 1 active (HELD/CONFIRMED) reservation_item and at most 1 CONFIRMED order_item; SOLD seats equal CONFIRMED reservation seats and CONFIRMED order seats"),
+            new InvariantSpec("I2", "Seat Consistency",
+                    "Every HELD, SOLD, and AVAILABLE seat matches its exact active reservation_item state, and no HELD reservation is older than expires_at + 90s"),
+            new InvariantSpec("I3", "Order and Payment Consistency",
+                    "Bijective alignment across reservations, orders, and payments in both directions, matching item seat sets, and no undeclared PAYMENT_PENDING or REFUND_PENDING orders at quiescence"),
+            new InvariantSpec("I4", "Duplicate Effects",
+                    "At most 1 payment row per order (unique providerReference and refundId) and at most 1 outbox event per (aggregateId, eventType) across all 3 databases"),
+            new InvariantSpec("I5", "Money",
+                    "All parent rows exist, all outbox JSON payloads parse cleanly, every REFUNDED payment has a payment.refunded outbox row, and amounts/currencies match across seats, reservations, orders, payments, and refunds"),
+            new InvariantSpec("I6", "Outbox Drained",
+                    "Every outbox_events row across inventory_db, order_db, and payment_db has published_at IS NOT NULL at quiescence"),
+            new InvariantSpec("I7", "Dead Letters",
+                    "Dead-letter topic (*-dlt) offset growth equals the exact scenario-declared expected dead-letter count"),
+            new InvariantSpec("I8", "Notifications",
+                    "Notification counters match expected counts derived from orders table (1 confirmed per CONFIRMED order, 1..2 cancelled per cancelled order) and distinct eventIds on order.events with 0 counter resets and 0 unexpected duplicates")
+    );
 
     public record ScenarioRecord(
             String id,
@@ -32,6 +72,10 @@ public final class ScenarioReportRecorder {
             int holdsAccepted,
             int holdsRejected,
             int holdsRateLimited,
+            int holdsFailedOrLost,
+            int reservationsCommitted,
+            Map<String, Integer> reservationsByStatus,
+            int ordersCreated,
             Map<String, Integer> ordersByStatus,
             int paymentsSucceeded,
             int paymentsFailed,
@@ -39,20 +83,22 @@ public final class ScenarioReportRecorder {
             long notificationsConfirmed,
             long notificationsCancelled,
             long deadLetters,
+            long expectedDeadLetters,
             Map<String, Boolean> invariants,
             String notes
     ) {
-        public String ordersSummary() {
-            if (ordersByStatus == null || ordersByStatus.isEmpty()) {
+        public String reservationsSummary() {
+            if (reservationsCommitted == 0 && (reservationsByStatus == null || reservationsByStatus.isEmpty())) {
                 return "0";
             }
-            List<String> parts = new ArrayList<>();
-            ordersByStatus.forEach((st, count) -> {
-                if (count != null && count > 0) {
-                    parts.add(st + "=" + count);
-                }
-            });
-            return parts.isEmpty() ? "0" : String.join(", ", parts);
+            return reservationsCommitted + " (" + formatMap(reservationsByStatus) + ")";
+        }
+
+        public String ordersSummary() {
+            if (ordersCreated == 0 && (ordersByStatus == null || ordersByStatus.isEmpty())) {
+                return "0";
+            }
+            return ordersCreated + " (" + formatMap(ordersByStatus) + ")";
         }
 
         public String invariantsSummary() {
@@ -74,12 +120,19 @@ public final class ScenarioReportRecorder {
         }
     }
 
-    private final List<ScenarioRecord> records = new ArrayList<>();
+    private final Map<String, ScenarioRecord> recordsById = new LinkedHashMap<>();
     private final Instant suiteStartedAt = Instant.now();
 
     public synchronized void record(ScenarioRecord record) {
-        records.removeIf(r -> r.id().equals(record.id()));
-        records.add(record);
+        recordsById.put(record.id(), record);
+    }
+
+    public synchronized boolean hasRecord(String id) {
+        return recordsById.containsKey(id);
+    }
+
+    public synchronized List<ScenarioRecord> snapshotRecords() {
+        return new ArrayList<>(recordsById.values());
     }
 
     public static ScenarioRecord fromEventsAudit(
@@ -93,45 +146,62 @@ public final class ScenarioReportRecorder {
             int holdsAccepted,
             int holdsRejected,
             int holdsRateLimited,
-            java.util.Collection<UUID> eventIds,
+            int holdsFailedOrLost,
+            Collection<UUID> eventIds,
             Db db,
             Notifications.NotificationSnapshot notifDiff,
             long deadLettersDelta,
+            long expectedDeadLetters,
             InvariantAuditor.AuditResult auditResult,
             String notes) {
 
+        Map<String, Integer> reservationsByStatus = new LinkedHashMap<>();
+        int reservationsCommitted = 0;
         Map<String, Integer> ordersByStatus = new LinkedHashMap<>();
+        int ordersCreated = 0;
         int paymentsSucceeded = 0;
         int paymentsFailed = 0;
         int refunds = 0;
 
-        if (eventIds != null && !eventIds.isEmpty() && db != null) {
-            List<UUID> orderIds = new ArrayList<>();
-            for (UUID evId : eventIds) {
-                for (Db.OrderRow order : db.findOrders(evId)) {
-                    ordersByStatus.merge(order.status(), 1, Integer::sum);
-                    orderIds.add(order.orderId());
-                }
-            }
-            for (Db.PaymentRow payment : db.findPaymentsByOrderIds(orderIds)) {
-                switch (payment.status()) {
-                    case "SUCCEEDED" -> paymentsSucceeded++;
-                    case "FAILED" -> paymentsFailed++;
-                    case "REFUNDED" -> refunds++;
-                    default -> {
+        if (db != null) {
+            if (eventIds != null && !eventIds.isEmpty()) {
+                List<UUID> orderIds = new ArrayList<>();
+                for (UUID evId : eventIds) {
+                    for (Db.ReservationRow res : db.findReservations(evId)) {
+                        reservationsCommitted++;
+                        reservationsByStatus.merge(res.status(), 1, Integer::sum);
+                    }
+                    for (Db.OrderRow order : db.findOrders(evId)) {
+                        ordersCreated++;
+                        ordersByStatus.merge(order.status(), 1, Integer::sum);
+                        orderIds.add(order.orderId());
                     }
                 }
-            }
-        } else if (db != null) {
-            for (Db.OrderRow order : db.findOrders(null)) {
-                ordersByStatus.merge(order.status(), 1, Integer::sum);
-            }
-            for (Db.PaymentRow payment : db.findPaymentsByOrderIds(null)) {
-                switch (payment.status()) {
-                    case "SUCCEEDED" -> paymentsSucceeded++;
-                    case "FAILED" -> paymentsFailed++;
-                    case "REFUNDED" -> refunds++;
-                    default -> {
+                for (Db.PaymentRow payment : db.findPaymentsByOrderIds(orderIds)) {
+                    switch (payment.status()) {
+                        case "SUCCEEDED" -> paymentsSucceeded++;
+                        case "FAILED" -> paymentsFailed++;
+                        case "REFUNDED" -> refunds++;
+                        default -> {
+                        }
+                    }
+                }
+            } else {
+                for (Db.ReservationRow res : db.findReservations(null)) {
+                    reservationsCommitted++;
+                    reservationsByStatus.merge(res.status(), 1, Integer::sum);
+                }
+                for (Db.OrderRow order : db.findOrders(null)) {
+                    ordersCreated++;
+                    ordersByStatus.merge(order.status(), 1, Integer::sum);
+                }
+                for (Db.PaymentRow payment : db.findPaymentsByOrderIds(null)) {
+                    switch (payment.status()) {
+                        case "SUCCEEDED" -> paymentsSucceeded++;
+                        case "FAILED" -> paymentsFailed++;
+                        case "REFUNDED" -> refunds++;
+                        default -> {
+                        }
                     }
                 }
             }
@@ -160,6 +230,10 @@ public final class ScenarioReportRecorder {
                 holdsAccepted,
                 holdsRejected,
                 holdsRateLimited,
+                holdsFailedOrLost,
+                reservationsCommitted,
+                reservationsByStatus,
+                ordersCreated,
                 ordersByStatus,
                 paymentsSucceeded,
                 paymentsFailed,
@@ -167,6 +241,7 @@ public final class ScenarioReportRecorder {
                 notifConfirmed,
                 notifCancelled,
                 deadLettersDelta,
+                expectedDeadLetters,
                 invMap,
                 notes
         );
@@ -183,17 +258,19 @@ public final class ScenarioReportRecorder {
             int holdsAccepted,
             int holdsRejected,
             int holdsRateLimited,
+            int holdsFailedOrLost,
             UUID eventId,
             Db db,
             Notifications.NotificationSnapshot notifDiff,
             long deadLettersDelta,
+            long expectedDeadLetters,
             InvariantAuditor.AuditResult auditResult,
             String notes) {
         return fromEventsAudit(
                 id, name, tag, status, durationMs, users,
-                holdsAttempted, holdsAccepted, holdsRejected, holdsRateLimited,
+                holdsAttempted, holdsAccepted, holdsRejected, holdsRateLimited, holdsFailedOrLost,
                 eventId != null ? List.of(eventId) : null,
-                db, notifDiff, deadLettersDelta, auditResult, notes
+                db, notifDiff, deadLettersDelta, expectedDeadLetters, auditResult, notes
         );
     }
 
@@ -201,7 +278,8 @@ public final class ScenarioReportRecorder {
         Instant finishedAt = Instant.now();
         long totalDurationMs = java.time.Duration.between(suiteStartedAt, finishedAt).toMillis();
 
-        String markdown = renderMarkdown(finishedAt, totalDurationMs);
+        List<ScenarioRecord> fullRows = buildFullCatalogRecords();
+        String markdown = renderMarkdown(fullRows, finishedAt, totalDurationMs);
 
         Path targetReport = workspaceRoot.resolve("e2e-tests/target/e2e-report.md");
         if (targetReport.getParent() != null) {
@@ -209,7 +287,8 @@ public final class ScenarioReportRecorder {
         }
         Files.writeString(targetReport, markdown, StandardCharsets.UTF_8);
 
-        if (Boolean.getBoolean("e2e.publishReport")) {
+        boolean allPassed = fullRows.stream().allMatch(r -> "PASS".equals(r.status()));
+        if (Boolean.getBoolean("e2e.publishReport") && allPassed) {
             Path docsReport = workspaceRoot.resolve("docs/e2e-report.md");
             if (docsReport.getParent() != null) {
                 Files.createDirectories(docsReport.getParent());
@@ -218,8 +297,26 @@ public final class ScenarioReportRecorder {
         }
     }
 
-    private String renderMarkdown(Instant finishedAt, long totalDurationMs) {
-        records.sort((a, b) -> Integer.compare(extractScenarioNum(a.id()), extractScenarioNum(b.id())));
+    private List<ScenarioRecord> buildFullCatalogRecords() {
+        List<ScenarioRecord> full = new ArrayList<>(SCENARIO_CATALOG.size());
+        for (CatalogScenario cs : SCENARIO_CATALOG) {
+            ScenarioRecord rec = recordsById.get(cs.id());
+            if (rec != null) {
+                full.add(rec);
+            } else {
+                full.add(new ScenarioRecord(
+                        cs.id(), cs.name(), cs.tag(), "NOT RUN", 0L,
+                        0, 0, 0, 0, 0, 0,
+                        0, Map.of(), 0, Map.of(),
+                        0, 0, 0, 0L, 0L, 0L, 0L, Map.of(),
+                        "Scenario did not run in this execution."
+                ));
+            }
+        }
+        return full;
+    }
+
+    private String renderMarkdown(List<ScenarioRecord> fullRows, Instant finishedAt, long totalDurationMs) {
         StringBuilder md = new StringBuilder();
         String timestamp = DateTimeFormatter.ISO_INSTANT.format(finishedAt.atOffset(ZoneOffset.UTC));
 
@@ -229,14 +326,18 @@ public final class ScenarioReportRecorder {
         md.append("- **Target Stack**: Real 10-container Docker Compose topology (`gateway-service`, `inventory-service`, `order-service`, `payment-service`, `notification-service`, `kafka`, `redis`, `postgres-inventory`, `postgres-order`, `postgres-payment`)\n\n");
 
         md.append("## 1. Per-Scenario Execution Matrix\n\n");
-        md.append("| ID | Scenario | Tag | Status | Duration | Users | Holds (Att / 201 / 409 / 429) | Orders by Final Status | Payments (Succ / Fail / Ref) | Notifications (`confirmed` / `cancelled`) | DLT Delta | Invariants (I1–I8) |\n");
-        md.append("|---|---|---|---|---:|---:|---|---|---|---:|---:|---|\n");
+        md.append("| ID | Scenario | Tag | Status | Duration | Users | HTTP Holds (`Att / 201 / 409 / 429 / Err`) | DB Reservations (`Committed`) | DB Orders (`Created`) | Payments (`Succ / Fail / Ref`) | Notifications (`confirmed / cancelled`) | DLT (`Actual / Exp`) | Invariants (`I1–I8`) |\n");
+        md.append("|---|---|---|---|---:|---:|---|---|---|---|---:|---:|---|\n");
 
         int totalUsers = 0;
         int totalHoldsAttempted = 0;
         int totalHoldsAccepted = 0;
         int totalHoldsRejected = 0;
         int totalHoldsRateLimited = 0;
+        int totalHoldsFailedOrLost = 0;
+        int totalReservationsCommitted = 0;
+        Map<String, Integer> totalReservationsByStatus = new LinkedHashMap<>();
+        int totalOrdersCreated = 0;
         Map<String, Integer> totalOrdersByStatus = new LinkedHashMap<>();
         int totalPaySucc = 0;
         int totalPayFail = 0;
@@ -244,34 +345,50 @@ public final class ScenarioReportRecorder {
         long totalNotifConfirmed = 0;
         long totalNotifCancelled = 0;
         long totalDlt = 0;
+        long totalExpectedDlt = 0;
         int passCount = 0;
         int failCount = 0;
         int disabledCount = 0;
+        int notRunCount = 0;
 
-        for (ScenarioRecord r : records) {
-            if ("PASS".equals(r.status())) passCount++;
-            else if ("FAIL".equals(r.status())) failCount++;
-            else if ("DISABLED".equals(r.status())) disabledCount++;
+        for (ScenarioRecord r : fullRows) {
+            switch (r.status()) {
+                case "PASS" -> passCount++;
+                case "FAIL" -> failCount++;
+                case "DISABLED" -> disabledCount++;
+                default -> notRunCount++;
+            }
 
-            // Avoid double-counting S13 in per-scenario sums since S13 audits the cumulative database state
+            // Sum workload scenarios S1-S12 (S13 is the global database/topic audit across all rows)
             if (!"S13".equals(r.id())) {
                 totalUsers += r.users();
                 totalHoldsAttempted += r.holdsAttempted();
                 totalHoldsAccepted += r.holdsAccepted();
                 totalHoldsRejected += r.holdsRejected();
                 totalHoldsRateLimited += r.holdsRateLimited();
-                r.ordersByStatus().forEach((k, v) -> totalOrdersByStatus.merge(k, v, Integer::sum));
+                totalHoldsFailedOrLost += r.holdsFailedOrLost();
+                totalReservationsCommitted += r.reservationsCommitted();
+                if (r.reservationsByStatus() != null) {
+                    r.reservationsByStatus().forEach((k, v) -> totalReservationsByStatus.merge(k, v, Integer::sum));
+                }
+                totalOrdersCreated += r.ordersCreated();
+                if (r.ordersByStatus() != null) {
+                    r.ordersByStatus().forEach((k, v) -> totalOrdersByStatus.merge(k, v, Integer::sum));
+                }
                 totalPaySucc += r.paymentsSucceeded();
                 totalPayFail += r.paymentsFailed();
                 totalRefunds += r.refunds();
                 totalNotifConfirmed += r.notificationsConfirmed();
                 totalNotifCancelled += r.notificationsCancelled();
                 totalDlt += r.deadLetters();
+                totalExpectedDlt += r.expectedDeadLetters();
             }
 
-            String holdsStr = r.holdsAttempted() + " / " + r.holdsAccepted() + " / " + r.holdsRejected() + " / " + r.holdsRateLimited();
+            String holdsStr = r.holdsAttempted() + " / " + r.holdsAccepted() + " / " + r.holdsRejected()
+                    + " / " + r.holdsRateLimited() + " / " + r.holdsFailedOrLost();
             String payStr = r.paymentsSucceeded() + " / " + r.paymentsFailed() + " / " + r.refunds();
             String notifStr = r.notificationsConfirmed() + " / " + r.notificationsCancelled();
+            String dltStr = r.deadLetters() + " / " + r.expectedDeadLetters();
 
             md.append("| **").append(r.id()).append("** ")
                     .append("| ").append(r.name()).append(" ")
@@ -280,30 +397,40 @@ public final class ScenarioReportRecorder {
                     .append("| ").append(String.format("%.2fs", r.durationMs() / 1000.0)).append(" ")
                     .append("| ").append(r.users()).append(" ")
                     .append("| `").append(holdsStr).append("` ")
+                    .append("| ").append(r.reservationsSummary()).append(" ")
                     .append("| ").append(r.ordersSummary()).append(" ")
                     .append("| `").append(payStr).append("` ")
                     .append("| `").append(notifStr).append("` ")
-                    .append("| ").append(r.deadLetters()).append(" ")
+                    .append("| `").append(dltStr).append("` ")
                     .append("| ").append(r.invariantsSummary()).append(" |\n");
         }
 
         md.append("\n## 2. Detailed Scenario Breakdown\n\n");
-        for (ScenarioRecord r : records) {
+        for (ScenarioRecord r : fullRows) {
             md.append("### ").append(r.id()).append(" — ").append(r.name()).append("\n");
             md.append("- **Status**: `").append(r.status()).append("` (`").append(r.tag()).append("`, ")
                     .append(String.format("%.2f s", r.durationMs() / 1000.0)).append(")\n");
             md.append("- **Users**: ").append(r.users())
-                    .append(" | **Holds**: attempted=").append(r.holdsAttempted())
+                    .append(" | **HTTP Holds**: attempted=").append(r.holdsAttempted())
                     .append(", accepted(201)=").append(r.holdsAccepted())
                     .append(", conflict(409)=").append(r.holdsRejected())
-                    .append(", rate-limited(429)=").append(r.holdsRateLimited()).append("\n");
-            md.append("- **Orders by Final Status**: ").append(r.ordersSummary()).append("\n");
-            md.append("- **Payments**: succeeded=").append(r.paymentsSucceeded())
+                    .append(", rate-limited(429)=").append(r.holdsRateLimited())
+                    .append(", error/lost(5xx/transport)=").append(r.holdsFailedOrLost()).append("\n");
+            md.append("- **Reservations Committed in `inventory_db`**: ").append(r.reservationsSummary()).append("\n");
+            if (!"S13".equals(r.id()) && r.reservationsCommitted() != r.holdsAccepted()) {
+                int crashCommittedDelta = r.reservationsCommitted() - r.holdsAccepted();
+                md.append("- **Crash HTTP-Response Reconciliation Note**: ").append(crashCommittedDelta)
+                        .append(" hold request(s) committed in `inventory_db` before container crash/SIGKILL whose HTTP `201` response was lost in transit (`holdsAccepted=")
+                        .append(r.holdsAccepted()).append("` vs `reservationsCommitted=").append(r.reservationsCommitted()).append("`).\n");
+            }
+            md.append("- **Orders Created in `order_db`**: ").append(r.ordersSummary()).append("\n");
+            md.append("- **Payments in `payment_db`**: succeeded=").append(r.paymentsSucceeded())
                     .append(", failed=").append(r.paymentsFailed())
                     .append(", refunded=").append(r.refunds()).append("\n");
             md.append("- **Notifications Sent**: `order.confirmed`=").append(r.notificationsConfirmed())
                     .append(", `order.cancelled`=").append(r.notificationsCancelled()).append("\n");
-            md.append("- **Dead Letters Delta**: ").append(r.deadLetters()).append("\n");
+            md.append("- **Dead Letters Delta (`Actual / Expected`)**: ").append(r.deadLetters())
+                    .append(" / ").append(r.expectedDeadLetters()).append("\n");
             md.append("- **Invariants (I1–I8)**: ").append(r.invariantsSummary()).append("\n");
             if (r.notes() != null && !r.notes().isBlank()) {
                 md.append("- **Notes**: ").append(r.notes()).append("\n");
@@ -311,58 +438,108 @@ public final class ScenarioReportRecorder {
             md.append("\n");
         }
 
-        md.append("## 3. Summary of Totals & Verified Global Guarantees\n\n");
+        int crashLostHttpCount = totalReservationsCommitted - totalHoldsAccepted;
+        String reservationReconciliationNote = crashLostHttpCount != 0
+                ? String.format(" (reconciled: %d HTTP `201`s received + %d committed in DB whose HTTP response was lost to crash = %d DB reservations)",
+                totalHoldsAccepted, crashLostHttpCount, totalReservationsCommitted)
+                : " (matches HTTP `201` holds accepted)";
+        long unexpectedDlt = totalDlt - totalExpectedDlt;
+
+        md.append("## 3. Summary of Totals & Global Guarantees\n\n");
         md.append("| Metric | Value |\n");
         md.append("|---|---|\n");
-        md.append("| Scenarios Executed | ").append(records.size())
+        md.append("| Scenarios in Catalog | ").append(fullRows.size())
                 .append(" (Passed: ").append(passCount)
                 .append(", Failed: ").append(failCount)
-                .append(", Disabled: ").append(disabledCount).append(") |\n");
+                .append(", Disabled: ").append(disabledCount)
+                .append(", Not Run: ").append(notRunCount).append(") |\n");
         md.append("| Total Suite Runtime | ").append(String.format("%.2f s", totalDurationMs / 1000.0)).append(" |\n");
-        md.append("| Distinct Simulated Users | ").append(totalUsers).append(" |\n");
-        md.append("| Seat Holds Attempted / Accepted (`201`) / Rejected (`409`) / Rate-Limited (`429`) | ")
+        md.append("| Distinct Simulated Users (S1–S12) | ").append(totalUsers).append(" |\n");
+        md.append("| HTTP Seat Holds (`Attempted / Accepted 201 / Conflict 409 / Rate-Limited 429 / Error or Lost`) | ")
                 .append(totalHoldsAttempted).append(" / ")
                 .append(totalHoldsAccepted).append(" / ")
                 .append(totalHoldsRejected).append(" / ")
-                .append(totalHoldsRateLimited).append(" |\n");
-        md.append("| Cumulative Orders by Final Status | ").append(formatMap(totalOrdersByStatus)).append(" |\n");
-        md.append("| Payments Succeeded / Failed / Refunded | ")
+                .append(totalHoldsRateLimited).append(" / ")
+                .append(totalHoldsFailedOrLost).append(" |\n");
+        md.append("| Database Reservations Committed (`inventory_db`) | ")
+                .append(totalReservationsCommitted).append(" (").append(formatMap(totalReservationsByStatus)).append(")")
+                .append(reservationReconciliationNote).append(" |\n");
+        md.append("| Database Orders Created (`order_db`) | ")
+                .append(totalOrdersCreated).append(" (").append(formatMap(totalOrdersByStatus)).append(") |\n");
+        md.append("| Payments (`Succeeded / Failed / Refunded`) | ")
                 .append(totalPaySucc).append(" / ")
                 .append(totalPayFail).append(" / ")
                 .append(totalRefunds).append(" |\n");
-        md.append("| Notifications Delivered (`order.confirmed` / `order.cancelled`) | ")
+        md.append("| Notifications Delivered (`order.confirmed / order.cancelled`) | ")
                 .append(totalNotifConfirmed).append(" / ")
                 .append(totalNotifCancelled).append(" |\n");
-        md.append("| Unexpected Dead-Letter Messages | 0 |\n\n");
+        md.append("| Dead-Letter Messages (`Actual / Expected / Unexpected`) | ")
+                .append(totalDlt).append(" / ")
+                .append(totalExpectedDlt).append(" / ")
+                .append(unexpectedDlt).append(" |\n\n");
 
-        md.append("### Verified Distributed System Guarantees\n\n");
-        md.append("| Code | Global Guarantee | Verification Mechanism & Result |\n");
-        md.append("|---|---|---|\n");
-        md.append("| **I1** | **Zero Oversell** | Every seat has at most 1 active (`HELD`/`CONFIRMED`) reservation item and at most 1 `CONFIRMED` order item across `inventory_db` and `order_db` — **VERIFIED (0 violations)** |\n");
-        md.append("| **I2** | **Seat & Reservation State Machine Bijection** | Every `SOLD`, `HELD`, and `AVAILABLE` seat matches its exact active reservation item state, with zero stale `HELD` reservations past `expires_at + 90s` — **VERIFIED (0 violations)** |\n");
-        md.append("| **I3** | **Order, Reservation & Payment Saga Alignment** | Every `CONFIRMED` order has a `CONFIRMED` reservation and `SUCCEEDED` payment; every late payment on an expired hold is automatically refunded (`CANCELLED_REFUNDED` + `REFUNDED`) — **VERIFIED (0 violations)** |\n");
-        md.append("| **I4** | **No Double Charge & No Double Refund** | At most 1 `payment` row per `order_id`, and at most 1 outbox event per `(orderId, type)` across `inventory_db`, `order_db`, and `payment_db` — **VERIFIED (0 violations)** |\n");
-        md.append("| **I5** | **End-to-End Monetary & Currency Conservation** | Seat prices, reservation totals, order totals, payment charges, and refund amounts match to the cent (`amountCents`) and `currency` — **VERIFIED (0 violations)** |\n");
-        md.append("| **I6** | **Transactional Outbox Drain** | All `outbox_events` across all 3 PostgreSQL databases have `published_at IS NOT NULL` at quiescence, even after 15s Kafka broker outages and `SIGKILL` container crashes — **VERIFIED (0 violations)** |\n");
-        md.append("| **I7** | **At-Least-Once Idempotent Notification Delivery** | `notification_sent_total{event_type=\"order.confirmed\"}` and `{event_type=\"order.cancelled\"}` match terminal orders with `notification_failed_total == 0` — **VERIFIED (0 violations)** |\n");
-        md.append("| **I8** | **Zero Unintended Dead-Letter Queue Growth** | All `*-dlt` topics across Kafka remain at zero unexpected messages after replays, provider errors, and container crashes — **VERIFIED (0 violations)** |\n");
+        md.append("### Global Distributed System Guarantees (`I1`–`I8`)\n\n");
+        md.append("| Code | Global Guarantee | Verification Mechanism | Status |\n");
+        md.append("|---|---|---|---|n".replace("|n", "|\n"));
+
+        for (InvariantSpec spec : INVARIANT_SPECS) {
+            String statusCell = computeGuaranteeStatus(spec.code(), fullRows);
+            md.append("| **").append(spec.code()).append("** ")
+                    .append("| **").append(spec.title()).append("** ")
+                    .append("| ").append(spec.description()).append(" ")
+                    .append("| ").append(statusCell).append(" |\n");
+        }
 
         return md.toString();
     }
 
-    private static int extractScenarioNum(String id) {
-        if (id == null) return Integer.MAX_VALUE;
-        String digits = id.replaceAll("\\D+", "");
-        if (digits.isEmpty()) return Integer.MAX_VALUE;
-        try {
-            return Integer.parseInt(digits);
-        } catch (NumberFormatException e) {
-            return Integer.MAX_VALUE;
+    /**
+     * Computes guarantee row status strictly from recorded scenario results:
+     * - FAIL: if any scenario found a violation of this invariant
+     * - NOT RUN: if no scenario checking this invariant ran
+     * - VERIFIED: ONLY if every scenario in the catalog ran and passed with 0 violations
+     * - PARTIAL: if some scenarios did not run (or a scenario failed an HTTP check without an invariant violation)
+     */
+    private static String computeGuaranteeStatus(String invariantCode, List<ScenarioRecord> fullRows) {
+        int totalScenarios = fullRows.size();
+        int ranCount = 0;
+        int passedScenarioAndInvariant = 0;
+        int failedScenarios = 0;
+        int notRunOrDisabled = 0;
+        List<String> violatedScenarios = new ArrayList<>();
+
+        for (ScenarioRecord r : fullRows) {
+            if ("NOT RUN".equals(r.status()) || "DISABLED".equals(r.status())) {
+                notRunOrDisabled++;
+                continue;
+            }
+            ranCount++;
+            Boolean invOk = r.invariants() != null ? r.invariants().get(invariantCode) : null;
+            if (Boolean.FALSE.equals(invOk)) {
+                violatedScenarios.add(r.id());
+            }
+            if ("PASS".equals(r.status()) && Boolean.TRUE.equals(invOk)) {
+                passedScenarioAndInvariant++;
+            } else if ("FAIL".equals(r.status())) {
+                failedScenarios++;
+            }
         }
+
+        if (!violatedScenarios.isEmpty()) {
+            return "**FAIL** (violations in " + String.join(", ", violatedScenarios) + ")";
+        }
+        if (ranCount == 0) {
+            return "**NOT RUN** (0/" + totalScenarios + " scenarios ran)";
+        }
+        if (passedScenarioAndInvariant == totalScenarios && failedScenarios == 0 && notRunOrDisabled == 0) {
+            return "**VERIFIED** (" + passedScenarioAndInvariant + "/" + totalScenarios + " scenarios passed, 0 violations)";
+        }
+        return String.format("**PARTIAL** (%d/%d scenarios passed, %d failed, %d not run/disabled, 0 invariant violations)",
+                passedScenarioAndInvariant, totalScenarios, failedScenarios, notRunOrDisabled);
     }
 
     private static String formatMap(Map<String, Integer> map) {
-        if (map.isEmpty()) return "0";
+        if (map == null || map.isEmpty()) return "0";
         List<String> parts = new ArrayList<>();
         map.forEach((k, v) -> {
             if (v != null && v > 0) parts.add(k + "=" + v);
