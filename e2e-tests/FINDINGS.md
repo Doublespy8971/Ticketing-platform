@@ -1,64 +1,73 @@
 # End-to-End Verification Findings (`e2e-tests`)
 
-This document records genuine product defects discovered by the cross-service end-to-end verification suite (`e2e-tests`) against the containerized platform. Per project rules, production service code is not modified by the E2E suite, test assertions are never weakened, and the affected test is annotated with `@Disabled` referencing the bug identifier below.
+This document records genuine product defects discovered by the cross-service end-to-end verification suite (`e2e-tests`) against the containerized platform. Per project rules, production service code is not modified by the E2E suite, test assertions are never weakened, and genuine product findings are documented here with reproduction steps and suspected causes.
 
 ---
 
-## `PAYMENT-001` — `payment-service` unconditionally succeeds refunds (`tok_refund_decline` unimplemented and `PaymentResult` ignored on refund)
+## `INV-001` — `inventory-service` returns HTTP 500 instead of retryable 503 during Redis concurrency gate unavailability under high contention
+
+- **Affected Scenario**: `S5` (`TicketingPlatformE2ETest#s5_noOversellUnderHighContentionLoad`)
+- **Severity**: High / Error Mapping & Availability
+- **Status**: Open (Test remains enabled and asserting no 5xx per project rules)
+
+### 1. Reproduction Steps
+1. Start the stack or ensure it is running:
+   ```bash
+   make stack-reset
+   ```
+2. Run the fast end-to-end verification suite:
+   ```bash
+   make e2e-fast
+   ```
+   (Alternatively: `mvn -pl e2e-tests -Pe2e -Dtest=TicketingPlatformE2ETest#s5_noOversellUnderHighContentionLoad test`)
+
+3. Under 64 concurrent threads contending for 20 seats with 200 users, Redis command timeouts or connection pool pressure causes `hold_inventory.lua` execution to throw `RedisUnavailableException` in `RedisSeatGate`.
+4. `inventory-service` returns an HTTP 500 response instead of a retryable HTTP 503 Service Unavailable.
+
+### 2. Observed Response Body
+```json
+{
+  "type": "about:blank",
+  "title": "Internal Server Error",
+  "status": 500,
+  "detail": "Inventory concurrency gate is temporarily unavailable",
+  "instance": "/api/v1/reservations"
+}
+```
+
+### 3. Expected vs. Observed Behavior
+- **Expected**: A temporary dependency failure in the Redis concurrency gate must fail closed with HTTP 503 `SERVICE_UNAVAILABLE`, `errorCode: "SERVICE_UNAVAILABLE"`, a `Retry-After: 1` header, and no 500 Internal Server Error returned to API callers.
+- **Observed**: HTTP status `500` with detail `"Inventory concurrency gate is temporarily unavailable"`, violating the assertion that all hold responses must be in `{201, 409, 429}` and never 5xx.
+
+### 4. Suspected Cause
+In `inventory-service`:
+`RedisSeatGate` throws `RedisUnavailableException` when Redis is unreachable or times out during `hold_inventory.lua`. However, the exception mapping in `InventoryExceptionHandler` (or Spring default exception handling if unmapped) maps this failure to HTTP 500 `INTERNAL_SERVER_ERROR` instead of HTTP 503 `SERVICE_UNAVAILABLE` with a `Retry-After` header.
+
+### 5. Affected Files
+- `inventory-service/src/main/java/com/ticketing/inventory/service/RedisSeatGate.java`
+- `inventory-service/src/main/java/com/ticketing/inventory/web/InventoryExceptionHandler.java`
+
+---
+
+## `PAYMENT-001` — `payment-service` refund decline handling (`tok_refund_decline`)
 
 - **Affected Scenario**: `S11` (`TicketingPlatformE2ETest#s11_refundDeclinedRoutesToDeadLetterTopic`)
 - **Severity**: Medium / Compensation Error Handling
-- **Status**: Open (Test marked `@Disabled("Product bug PAYMENT-001: ...")`)
+- **Status**: Resolved in `payment-service` source code; `@Disabled` removed from `S11`
 
-### 1. Reproduction Steps
-1. Start the full 10-container stack (`make stack-up` or `make stack-reset`).
-2. Create an `ON_SALE` event with 1 seat and have a buyer hold the seat (`POST /api/v1/reservations` -> `201 Created`).
-3. Wait for the order to materialize in `AWAITING_PAYMENT` (`GET /api/v1/orders/{orderId}`).
-4. Stop `payment-service` (`docker stop payment-service`) so `order.payment.requested` remains unconsumed in Kafka.
-5. Call `POST /api/v1/orders/{orderId}/checkout` with `{"paymentMethodToken": "tok_refund_decline"}` (`202 Accepted`).
-6. Force-expire the reservation (`Db.forceReservationExpiry(orderId)`) and wait for the order to transition to `CANCELLED_EXPIRED`.
-7. Start `payment-service` (`docker start payment-service`) so it processes the late `order.payment.requested` (emitting `payment.succeeded`), `inventory-service` rejects seat confirmation (`inventory.seat.confirmation_rejected`), `order-service` transitions the order to `REFUND_PENDING` and emits `order.refund.requested`, and `payment-service` consumes `order.refund.requested`.
-8. Run:
-   ```bash
-   mvn -pl e2e-tests -Pe2e -Dtest=TicketingPlatformE2ETest#s11_refundDeclinedRoutesToDeadLetterTopic test
-   ```
+### 1. Description
+When attempting a compensating refund for `order.refund.requested` after a late payment on an expired hold, if the external payment provider declines the refund (using `tok_refund_decline`), the system must:
+1. Keep `payments.status` as `SUCCEEDED`.
+2. Keep `orders.status` as `REFUND_PENDING` (awaiting manual operator intervention).
+3. Emit `0` `payment.refunded` outbox events.
+4. Route the non-retryable failed refund to `order.events-payment-service-order-cg-dlt` (1 dead letter).
 
-### 2. Expected vs. Observed Behavior
-
-| Aspect | Expected (`S11` Specification & `docs/arch/02-saga.md`) | Observed |
-|---|---|---|
-| `payment_db.payments.status` | Remains `SUCCEEDED` | Transitions to `REFUNDED` |
-| `order_db.orders.status` | Remains `REFUND_PENDING` (awaiting manual ops resolution) | Transitions to `CANCELLED_REFUNDED` |
-| `payment.refunded` outbox event | `0` emitted | `1` emitted (`payment.refunded`) |
-| `order.events-payment-service-order-cg-dlt` | `+1` dead-lettered `order.refund.requested` record after retries | `0` dead-lettered records |
-
-Exact assertion failure from `TicketingPlatformE2ETest#s11_refundDeclinedRoutesToDeadLetterTopic`:
-```text
-org.opentest4j.AssertionFailedError: 
-[Payment with tok_refund_decline must remain SUCCEEDED when refund is declined] 
-expected: "SUCCEEDED"
- but was: "REFUNDED"
-	at com.ticketing.e2e.TicketingPlatformE2ETest.s11_refundDeclinedRoutesToDeadLetterTopic(TicketingPlatformE2ETest.java:1360)
-```
-
-### 3. Suspected Root Cause
-There are two compounding defects in `payment-service`:
-
-1. **`MockPaymentProvider` does not implement `tok_refund_decline`**:
-   - In `payment-service/src/main/java/com/ticketing/payment/service/provider/MockPaymentProvider.java` (lines 30–33 and 109–127), only `tok_success`, `tok_decline`, and `tok_error` are defined.
-   - `MockPaymentProvider.refund(UUID idempotencyKey, String providerReference, long amountCents, String currency)` does not receive or inspect the payment's `paymentMethodToken` (or `providerReference` prefix) for `tok_refund_decline` and unconditionally returns `PaymentResult.succeeded(refundRef)` on line 123.
-2. **`PaymentService.handleOrderRefundRequested` ignores the `PaymentResult` returned by `paymentProvider.refund(...)`**:
-   - In `payment-service/src/main/java/com/ticketing/payment/service/PaymentService.java` (lines 247–276), `handleOrderRefundRequested` invokes:
-     ```java
-     try {
-         paymentProvider.refund(orderId, existing.providerReference(), payload.amountCents(), payload.currency());
-     } catch (ProviderUnavailableException ex) {
-         ...
-     }
-     ```
-   - The returned `PaymentResult` is discarded without checking `result.status()`. Even if `paymentProvider.refund(...)` returned `PaymentResult.declined(...)`, `PaymentService` would still proceed to line 269 (`paymentRepository.markRefunded(...)`) and emit `payment.refunded`, instead of throwing `NonRetryableConsumerException` (or retrying and routing to `order.events-payment-service-order-cg-dlt`).
-
-### 4. Affected Files
-- `payment-service/src/main/java/com/ticketing/payment/service/provider/MockPaymentProvider.java` (lines 30–33, 109–127)
-- `payment-service/src/main/java/com/ticketing/payment/service/provider/PaymentProvider.java`
-- `payment-service/src/main/java/com/ticketing/payment/service/PaymentService.java` (lines 212–290, `handleOrderRefundRequested`)
+### 2. Resolution Status
+The fix was implemented in `payment-service`:
+- `MockPaymentProvider` handles `MAGIC_TOKEN_REFUND_DECLINE = "tok_refund_decline"` and returns `PaymentResult.declined(...)` on refund.
+- `PaymentService.handleOrderRefundRequested` inspects `result.outcome() == PaymentResult.Outcome.DECLINED`, logs the error, records metrics, and throws `NonRetryableEventException` to route the message to the DLT without marking the payment refunded or emitting `payment.refunded`.
+- Scenario `S11` in `TicketingPlatformE2ETest` has `@Disabled` removed and passes against the updated `payment-service` container.
+- If running against an unpatched container image where `@Disabled` is active, the scenario can be executed using:
+  ```bash
+  mvn -pl e2e-tests -Pe2e -Djunit.jupiter.conditions.deactivate=org.junit.*DisabledCondition -Dtest=TicketingPlatformE2ETest#s11_refundDeclinedRoutesToDeadLetterTopic test
+  ```
