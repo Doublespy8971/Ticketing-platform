@@ -108,6 +108,7 @@ All custom metrics use the `ticketing_` prefix, lowercase `snake_case`, and base
 | `inventory_payment_events_handled_total` | `Counter` | `service`, `event_type`, `outcome` (`confirmed`, `rejected`, `released`, `noop`, `ignored`) | `inventory-service` | Total payment events handled by inventory-service partitioned by event type and outcome. |
 | `inventory_redis_confirm_failures_total` | `Counter` | `service` | `inventory-service` | Total Redis confirm failures after retries in inventory-service. |
 | `inventory_redis_release_failures_total` | `Counter` | `service` | `inventory-service` | Total Redis release failures after retries in inventory-service. |
+| `inventory_redis_unavailable_total` | `Counter` | `service`, `operation` (`hold`, `release`, `confirm`), `cause` (`timeout`, `connection`, `other`) | `inventory-service` | Total Redis unavailability events during concurrency gate operations. |
 | `order_saga_events_handled_total` | `Counter` | `service`, `event_type`, `outcome` (`applied`, `noop`, `ignored`, `refund_requested`) | `order-service` | Total saga events handled by order-service partitioned by event type and outcome. |
 | `payment_provider_calls_total` | `Counter` | `service`, `operation` (`charge`, `refund`), `outcome` (`succeeded`, `declined`, `error`) | `payment-service` | Total calls to the payment provider. |
 | `payment_provider_duration_seconds` | `Timer` | `service`, `operation` (`charge`, `refund`) | `payment-service` | Duration of payment provider calls. |

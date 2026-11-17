@@ -1058,7 +1058,122 @@ KAFKA_TOOK=$(( $(date +%s) - SECTION_KAFKA_START ))
 echo "--- Kafka check (took ${KAFKA_TOOK}s) ---"
 
 # ------------------------------------------------------------------------------
-# 11) Final summary
+# 11) Redis failure during hold (503 SERVICE_UNAVAILABLE + Retry-After: 1)
+# ------------------------------------------------------------------------------
+echo ""
+echo "--- Redis failure check ---"
+start_check "11. Redis failure during hold: stop Redis -> 503 SERVICE_UNAVAILABLE + Retry-After, restart Redis -> 201 CREATED"
+SECTION_REDIS_FAIL_START=$(date +%s)
+
+REDIS_FAIL_OK=true
+REDIS_FAIL_ERRORS=()
+
+# Helper to ensure Redis container is restarted if script exits prematurely
+cleanup_redis_container() {
+    command docker start "${REDIS_CONTAINER}" >/dev/null 2>&1 || true
+}
+trap cleanup_redis_container EXIT
+
+if [ -n "${EVENT_ID}" ] && [ "${#SEAT_IDS[@]}" -ge 7 ]; then
+    REDIS_FAIL_SEAT="${SEAT_IDS[6]}"
+    REDIS_FAIL_USER=$(uuid_gen)
+    REDIS_FAIL_IDEMP=$(uuid_gen)
+    REDIS_FAIL_CORR=$(uuid_gen)
+    REDIS_FAIL_BODY=$(jq -n \
+        --arg eventId "${EVENT_ID}" \
+        --arg seatId "${REDIS_FAIL_SEAT}" \
+        '{eventId: $eventId, seatIds: [$seatId]}')
+
+    # 1. Stop Redis container
+    command docker stop "${REDIS_CONTAINER}" >/dev/null 2>&1 || true
+
+    # 2. Hold request should fail closed with HTTP 503, Retry-After: 1, SERVICE_UNAVAILABLE
+    HOLD_FAIL_RESPONSE=$(curl --max-time 10 --connect-timeout 3 -s -i -X POST "${INVENTORY_URL}/api/v1/reservations" \
+        -H "Content-Type: application/json" \
+        -H "X-User-Id: ${REDIS_FAIL_USER}" \
+        -H "X-User-Roles: USER" \
+        -H "X-Correlation-Id: ${REDIS_FAIL_CORR}" \
+        -H "Idempotency-Key: ${REDIS_FAIL_IDEMP}" \
+        -d "${REDIS_FAIL_BODY}" || true)
+
+    HTTP_STATUS_FAIL=$(echo "${HOLD_FAIL_RESPONSE}" | grep -E '^HTTP/[0-9.]+ ' | tail -n1 | awk '{print $2}')
+    RETRY_AFTER_HEADER=$(echo "${HOLD_FAIL_RESPONSE}" | grep -i '^Retry-After:' | head -n1 | tr -d '\r\n' | awk -F': ' '{print $2}' | tr -d ' ')
+    FAIL_BODY=$(echo "${HOLD_FAIL_RESPONSE}" | sed '1,/^\r\{0,1\}$/d')
+    FAIL_ERR_CODE=$(echo "${FAIL_BODY}" | jq -r '.errorCode // empty' 2>/dev/null || true)
+    FAIL_DETAIL=$(echo "${FAIL_BODY}" | jq -r '.detail // empty' 2>/dev/null || true)
+
+    if [ "${HTTP_STATUS_FAIL}" != "503" ]; then
+        REDIS_FAIL_OK=false
+        REDIS_FAIL_ERRORS+=("Expected HTTP 503 while Redis stopped, got ${HTTP_STATUS_FAIL}")
+    fi
+    if [ "${RETRY_AFTER_HEADER}" != "1" ]; then
+        REDIS_FAIL_OK=false
+        REDIS_FAIL_ERRORS+=("Expected Retry-After: 1, got '${RETRY_AFTER_HEADER}'")
+    fi
+    if [ "${FAIL_ERR_CODE}" != "SERVICE_UNAVAILABLE" ]; then
+        REDIS_FAIL_OK=false
+        REDIS_FAIL_ERRORS+=("Expected errorCode SERVICE_UNAVAILABLE, got '${FAIL_ERR_CODE}'")
+    fi
+    if [ "${FAIL_DETAIL}" != "Inventory concurrency gate is temporarily unavailable." ]; then
+        REDIS_FAIL_OK=false
+        REDIS_FAIL_ERRORS+=("Expected detail 'Inventory concurrency gate is temporarily unavailable.', got '${FAIL_DETAIL}'")
+    fi
+
+    # 3. Restart Redis container
+    command docker start "${REDIS_CONTAINER}" >/dev/null 2>&1 || true
+
+    # Wait for Redis to be pingable
+    REDIS_UP=false
+    for i in $(seq 1 30); do
+        if run_redis ping 2>/dev/null | grep -q "PONG"; then
+            REDIS_UP=true
+            break
+        fi
+        sleep 0.5
+    done
+
+    if [ "${REDIS_UP}" != "true" ]; then
+        REDIS_FAIL_OK=false
+        REDIS_FAIL_ERRORS+=("Redis failed to respond to PING within 15s after restart")
+    fi
+
+    # 4. Retry the exact same request with the exact same Idempotency-Key
+    HOLD_RETRY_RAW=$(curl --max-time 10 --connect-timeout 3 -s -w "\n%{http_code}" -X POST "${INVENTORY_URL}/api/v1/reservations" \
+        -H "Content-Type: application/json" \
+        -H "X-User-Id: ${REDIS_FAIL_USER}" \
+        -H "X-User-Roles: USER" \
+        -H "X-Correlation-Id: ${REDIS_FAIL_CORR}" \
+        -H "Idempotency-Key: ${REDIS_FAIL_IDEMP}" \
+        -d "${REDIS_FAIL_BODY}")
+
+    HTTP_STATUS_RETRY=$(echo "${HOLD_RETRY_RAW}" | tail -n1)
+    RETRY_BODY=$(echo "${HOLD_RETRY_RAW}" | sed '$d')
+    RETRY_STATUS=$(echo "${RETRY_BODY}" | jq -r '.status // empty' 2>/dev/null || true)
+    RETRY_RES_ID=$(echo "${RETRY_BODY}" | jq -r '.reservationId // empty' 2>/dev/null || true)
+
+    if [ "${HTTP_STATUS_RETRY}" != "201" ]; then
+        REDIS_FAIL_OK=false
+        REDIS_FAIL_ERRORS+=("Expected HTTP 201 on retry, got ${HTTP_STATUS_RETRY}")
+    fi
+    if [ "${RETRY_STATUS}" != "HELD" ] || [ -z "${RETRY_RES_ID}" ]; then
+        REDIS_FAIL_OK=false
+        REDIS_FAIL_ERRORS+=("Expected status HELD with non-empty reservationId, got status='${RETRY_STATUS}', resId='${RETRY_RES_ID}'")
+    fi
+
+    if [ "${REDIS_FAIL_OK}" = "true" ]; then
+        record_pass "${CHECK_NAME} (HTTP 503 SERVICE_UNAVAILABLE + Retry-After: 1 -> restart -> HTTP 201 HELD reservationId=${RETRY_RES_ID})"
+    else
+        record_fail "${CHECK_NAME}" "${REDIS_FAIL_ERRORS[*]}"
+    fi
+else
+    record_fail "${CHECK_NAME}" "Skipped due to missing event or seats"
+fi
+trap - EXIT
+REDIS_FAIL_TOOK=$(( $(date +%s) - SECTION_REDIS_FAIL_START ))
+echo "--- Redis failure check (took ${REDIS_FAIL_TOOK}s) ---"
+
+# ------------------------------------------------------------------------------
+# 12) Final summary
 # ------------------------------------------------------------------------------
 TOTAL_ELAPSED=$(( $(date +%s) - TOTAL_START_TIME ))
 echo ""

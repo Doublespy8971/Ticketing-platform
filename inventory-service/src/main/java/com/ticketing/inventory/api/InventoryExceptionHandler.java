@@ -4,11 +4,18 @@ import com.ticketing.common.correlation.CorrelationConstants;
 import com.ticketing.common.error.BaseRestControllerAdvice;
 import com.ticketing.common.error.ErrorCode;
 import com.ticketing.common.error.ProblemDetails;
+import com.ticketing.inventory.redis.RedisSeatGate;
 import com.ticketing.inventory.redis.RedisUnavailableException;
+import io.lettuce.core.RedisException;
+import io.micrometer.core.instrument.Counter;
+import io.micrometer.core.instrument.MeterRegistry;
 import jakarta.servlet.http.HttpServletRequest;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.slf4j.MDC;
+import org.springframework.beans.factory.ObjectProvider;
+import org.springframework.data.redis.RedisConnectionFailureException;
+import org.springframework.data.redis.RedisSystemException;
 import org.springframework.http.HttpHeaders;
 import org.springframework.http.HttpStatus;
 import org.springframework.http.MediaType;
@@ -20,6 +27,15 @@ import org.springframework.web.bind.annotation.RestControllerAdvice;
 public class InventoryExceptionHandler extends BaseRestControllerAdvice {
 
     private static final Logger log = LoggerFactory.getLogger(InventoryExceptionHandler.class);
+
+    private static final String SERVICE_NAME = "inventory-service";
+    private static final String METRIC_REDIS_UNAVAILABLE = "inventory_redis_unavailable_total";
+
+    private final MeterRegistry meterRegistry;
+
+    public InventoryExceptionHandler(ObjectProvider<MeterRegistry> meterRegistryProvider) {
+        this.meterRegistry = meterRegistryProvider != null ? meterRegistryProvider.getIfAvailable() : null;
+    }
 
     @ExceptionHandler(UnauthorizedException.class)
     public ResponseEntity<ProblemDetails> handleUnauthorized(UnauthorizedException ex, HttpServletRequest request) {
@@ -110,19 +126,75 @@ public class InventoryExceptionHandler extends BaseRestControllerAdvice {
                 .body(body);
     }
 
-    @ExceptionHandler(RedisUnavailableException.class)
+    @ExceptionHandler({
+            RedisUnavailableException.class,
+            RedisException.class,
+            RedisConnectionFailureException.class,
+            RedisSystemException.class
+    })
     public ResponseEntity<ProblemDetails> handleRedisUnavailable(
-            RedisUnavailableException ex, HttpServletRequest request) {
-        log.error("Redis unavailable while handling {}: {}", request.getRequestURI(), ex.getMessage(), ex);
+            Exception ex, HttpServletRequest request) {
+        Throwable rootCause = ex;
+        while (rootCause.getCause() != null && rootCause.getCause() != rootCause) {
+            rootCause = rootCause.getCause();
+        }
+        String correlationId = MDC.get(CorrelationConstants.MDC_KEY);
+        log.error("Redis unavailable while handling {} [correlationId={}]: {}: {}",
+                request.getRequestURI(), correlationId, rootCause.getClass().getName(), rootCause.getMessage());
+
+        boolean isHold = isHoldPath(request);
+        boolean alreadyRecorded = false;
+        if (ex instanceof RedisUnavailableException rue && rue.isMetricRecorded()) {
+            alreadyRecorded = true;
+        }
+
+        if (!alreadyRecorded && meterRegistry != null) {
+            String cause = RedisSeatGate.resolveCause(ex);
+            String operation = isHold ? "hold" : "other";
+            Counter.builder(METRIC_REDIS_UNAVAILABLE)
+                    .tag("service", SERVICE_NAME)
+                    .tag("operation", operation)
+                    .tag("cause", cause)
+                    .register(meterRegistry)
+                    .increment();
+            if (ex instanceof RedisUnavailableException rue) {
+                rue.setMetricRecorded(true);
+            }
+        }
+
+        if (isHold) {
+            ProblemDetails body = ProblemDetails.of(
+                    ErrorCode.SERVICE_UNAVAILABLE,
+                    "Inventory concurrency gate is temporarily unavailable.",
+                    request.getRequestURI(),
+                    correlationId,
+                    null
+            );
+            return ResponseEntity.status(HttpStatus.SERVICE_UNAVAILABLE)
+                    .header(HttpHeaders.RETRY_AFTER, "1")
+                    .contentType(MediaType.parseMediaType(ProblemDetails.MEDIA_TYPE))
+                    .body(body);
+        }
+
         ProblemDetails body = ProblemDetails.of(
                 ErrorCode.INTERNAL_SERVER_ERROR,
-                "Inventory concurrency gate is temporarily unavailable.",
+                "An unexpected error occurred.",
                 request.getRequestURI(),
-                MDC.get(CorrelationConstants.MDC_KEY),
+                correlationId,
                 null
         );
         return ResponseEntity.status(HttpStatus.INTERNAL_SERVER_ERROR)
                 .contentType(MediaType.parseMediaType(ProblemDetails.MEDIA_TYPE))
                 .body(body);
+    }
+
+    private boolean isHoldPath(HttpServletRequest request) {
+        if (request == null) {
+            return false;
+        }
+        String method = request.getMethod();
+        String uri = request.getRequestURI();
+        return "POST".equalsIgnoreCase(method) && uri != null &&
+                (uri.equals("/api/v1/reservations") || uri.endsWith("/api/v1/reservations") || uri.endsWith("/api/v1/reservations/"));
     }
 }

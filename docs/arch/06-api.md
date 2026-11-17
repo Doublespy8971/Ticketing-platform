@@ -102,6 +102,7 @@ All `4xx` and `5xx` responses across `gateway-service`, `inventory-service`, and
 | `IDEMPOTENCY_KEY_PAYLOAD_MISMATCH` | `422` | `inventory-service`, `order-service` | Same `Idempotency-Key` reused with a different request payload. |
 | `RATE_LIMIT_EXCEEDED` | `429` | `gateway-service` | Token-bucket rate limit exceeded (`Retry-After: 1`). |
 | `INTERNAL_SERVER_ERROR` | `500` | All | Unexpected server error. |
+| `SERVICE_UNAVAILABLE` | `503` | All (`inventory-service`, `order-service`) | Concurrency gate or downstream dependency temporarily unavailable (`Retry-After: 1`). |
 
 ---
 
@@ -347,11 +348,13 @@ All `4xx` and `5xx` responses across `gateway-service`, `inventory-service`, and
   - `409 Conflict` (`EVENT_NOT_OPEN`): `hold_inventory.lua` returned `"EVENT_NOT_OPEN"` because current time is before `drop_time`.
   - `409 Conflict` (`SEAT_ALREADY_TAKEN`): `hold_inventory.lua` returned `"SEAT_TAKEN"` (or PostgreSQL optimistic/unique constraint failed) because one or more requested seats are already `HELD` or `SOLD`.
   - `422 Unprocessable Entity` (`IDEMPOTENCY_KEY_PAYLOAD_MISMATCH`): Reused `Idempotency-Key` with different payload.
+  - `503 Service Unavailable` (`SERVICE_UNAVAILABLE`): The Redis concurrency gate cannot be reached (e.g. connection failure or command timeout). The hold endpoint fails closed with HTTP 503, errorCode `SERVICE_UNAVAILABLE`, `Retry-After: 1` header, and fixed detail `"Inventory concurrency gate is temporarily unavailable."` with no internal exception text. No reservation, seat, outbox, or idempotency record is left behind in `inventory_db`.
 - **Mapping `hold_inventory.lua` Plain-String Return Values to HTTP Responses**:
   - `"HELD"` -> Proceed to execute the synchronous PostgreSQL transaction on `inventory_db` (`seats`, `reservations`, `reservation_items`, `outbox_events`) and return `201 Created`.
   - `"EVENT_NOT_CACHED"` -> Query `inventory_db` for the event and active seats (`HELD` and `SOLD`), warm Redis (`event:{eventId}:drop_ts`, `HELD` seat locks with TTL `= max(1, seconds_until_expires_at) + 60`, and `SOLD` seat locks with no TTL), and retry `hold_inventory.lua` once; if the event row does not exist in `inventory_db`, return `404 Not Found` (`RESOURCE_NOT_FOUND`).
   - `"EVENT_NOT_OPEN"` -> Return `409 Conflict` with RFC 7807 `errorCode: "EVENT_NOT_OPEN"` without opening a PostgreSQL transaction on `reservations`.
   - `"SEAT_TAKEN"` -> Return `409 Conflict` with RFC 7807 `errorCode: "SEAT_ALREADY_TAKEN"` without opening a PostgreSQL transaction on `reservations`.
+  - Redis Unreachable / Timeout -> Fails closed with `503 Service Unavailable` (`SERVICE_UNAVAILABLE`), `Retry-After: 1`, fixed detail `"Inventory concurrency gate is temporarily unavailable."`, and best-effort token-checked `release_inventory.lua` ambiguity compensation (300 ms timeout). No reservation, seat, outbox, or idempotency row is committed.
 
 ---
 

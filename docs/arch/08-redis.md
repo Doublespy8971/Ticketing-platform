@@ -60,6 +60,8 @@ return 'HELD'
 - `"EVENT_NOT_CACHED"`: Executes the cache rewarm job from `inventory_db` (Section 9.3.3) and retries `hold_inventory.lua` once; if `eventId` does not exist in `inventory_db`, returns `404 Not Found` (`RESOURCE_NOT_FOUND`).
 - `"EVENT_NOT_OPEN"`: Deletes the `IN_PROGRESS` idempotency key claim (so a later retry re-executes) and returns `409 Conflict` with RFC 7807 `errorCode: "EVENT_NOT_OPEN"`.
 - `"SEAT_TAKEN"`: Deletes the `IN_PROGRESS` idempotency key claim (so a later retry re-executes) and returns `409 Conflict` with RFC 7807 `errorCode: "SEAT_ALREADY_TAKEN"`.
+- **Redis Concurrency Gate Failure / Timeout**: When Redis cannot be reached (e.g., connection failure, command timeout, or `RedisUnavailableException`), the hold endpoint fails closed with HTTP `503 Service Unavailable`, `errorCode: "SERVICE_UNAVAILABLE"`, a `Retry-After: 1` header, and fixed detail `"Inventory concurrency gate is temporarily unavailable."` without internal exception text. The claimed `IN_PROGRESS` idempotency key is deleted so retries execute again, and no 503 response is stored as `COMPLETED`. No reservation, seat, outbox, or idempotency record is left behind in `inventory_db`.
+  - **Ambiguity Compensation**: Because a timed-out Redis command may have executed on the server, `RedisSeatGate.hold` / `ReservationService` triggers a best-effort token-checked `release_inventory.lua` call for the requested seats with `reservationId` using a fresh short timeout (300 ms). If this compensation also fails or times out, it logs the outcome and relies on the 660-second safety-net TTL without masking the original 503 failure. Because the release is token-checked, it can never free another reservation's seat.
 
 ---
 

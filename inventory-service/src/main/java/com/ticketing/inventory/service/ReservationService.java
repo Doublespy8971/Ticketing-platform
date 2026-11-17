@@ -228,13 +228,22 @@ public class ReservationService {
                 UUID reservationId = UuidV7.generate();
 
                 // 5. Call RedisSeatGate.hold; on EVENT_NOT_CACHED call rewarmEvent once and retry once
-                HoldOutcome holdOutcome = acquireRedisSeatHold(
-                        eventId,
-                        requestedSeatIds,
-                        reservationId,
-                        requestInstant.toEpochMilli(),
-                        correlationId
-                );
+                HoldOutcome holdOutcome;
+                try {
+                    holdOutcome = acquireRedisSeatHold(
+                            eventId,
+                            requestedSeatIds,
+                            reservationId,
+                            requestInstant.toEpochMilli(),
+                            correlationId
+                    );
+                } catch (RedisUnavailableException ex) {
+                    if (!ex.isCompensationAttempted()) {
+                        redisSeatGate.bestEffortRelease(eventId, requestedSeatIds, reservationId);
+                        ex.setCompensationAttempted(true);
+                    }
+                    throw ex;
+                }
                 if (holdOutcome == HoldOutcome.EVENT_NOT_OPEN) {
                     outcomeTag = "EVENT_NOT_OPEN";
                     recordRejected("EVENT_NOT_OPEN");
