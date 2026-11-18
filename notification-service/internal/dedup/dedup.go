@@ -2,6 +2,7 @@ package dedup
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"strings"
 	"sync"
@@ -78,12 +79,19 @@ func WithRedisMetrics(m *metrics.Metrics) RedisDedupOption {
 	}
 }
 
+func WithRedisStopChan(stopChan <-chan struct{}) RedisDedupOption {
+	return func(r *RedisDeduplicator) {
+		r.stopChan = stopChan
+	}
+}
+
 type RedisDeduplicator struct {
 	client        redis.Cmdable
 	consumerGroup string
 	workerID      string
 	claimTTL      time.Duration
 	sentTTL       time.Duration
+	stopChan      <-chan struct{}
 	metrics       *metrics.Metrics
 }
 
@@ -161,6 +169,8 @@ func (d *RedisDeduplicator) Claim(ctx context.Context, eventID string) (bool, er
 		select {
 		case <-ctx.Done():
 			return false, ctx.Err()
+		case <-d.stopChan:
+			return false, errors.New("claim wait interrupted by stop channel")
 		case <-ticker.C:
 		}
 

@@ -3,6 +3,7 @@ package consumer
 import (
 	"context"
 	"errors"
+	"sync"
 	"testing"
 	"time"
 
@@ -329,5 +330,213 @@ func TestProcessMessageCancelledReleasesClaim(t *testing.T) {
 	// Offset must NOT be committed when cancelled without processing
 	if reader.CommittedCount() != 0 {
 		t.Fatalf("offset must not be committed on cancellation, got %d", reader.CommittedCount())
+	}
+}
+
+type transientErrorReader struct {
+	err error
+}
+
+func (r *transientErrorReader) FetchMessage(ctx context.Context) (kafka.Message, error) {
+	if ctx.Err() != nil {
+		return kafka.Message{}, ctx.Err()
+	}
+	return kafka.Message{}, r.err
+}
+
+func (r *transientErrorReader) CommitMessages(ctx context.Context, msgs ...kafka.Message) error {
+	return nil
+}
+
+func (r *transientErrorReader) Close() error {
+	return nil
+}
+
+// Requirement 3: transient error forever with 10s backoff -> stops within 500 ms after StopFetching
+func TestRun_TransientFetchErrorInterruptibleByStopFetching(t *testing.T) {
+	reader := &transientErrorReader{err: errors.New("kafka: not leader for partition")}
+	d := dedup.NewMemoryDeduplicator(1 * time.Hour)
+	sender := notify.NewFailingSender(0, nil)
+	m := metrics.NewMetrics()
+
+	c := NewConsumer(reader, d, sender, m, Options{})
+
+	runDone := make(chan error, 1)
+	ctx := context.Background()
+
+	go func() {
+		runDone <- c.Run(ctx)
+	}()
+
+	// Wait briefly so reader fails fetch and enters backoff timer
+	time.Sleep(50 * time.Millisecond)
+
+	start := time.Now()
+	c.StopFetching()
+
+	select {
+	case err := <-runDone:
+		elapsed := time.Since(start)
+		if err != nil {
+			t.Fatalf("expected nil error on stop fetching, got %v", err)
+		}
+		if elapsed > 500*time.Millisecond {
+			t.Fatalf("expected Run to return within 500ms, took %v", elapsed)
+		}
+	case <-time.After(1 * time.Second):
+		t.Fatalf("timed out waiting for Run to return after StopFetching")
+	}
+}
+
+type failingCommitReader struct {
+	mu           sync.Mutex
+	messages     []kafka.Message
+	commitCalled chan struct{}
+	commitOnce   sync.Once
+}
+
+func (r *failingCommitReader) FetchMessage(ctx context.Context) (kafka.Message, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if len(r.messages) == 0 {
+		<-ctx.Done()
+		return kafka.Message{}, ctx.Err()
+	}
+	msg := r.messages[0]
+	r.messages = r.messages[1:]
+	return msg, nil
+}
+
+func (r *failingCommitReader) CommitMessages(ctx context.Context, msgs ...kafka.Message) error {
+	r.commitOnce.Do(func() {
+		close(r.commitCalled)
+	})
+	return errors.New("kafka: commit failure")
+}
+
+func (r *failingCommitReader) Close() error {
+	return nil
+}
+
+// Requirement 3: same during commit retry -> stops within 500 ms after StopFetching
+func TestRun_CommitRetryInterruptibleByStopFetching(t *testing.T) {
+	commitCalled := make(chan struct{})
+	reader := &failingCommitReader{
+		messages: []kafka.Message{{
+			Topic:     "order.events",
+			Partition: 0,
+			Offset:    100,
+			Value:     validConfirmedJSON,
+		}},
+		commitCalled: commitCalled,
+	}
+
+	d := dedup.NewMemoryDeduplicator(1 * time.Hour)
+	sender := notify.NewFailingSender(0, nil)
+	m := metrics.NewMetrics()
+
+	c := NewConsumer(reader, d, sender, m, Options{})
+
+	runDone := make(chan error, 1)
+	ctx := context.Background()
+
+	go func() {
+		runDone <- c.Run(ctx)
+	}()
+
+	// Wait until commit is attempted
+	select {
+	case <-commitCalled:
+	case <-time.After(2 * time.Second):
+		t.Fatalf("timed out waiting for commit to be called")
+	}
+
+	// Consumer is now in commitWithRetry backoff sleep (500ms..10s)
+	start := time.Now()
+	c.StopFetching()
+
+	select {
+	case err := <-runDone:
+		elapsed := time.Since(start)
+		if err != nil {
+			t.Fatalf("expected nil error on stop fetching, got %v", err)
+		}
+		if elapsed > 500*time.Millisecond {
+			t.Fatalf("expected Run to return within 500ms during commit retry, took %v", elapsed)
+		}
+	case <-time.After(1 * time.Second):
+		t.Fatalf("timed out waiting for Run to return during commit retry")
+	}
+}
+
+type blockingClaimDeduplicator struct {
+	claimCalled chan struct{}
+	claimOnce   sync.Once
+}
+
+func (b *blockingClaimDeduplicator) Claim(ctx context.Context, eventID string) (bool, error) {
+	b.claimOnce.Do(func() {
+		close(b.claimCalled)
+	})
+	<-ctx.Done()
+	return false, ctx.Err()
+}
+
+func (b *blockingClaimDeduplicator) Promote(ctx context.Context, eventID string) error {
+	return nil
+}
+
+func (b *blockingClaimDeduplicator) Release(ctx context.Context, eventID string, reasons ...string) error {
+	return nil
+}
+
+func (b *blockingClaimDeduplicator) Key(eventID string) string {
+	return "test-key"
+}
+
+// Requirement 3: same while waiting on another worker's claim -> stops within 500 ms after StopFetching
+func TestRun_ClaimWaitInterruptibleByStopFetching(t *testing.T) {
+	claimCalled := make(chan struct{})
+	reader := NewMockMessageReader([]kafka.Message{{
+		Topic:     "order.events",
+		Partition: 0,
+		Offset:    200,
+		Value:     validConfirmedJSON,
+	}})
+
+	d := &blockingClaimDeduplicator{claimCalled: claimCalled}
+	sender := notify.NewFailingSender(0, nil)
+	m := metrics.NewMetrics()
+
+	c := NewConsumer(reader, d, sender, m, Options{})
+
+	runDone := make(chan error, 1)
+	ctx := context.Background()
+
+	go func() {
+		runDone <- c.Run(ctx)
+	}()
+
+	// Wait until claim is called
+	select {
+	case <-claimCalled:
+	case <-time.After(2 * time.Second):
+		t.Fatalf("timed out waiting for Claim to be called")
+	}
+
+	start := time.Now()
+	c.StopFetching()
+
+	select {
+	case err := <-runDone:
+		elapsed := time.Since(start)
+		if err != nil {
+			t.Fatalf("expected nil error on stop fetching during claim wait, got %v", err)
+		}
+		if elapsed > 500*time.Millisecond {
+			t.Fatalf("expected Run to return within 500ms while waiting on claim, took %v", elapsed)
+		}
+	case <-time.After(1 * time.Second):
+		t.Fatalf("timed out waiting for Run to return while waiting on claim")
 	}
 }

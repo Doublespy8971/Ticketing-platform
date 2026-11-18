@@ -112,13 +112,17 @@
 2. **Transient Kafka Errors**:
    - `FetchMessage` errors other than context cancellation do not terminate the loop: the consumer logs a `WARN`, backs off exponentially (500ms to 10s), and resumes fetching.
    - `CommitMessages` retries up to 5 times with exponential backoff (500ms to 10s). If all retries fail, it is safe because the `"SENT"` Redis key prevents duplicate dispatches on redelivery.
-3. **Graceful Shutdown**:
+3. **Graceful Shutdown & Interruptible Waits**:
    - On `SIGTERM` or `SIGINT`:
      1. Immediately marks `/ready` as not ready (HTTP 503 `DOWN`).
      2. Stops fetching new Kafka messages (`StopFetching()`).
-     3. Allows in-flight message processing and offset commit up to the 10-second drain period.
-     4. Closes Kafka reader, Redis client, and HTTP server, in that exact order.
-     5. If the 10-second drain period is exceeded, releases the in-flight claim on a fresh context (`reason="cancelled"`) and exits non-zero (`os.Exit(1)`).
+     3. **Interruptible Waits**: Every wait in the consumer loop—including the fetch error backoff (500ms to 10s), the commit retry backoff (500ms to 10s), the claim wait polling loop (up to 65s), and the Redis unavailable backoff (up to 300s)—is immediately interruptible by the stop-fetching channel (`c.stopFetchChan`) and context cancellation (`ctx.Done()`) via `select` over `time.NewTimer`, stopping the timer when interrupted.
+     4. If no message is in flight when `StopFetching()` is signaled (even during a 10s transient-error backoff while Kafka is partitioned or down), `Run` returns `nil` within 500 ms.
+     5. If a message is in flight, it is allowed to finish sending and commit its offset within the 10-second drain period.
+     6. Closes Kafka reader, Redis client, and HTTP server, in that exact order.
+   - **Process Exit Codes**:
+     - `0` (Success): Emitted upon clean drain completion, including when interrupted during transient error backoff sleeps with no uncommitted in-flight message.
+     - `1` (Failure): Emitted only when an in-flight message fails to complete within the 10-second drain timeout (releasing the held in-progress claim with `reason="cancelled"` via fresh 2s context), or on fatal startup/server failure. This cleanly integrates with orchestrator restart policies (`restart: on-failure:5` in Docker Compose).
 
 ---
 

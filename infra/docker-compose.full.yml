@@ -124,7 +124,8 @@ services:
         condition: service_completed_successfully
       order-service:
         condition: service_healthy
-    restart: "no"
+    # Non-zero exits mean an in-flight message timed out or crashed; clean drains exit 0 and should not restart unless the orchestrator wants it
+    restart: on-failure:5
     deploy:
       resources:
         limits:

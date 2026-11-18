@@ -130,13 +130,16 @@ func (c *Consumer) Run(ctx context.Context) error {
 				slog.String("error", err.Error()),
 				slog.Duration("backoff", fetchBackoff),
 			)
+			timer := time.NewTimer(fetchBackoff)
 			select {
-			case <-time.After(fetchBackoff):
+			case <-timer.C:
 				fetchBackoff = min(fetchBackoff*2, maxFetchBackoff)
 				continue
 			case <-ctx.Done():
+				timer.Stop()
 				return nil
 			case <-c.stopFetchChan:
+				timer.Stop()
 				return nil
 			}
 		}
@@ -145,7 +148,7 @@ func (c *Consumer) Run(ctx context.Context) error {
 		fetchBackoff = 500 * time.Millisecond
 
 		if err := c.ProcessMessage(ctx, msg); err != nil {
-			if errors.Is(err, context.Canceled) || ctx.Err() != nil {
+			if errors.Is(err, context.Canceled) || ctx.Err() != nil || c.stopping.Load() {
 				return nil
 			}
 			c.logger.Warn("Error processing message, continuing", slog.String("error", err.Error()))
@@ -222,8 +225,11 @@ func (c *Consumer) ProcessMessage(ctx context.Context, msg kafka.Message) (err e
 	}
 
 	// Two-phase deduplication claim: SET <workerId>:IN_PROGRESS NX EX 60
-	claimed, err := c.dedup.Claim(ctx, env.EventID)
+	claimed, err := c.claimWithInterrupt(ctx, env.EventID)
 	if err != nil {
+		if errors.Is(err, context.Canceled) || ctx.Err() != nil || c.stopping.Load() {
+			return err
+		}
 		c.metrics.RecordRedisError()
 		c.logger.Warn("Redis dedup claim failed on initial attempt, retrying with backoff",
 			slog.String("eventId", env.EventID),
@@ -232,6 +238,9 @@ func (c *Consumer) ProcessMessage(ctx context.Context, msg kafka.Message) (err e
 
 		claimed, err = c.retryDedupClaim(ctx, env.EventID)
 		if err != nil {
+			if errors.Is(err, context.Canceled) || ctx.Err() != nil || c.stopping.Load() {
+				return err
+			}
 			c.logger.Error("Redis unavailable for deduplication claim after retrying up to max poll interval, halting consumer to prevent offset loss",
 				slog.String("eventId", env.EventID),
 				slog.String("eventType", env.EventType),
@@ -272,12 +281,18 @@ func (c *Consumer) ProcessMessage(ctx context.Context, msg kafka.Message) (err e
 		}
 
 		if attempt < c.maxAttempts {
+			timer := time.NewTimer(backoff)
 			select {
-			case <-time.After(backoff):
+			case <-timer.C:
 				backoff = min(backoff*2, c.maxBackoff)
 			case <-ctx.Done():
+				timer.Stop()
 				c.releaseClaimFreshContext(claimedEventID, metrics.ReleaseReasonCancelled)
 				return ctx.Err()
+			case <-c.stopFetchChan:
+				timer.Stop()
+				c.releaseClaimFreshContext(claimedEventID, metrics.ReleaseReasonCancelled)
+				return errors.New("sender retry interrupted by stop fetching")
 			}
 		}
 	}
@@ -332,6 +347,29 @@ func (c *Consumer) releaseClaimFreshContext(eventID, reason string) {
 	}
 }
 
+func (c *Consumer) StopChan() <-chan struct{} {
+	return c.stopFetchChan
+}
+
+func (c *Consumer) claimWithInterrupt(ctx context.Context, eventID string) (bool, error) {
+	claimCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
+
+	stopDone := make(chan struct{})
+	defer close(stopDone)
+
+	go func() {
+		select {
+		case <-c.stopFetchChan:
+			cancel()
+		case <-claimCtx.Done():
+		case <-stopDone:
+		}
+	}()
+
+	return c.dedup.Claim(claimCtx, eventID)
+}
+
 func (c *Consumer) commitWithRetry(ctx context.Context, msg kafka.Message) error {
 	backoff := 500 * time.Millisecond
 	maxBackoff := 10 * time.Second
@@ -342,7 +380,7 @@ func (c *Consumer) commitWithRetry(ctx context.Context, msg kafka.Message) error
 		if err == nil {
 			return nil
 		}
-		if errors.Is(err, context.Canceled) || ctx.Err() != nil {
+		if errors.Is(err, context.Canceled) || ctx.Err() != nil || c.stopping.Load() {
 			return err
 		}
 		lastErr = err
@@ -351,11 +389,16 @@ func (c *Consumer) commitWithRetry(ctx context.Context, msg kafka.Message) error
 			slog.String("error", err.Error()),
 			slog.Duration("backoff", backoff),
 		)
+		timer := time.NewTimer(backoff)
 		select {
-		case <-time.After(backoff):
+		case <-timer.C:
 			backoff = min(backoff*2, maxBackoff)
 		case <-ctx.Done():
+			timer.Stop()
 			return ctx.Err()
+		case <-c.stopFetchChan:
+			timer.Stop()
+			return errors.New("commit retry interrupted by stop fetching")
 		}
 	}
 
@@ -372,15 +415,23 @@ func (c *Consumer) retryDedupClaim(ctx context.Context, eventID string) (bool, e
 	maxBackoff := 5 * time.Second
 
 	for time.Now().Before(deadline) {
+		timer := time.NewTimer(backoff)
 		select {
 		case <-ctx.Done():
+			timer.Stop()
 			return false, ctx.Err()
-		case <-time.After(backoff):
+		case <-c.stopFetchChan:
+			timer.Stop()
+			return false, errors.New("redis dedup claim retry interrupted by stop fetching")
+		case <-timer.C:
 		}
 
-		claimed, err := c.dedup.Claim(ctx, eventID)
+		claimed, err := c.claimWithInterrupt(ctx, eventID)
 		if err == nil {
 			return claimed, nil
+		}
+		if errors.Is(err, context.Canceled) || ctx.Err() != nil || c.stopping.Load() {
+			return false, err
 		}
 
 		c.metrics.RecordRedisError()

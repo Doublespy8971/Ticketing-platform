@@ -1,11 +1,13 @@
 package test
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"net"
 	"net/http"
 	"net/http/httptest"
@@ -22,6 +24,7 @@ import (
 	tckafka "github.com/testcontainers/testcontainers-go/modules/kafka"
 	tcredis "github.com/testcontainers/testcontainers-go/modules/redis"
 
+	"github.com/ticketing-platform/notification-service/internal/app"
 	"github.com/ticketing-platform/notification-service/internal/consumer"
 	"github.com/ticketing-platform/notification-service/internal/dedup"
 	"github.com/ticketing-platform/notification-service/internal/health"
@@ -1305,5 +1308,142 @@ func TestRealInfra_MetricsAllowlistAndClaimCounters(t *testing.T) {
 		if !strings.Contains(body, expected) {
 			t.Fatalf("expected metrics to contain %q, got:\n%s", expected, body)
 		}
+	}
+}
+
+type safeLogBuffer struct {
+	mu  sync.Mutex
+	buf bytes.Buffer
+}
+
+func (s *safeLogBuffer) Write(p []byte) (n int, err error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.buf.Write(p)
+}
+
+func (s *safeLogBuffer) String() string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.buf.String()
+}
+
+// 12. Stop Kafka container while consumer is running: transient error warning logged,
+// StopFetching called, Run returns within 1 second, and process-level exit path reports success.
+func TestRealInfra_KafkaStopTransientErrorExitPathSuccess(t *testing.T) {
+	_, _, rdb := requireDockerAndInfra(t)
+	defer rdb.Close()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+
+	// Dedicated Kafka container so stopping it does not impact other tests
+	kafkaC, err := tckafka.Run(ctx, "confluentinc/cp-kafka:7.6.1", tckafka.WithClusterID(uuid.NewString()))
+	if err != nil {
+		t.Fatalf("failed to start dedicated kafka container: %v", err)
+	}
+	defer kafkaC.Terminate(ctx)
+
+	brokers, err := kafkaC.Brokers(ctx)
+	if err != nil {
+		t.Fatalf("failed to get kafka brokers: %v", err)
+	}
+
+	topic := fmt.Sprintf("topic-kafka-stop-%s", uuid.NewString())
+	groupID := fmt.Sprintf("cg-kafka-stop-%s", uuid.NewString())
+
+	createRealTopic(ctx, t, brokers, topic, 1)
+
+	realReader := kafka.NewReader(kafka.ReaderConfig{
+		Brokers:        brokers,
+		GroupID:        groupID,
+		Topic:          topic,
+		MinBytes:       1,
+		MaxBytes:       10e6,
+		MaxWait:        200 * time.Millisecond,
+		CommitInterval: 0,
+	})
+	defer realReader.Close()
+
+	var logBuf safeLogBuffer
+	logger := slog.New(slog.NewJSONHandler(&logBuf, &slog.HandlerOptions{
+		Level: slog.LevelWarn,
+	}))
+
+	m := metrics.NewMetrics()
+	d := dedup.NewRedisDeduplicator(rdb, groupID, 1*time.Hour,
+		dedup.WithRedisWorkerID("worker-kafka-stop"),
+		dedup.WithRedisClaimTTL(60*time.Second),
+		dedup.WithRedisMetrics(m),
+	)
+	sender := notify.NewFailingSender(0, nil)
+
+	c := consumer.NewConsumer(realReader, d, sender, m, consumer.Options{
+		Logger: logger,
+	})
+
+	cCtx, cCancel := context.WithCancel(ctx)
+	defer cCancel()
+
+	consumerDone := make(chan error, 1)
+	go func() {
+		consumerDone <- c.Run(cCtx)
+	}()
+
+	// Stop Kafka container while consumer is running
+	stopTimeout := 5 * time.Second
+	if err := kafkaC.Stop(ctx, &stopTimeout); err != nil {
+		t.Fatalf("failed to stop kafka container: %v", err)
+	}
+
+	// Wait until transient error warning is logged
+	deadline := time.Now().Add(25 * time.Second)
+	var foundTransientError bool
+	for time.Now().Before(deadline) {
+		if strings.Contains(logBuf.String(), "Transient Kafka fetch error, backing off") {
+			foundTransientError = true
+			break
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	if !foundTransientError {
+		t.Fatalf("timed out waiting for 'Transient Kafka fetch error, backing off' to be logged; logs:\n%s", logBuf.String())
+	}
+
+	// Call StopFetching
+	start := time.Now()
+	c.StopFetching()
+
+	// Assert Run returns within 1 second
+	var runErr error
+	select {
+	case runErr = <-consumerDone:
+		elapsed := time.Since(start)
+		if runErr != nil {
+			t.Fatalf("expected nil error on stop fetching, got %v", runErr)
+		}
+		if elapsed > 1*time.Second {
+			t.Fatalf("expected Run to return within 1s, took %v", elapsed)
+		}
+	case <-time.After(1 * time.Second):
+		t.Fatalf("timed out waiting for Run to return within 1s after StopFetching")
+	}
+
+	// Assert process-level exit path reports success (exit code 0)
+	exitConsumerDone := make(chan error, 1)
+	exitConsumerDone <- runErr
+
+	exitCode := app.DrainAndShutdown(
+		c,
+		exitConsumerDone,
+		cCancel,
+		nil,
+		5*time.Second,
+		logger,
+		realReader,
+		rdb,
+	)
+	if exitCode != 0 {
+		t.Fatalf("expected process-level exit path to report 0 (success), got %d", exitCode)
 	}
 }
