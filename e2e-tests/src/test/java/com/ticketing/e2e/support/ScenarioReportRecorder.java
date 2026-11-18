@@ -17,12 +17,15 @@ import java.util.UUID;
 /**
  * Collects per-scenario execution metrics and invariant results, and renders a
  * human-readable Markdown report to {@code e2e-tests/target/e2e-report.md}
- * (and {@code docs/e2e-report.md} only when {@code -De2e.publishReport=true} AND the run contained no failures).
- * Never writes secrets or JWT tokens to the report, and never emits hardcoded status strings.
+ * (and {@code docs/e2e-report.md} only when {@code -De2e.publishReport=true}
+ * AND the run contained no failures).
+ * Never writes secrets or JWT tokens to the report, and never emits hardcoded
+ * status strings.
  */
 public final class ScenarioReportRecorder {
 
-    public record CatalogScenario(String id, String name, String tag) {}
+    public record CatalogScenario(String id, String name, String tag) {
+    }
 
     public static final List<CatalogScenario> SCENARIO_CATALOG = List.of(
             new CatalogScenario("S1", "Happy path through the gateway", "fast"),
@@ -37,10 +40,12 @@ public final class ScenarioReportRecorder {
             new CatalogScenario("S10", "Technical provider error (tok_error) retry recovery", "fast"),
             new CatalogScenario("S11", "Refund declined (tok_refund_decline) routes to DLT", "chaos"),
             new CatalogScenario("S12", "Gateway protection (RBAC, header spoofing, rate-limit isolation)", "fast"),
-            new CatalogScenario("S13", "Final global audit across all rows of all three databases, Kafka consumer groups, DLTs, and notifications", "fast,chaos")
-    );
+            new CatalogScenario("S13",
+                    "Final global audit across all rows of all three databases, Kafka consumer groups, DLTs, and notifications",
+                    "fast,chaos"));
 
-    public record InvariantSpec(String code, String title, String description) {}
+    public record InvariantSpec(String code, String title, String description) {
+    }
 
     public static final List<InvariantSpec> INVARIANT_SPECS = List.of(
             new InvariantSpec("I1", "Oversell",
@@ -58,8 +63,7 @@ public final class ScenarioReportRecorder {
             new InvariantSpec("I7", "Dead Letters",
                     "Dead-letter topic (*-dlt) offset growth equals the exact scenario-declared expected dead-letter count"),
             new InvariantSpec("I8", "Notifications",
-                    "Notification counters match expected counts derived from orders table (1 confirmed per CONFIRMED order, 1..2 cancelled per cancelled order) and distinct eventIds on order.events with 0 counter resets and 0 unexpected duplicates")
-    );
+                    "Notification counters match expected counts derived from orders table (1 confirmed per CONFIRMED order, 1..2 cancelled per cancelled order) and distinct eventIds on order.events with 0 counter resets and 0 unexpected duplicates"));
 
     public record ScenarioRecord(
             String id,
@@ -86,8 +90,7 @@ public final class ScenarioReportRecorder {
             long expectedDeadLetters,
             Map<String, Boolean> invariants,
             String notes,
-            Double recoverySeconds
-    ) {
+            Double recoverySeconds) {
         public ScenarioRecord(
                 String id,
                 String name,
@@ -112,14 +115,14 @@ public final class ScenarioReportRecorder {
                 long deadLetters,
                 long expectedDeadLetters,
                 Map<String, Boolean> invariants,
-                String notes
-        ) {
+                String notes) {
             this(id, name, tag, status, durationMs, users, holdsAttempted, holdsAccepted,
                     holdsRejected, holdsRateLimited, holdsFailedOrLost, reservationsCommitted,
                     reservationsByStatus, ordersCreated, ordersByStatus, paymentsSucceeded,
                     paymentsFailed, refunds, notificationsConfirmed, notificationsCancelled,
                     deadLetters, expectedDeadLetters, invariants, notes, null);
         }
+
         public String reservationsSummary() {
             if (reservationsCommitted == 0 && (reservationsByStatus == null || reservationsByStatus.isEmpty())) {
                 return "0";
@@ -190,8 +193,7 @@ public final class ScenarioReportRecorder {
         return fromEventsAudit(
                 id, name, tag, status, durationMs, users,
                 holdsAttempted, holdsAccepted, holdsRejected, holdsRateLimited, holdsFailedOrLost,
-                eventIds, db, notifDiff, deadLettersDelta, expectedDeadLetters, auditResult, notes, null
-        );
+                eventIds, db, notifDiff, deadLettersDelta, expectedDeadLetters, auditResult, notes, null);
     }
 
     public static ScenarioRecord fromEventsAudit(
@@ -304,8 +306,7 @@ public final class ScenarioReportRecorder {
                 expectedDeadLetters,
                 invMap,
                 notes,
-                recoverySeconds
-        );
+                recoverySeconds);
     }
 
     public static ScenarioRecord fromEventAudit(
@@ -330,8 +331,7 @@ public final class ScenarioReportRecorder {
         return fromEventAudit(
                 id, name, tag, status, durationMs, users,
                 holdsAttempted, holdsAccepted, holdsRejected, holdsRateLimited, holdsFailedOrLost,
-                eventId, db, notifDiff, deadLettersDelta, expectedDeadLetters, auditResult, notes, null
-        );
+                eventId, db, notifDiff, deadLettersDelta, expectedDeadLetters, auditResult, notes, null);
     }
 
     public static ScenarioRecord fromEventAudit(
@@ -359,8 +359,7 @@ public final class ScenarioReportRecorder {
                 holdsAttempted, holdsAccepted, holdsRejected, holdsRateLimited, holdsFailedOrLost,
                 eventId != null ? List.of(eventId) : null,
                 db, notifDiff, deadLettersDelta, expectedDeadLetters, auditResult, notes,
-                recoverySeconds
-        );
+                recoverySeconds);
     }
 
     public synchronized void writeReports(Path workspaceRoot) throws IOException {
@@ -398,8 +397,7 @@ public final class ScenarioReportRecorder {
                         0, 0, 0, 0, 0, 0,
                         0, Map.of(), 0, Map.of(),
                         0, 0, 0, 0L, 0L, 0L, 0L, Map.of(),
-                        "Scenario did not run in this execution."
-                ));
+                        "Scenario did not run in this execution."));
             }
         }
         return full;
@@ -411,11 +409,14 @@ public final class ScenarioReportRecorder {
 
         md.append("# Ticketing Platform — Cross-Service End-to-End Verification Report\n\n");
         md.append("- **Generated At (UTC)**: `").append(timestamp).append("`\n");
-        md.append("- **Total Suite Duration**: `").append(String.format("%.2f s", totalDurationMs / 1000.0)).append("`\n");
-        md.append("- **Target Stack**: Real 10-container Docker Compose topology (`gateway-service`, `inventory-service`, `order-service`, `payment-service`, `notification-service`, `kafka`, `redis`, `postgres-inventory`, `postgres-order`, `postgres-payment`)\n\n");
+        md.append("- **Total Suite Duration**: `").append(String.format("%.2f s", totalDurationMs / 1000.0))
+                .append("`\n");
+        md.append(
+                "- **Target Stack**: Real 10-container Docker Compose topology (`gateway-service`, `inventory-service`, `order-service`, `payment-service`, `notification-service`, `kafka`, `redis`, `postgres-inventory`, `postgres-order`, `postgres-payment`)\n\n");
 
         md.append("## 1. Per-Scenario Execution Matrix\n\n");
-        md.append("| ID | Scenario | Tag | Status | Duration | Users | HTTP Holds (`Att / 201 / 409 / 429 / Err`) | DB Reservations (`Committed`) | DB Orders (`Created`) | Payments (`Succ / Fail / Ref`) | Notifications (`confirmed / cancelled`) | DLT (`Actual / Exp`) | Invariants (`I1–I8`) |\n");
+        md.append(
+                "| ID | Scenario | Tag | Status | Duration | Users | HTTP Holds (`Att / 201 / 409 / 429 / Err`) | DB Reservations (`Committed`) | DB Orders (`Created`) | Payments (`Succ / Fail / Ref`) | Notifications (`confirmed / cancelled`) | DLT (`Actual / Exp`) | Invariants (`I1–I8`) |\n");
         md.append("|---|---|---|---|---:|---:|---|---|---|---|---:|---:|---|\n");
 
         int totalUsers = 0;
@@ -448,7 +449,8 @@ public final class ScenarioReportRecorder {
                 default -> notRunCount++;
             }
 
-            // Sum workload scenarios S1-S12 (S13 is the global database/topic audit across all rows)
+            // Sum workload scenarios S1-S12 (S13 is the global database/topic audit across
+            // all rows)
             if (!"S13".equals(r.id())) {
                 totalUsers += r.users();
                 totalHoldsAttempted += r.holdsAttempted();
@@ -513,7 +515,8 @@ public final class ScenarioReportRecorder {
                 int crashCommittedDelta = r.reservationsCommitted() - r.holdsAccepted();
                 md.append("- **Crash HTTP-Response Reconciliation Note**: ").append(crashCommittedDelta)
                         .append(" hold request(s) committed in `inventory_db` before container crash/SIGKILL whose HTTP `201` response was lost in transit (`holdsAccepted=")
-                        .append(r.holdsAccepted()).append("` vs `reservationsCommitted=").append(r.reservationsCommitted()).append("`).\n");
+                        .append(r.holdsAccepted()).append("` vs `reservationsCommitted=")
+                        .append(r.reservationsCommitted()).append("`).\n");
             }
             md.append("- **Orders Created in `order_db`**: ").append(r.ordersSummary()).append("\n");
             md.append("- **Payments in `payment_db`**: succeeded=").append(r.paymentsSucceeded())
@@ -532,8 +535,9 @@ public final class ScenarioReportRecorder {
 
         int crashLostHttpCount = totalReservationsCommitted - totalHoldsAccepted;
         String reservationReconciliationNote = crashLostHttpCount != 0
-                ? String.format(" (reconciled: %d HTTP `201`s received + %d committed in DB whose HTTP response was lost to crash = %d DB reservations)",
-                totalHoldsAccepted, crashLostHttpCount, totalReservationsCommitted)
+                ? String.format(
+                        " (reconciled: %d HTTP `201`s received + %d committed in DB whose HTTP response was lost to crash = %d DB reservations)",
+                        totalHoldsAccepted, crashLostHttpCount, totalReservationsCommitted)
                 : " (matches HTTP `201` holds accepted)";
         long unexpectedDlt = totalDlt - totalExpectedDlt;
 
@@ -566,7 +570,8 @@ public final class ScenarioReportRecorder {
                 .append(totalHoldsRateLimited).append(" / ")
                 .append(totalHoldsFailedOrLost).append(" |\n");
         md.append("| Database Reservations Committed (`inventory_db`) | ")
-                .append(totalReservationsCommitted).append(" (").append(formatMap(totalReservationsByStatus)).append(")")
+                .append(totalReservationsCommitted).append(" (").append(formatMap(totalReservationsByStatus))
+                .append(")")
                 .append(reservationReconciliationNote).append(" |\n");
         md.append("| Database Orders Created (`order_db`) | ")
                 .append(totalOrdersCreated).append(" (").append(formatMap(totalOrdersByStatus)).append(") |\n");
@@ -616,8 +621,10 @@ public final class ScenarioReportRecorder {
      * Computes guarantee row status strictly from recorded scenario results:
      * - FAIL: if any scenario found a violation of this invariant
      * - NOT RUN: if no scenario checking this invariant ran
-     * - VERIFIED: ONLY if every scenario in the catalog ran and passed with 0 violations
-     * - PARTIAL: if some scenarios did not run (or a scenario failed an HTTP check without an invariant violation)
+     * - VERIFIED: ONLY if every scenario in the catalog ran and passed with 0
+     * violations
+     * - PARTIAL: if some scenarios did not run (or a scenario failed an HTTP check
+     * without an invariant violation)
      */
     private static String computeGuaranteeStatus(String invariantCode, List<ScenarioRecord> fullRows) {
         int totalScenarios = fullRows.size();
@@ -651,17 +658,21 @@ public final class ScenarioReportRecorder {
             return "**NOT RUN** (0/" + totalScenarios + " scenarios ran)";
         }
         if (passedScenarioAndInvariant == totalScenarios && failedScenarios == 0 && notRunOrDisabled == 0) {
-            return "**VERIFIED** (" + passedScenarioAndInvariant + "/" + totalScenarios + " scenarios passed, 0 violations)";
+            return "**VERIFIED** (" + passedScenarioAndInvariant + "/" + totalScenarios
+                    + " scenarios passed, 0 violations)";
         }
-        return String.format("**PARTIAL** (%d/%d scenarios passed, %d failed, %d not run/disabled, 0 invariant violations)",
+        return String.format(
+                "**PARTIAL** (%d/%d scenarios passed, %d failed, %d not run/disabled, 0 invariant violations)",
                 passedScenarioAndInvariant, totalScenarios, failedScenarios, notRunOrDisabled);
     }
 
     private static String formatMap(Map<String, Integer> map) {
-        if (map == null || map.isEmpty()) return "0";
+        if (map == null || map.isEmpty())
+            return "0";
         List<String> parts = new ArrayList<>();
         map.forEach((k, v) -> {
-            if (v != null && v > 0) parts.add(k + "=" + v);
+            if (v != null && v > 0)
+                parts.add(k + "=" + v);
         });
         return parts.isEmpty() ? "0" : String.join(", ", parts);
     }
