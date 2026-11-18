@@ -15,6 +15,10 @@
   - `auto.offset.reset=earliest`
   - `max.poll.records=100`
   - `max.poll.interval.ms=300000`
+  - `session.timeout.ms=15000` (15s default; overridable via `ticketing.consumer.session-timeout-ms` in Java and `KAFKA_SESSION_TIMEOUT_MS` in Go; validated between 6,000 and 60,000 ms)
+  - `heartbeat.interval.ms=3000` (3s default; overridable via `ticketing.consumer.heartbeat-interval-ms` in Java and `KAFKA_HEARTBEAT_INTERVAL_MS` in Go; validated positive and at most 1/3 of session timeout)
+  - **Crash-Recovery Failover Trade-off**: Lowering `session.timeout.ms` from Kafka's default 45 s to 15 s ensures rapid failure detection when a consumer process terminates abruptly (`kill -9`, OOM, host crash), enabling surviving or restarted workers to resume partition consumption in ~16–18 s instead of ~45–48 s. The operational trade-off is increased susceptibility to spurious rebalances during protracted JVM stop-the-world garbage collection pauses or thread stalls exceeding 15 s.
+  - **Worst-Case Failover Time**: Session timeout plus rebalance time (`session.timeout.ms` + rebalance protocol duration, typically ~16–18 s total), bounded by the E2E failover budget `FAILOVER_BUDGET = 60 s` (15 s timeout + 45 s margin).
 
 ---
 

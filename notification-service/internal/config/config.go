@@ -28,6 +28,8 @@ type Config struct {
 	SenderMaxBackoff      time.Duration
 	SenderTimeout         time.Duration
 	RedisMaxPollInterval  time.Duration
+	KafkaSessionTimeout   time.Duration
+	KafkaHeartbeatInterval time.Duration
 }
 
 func (c *Config) ServerAddr() string {
@@ -139,6 +141,18 @@ func LoadConfig() (*Config, error) {
 		return nil, fmt.Errorf("invalid REDIS_MAX_POLL_INTERVAL_MS %q: must be positive integer", maxPollIntervalMsStr)
 	}
 
+	sessionTimeoutMsStr := getEnv("KAFKA_SESSION_TIMEOUT_MS", "15000")
+	sessionTimeoutMs, err := strconv.Atoi(sessionTimeoutMsStr)
+	if err != nil || sessionTimeoutMs < 6000 || sessionTimeoutMs > 60000 {
+		return nil, fmt.Errorf("invalid KAFKA_SESSION_TIMEOUT_MS %q: must be integer between 6000 and 60000", sessionTimeoutMsStr)
+	}
+
+	heartbeatIntervalMsStr := getEnv("KAFKA_HEARTBEAT_INTERVAL_MS", "3000")
+	heartbeatIntervalMs, err := strconv.Atoi(heartbeatIntervalMsStr)
+	if err != nil || heartbeatIntervalMs <= 0 || heartbeatIntervalMs > sessionTimeoutMs/3 {
+		return nil, fmt.Errorf("invalid KAFKA_HEARTBEAT_INTERVAL_MS %q: must be positive integer and at most one third of session timeout (%d ms)", heartbeatIntervalMsStr, sessionTimeoutMs/3)
+	}
+
 	// Validate that claim TTL exceeds worst-case send time (attempts * timeout + backoff sum)
 	var backoffSum time.Duration
 	curBackoff := time.Duration(initialBackoffMs) * time.Millisecond
@@ -173,6 +187,8 @@ func LoadConfig() (*Config, error) {
 		SenderMaxBackoff:      time.Duration(maxBackoffMs) * time.Millisecond,
 		SenderTimeout:         time.Duration(senderTimeoutMs) * time.Millisecond,
 		RedisMaxPollInterval:  time.Duration(maxPollIntervalMs) * time.Millisecond,
+		KafkaSessionTimeout:   time.Duration(sessionTimeoutMs) * time.Millisecond,
+		KafkaHeartbeatInterval: time.Duration(heartbeatIntervalMs) * time.Millisecond,
 	}, nil
 }
 

@@ -170,6 +170,20 @@ All custom metrics use the `ticketing_` prefix, lowercase `snake_case`, and base
 | `REDIS_PASSWORD` | `notification-service` | *(empty)* | Optional Redis password for authenticated instances. Never logged. |
 | `REDIS_DB` | `notification-service` | `0` | Redis logical database index (integer >= 0). |
 | `REDIS_TLS_ENABLED` | `notification-service` | `false` | Boolean switch to enable TLS encryption on Redis connections. |
+| `KAFKA_SESSION_TIMEOUT_MS` / `ticketing.consumer.session-timeout-ms` | All Kafka consumers (`inventory-service`, `order-service`, `payment-service`, `notification-service`) | `15000` | Kafka consumer session timeout in milliseconds. Validated between `6000` and `60000`. |
+| `KAFKA_HEARTBEAT_INTERVAL_MS` / `ticketing.consumer.heartbeat-interval-ms` | All Kafka consumers (`inventory-service`, `order-service`, `payment-service`, `notification-service`) | `3000` | Kafka consumer heartbeat interval in milliseconds. Validated positive and `<= session_timeout_ms / 3`. |
+
+#### Kafka Consumer Timing & Crash-Recovery Failover Convention
+
+All Kafka consumer services across Java (`ticketing-consumer`) and Go (`notification-service`) adhere to unified heartbeat and session timeout configurations:
+- `session.timeout.ms = 15000` (15 s)
+- `heartbeat.interval.ms = 3000` (3 s)
+
+**Failover Trade-off**:
+Lowering `session.timeout.ms` from the Kafka default of 45 s to 15 s enables rapid crash recovery. When a consuming service abruptly terminates (`kill -9`, container crash, OOM), the Kafka coordinator detects member death within 15 seconds, rebalances the consumer group, and allows surviving or restarted replicas to resume partition processing in ~16–18 s instead of ~45–48 s. The operational trade-off is reduced tolerance to long stop-the-world JVM GC pauses or thread scheduling stalls exceeding 15 s, which would trigger unneeded consumer group rebalances.
+
+**Worst-Case Failover Time**:
+Worst-case partition failover duration equals the session timeout plus the consumer group rebalance protocol execution time (`session.timeout.ms` + rebalance duration, typically ~16–18 s in local/container networks). In end-to-end chaos tests, this failover window is bounded by `FAILOVER_BUDGET = 60 s` (15 s session timeout + 45 s margin for process startup and group stabilization).
 
 #### Mock Payment Provider Configuration & Magic Tokens
 

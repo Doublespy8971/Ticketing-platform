@@ -85,8 +85,41 @@ public final class ScenarioReportRecorder {
             long deadLetters,
             long expectedDeadLetters,
             Map<String, Boolean> invariants,
-            String notes
+            String notes,
+            Double recoverySeconds
     ) {
+        public ScenarioRecord(
+                String id,
+                String name,
+                String tag,
+                String status,
+                long durationMs,
+                int users,
+                int holdsAttempted,
+                int holdsAccepted,
+                int holdsRejected,
+                int holdsRateLimited,
+                int holdsFailedOrLost,
+                int reservationsCommitted,
+                Map<String, Integer> reservationsByStatus,
+                int ordersCreated,
+                Map<String, Integer> ordersByStatus,
+                int paymentsSucceeded,
+                int paymentsFailed,
+                int refunds,
+                long notificationsConfirmed,
+                long notificationsCancelled,
+                long deadLetters,
+                long expectedDeadLetters,
+                Map<String, Boolean> invariants,
+                String notes
+        ) {
+            this(id, name, tag, status, durationMs, users, holdsAttempted, holdsAccepted,
+                    holdsRejected, holdsRateLimited, holdsFailedOrLost, reservationsCommitted,
+                    reservationsByStatus, ordersCreated, ordersByStatus, paymentsSucceeded,
+                    paymentsFailed, refunds, notificationsConfirmed, notificationsCancelled,
+                    deadLetters, expectedDeadLetters, invariants, notes, null);
+        }
         public String reservationsSummary() {
             if (reservationsCommitted == 0 && (reservationsByStatus == null || reservationsByStatus.isEmpty())) {
                 return "0";
@@ -154,6 +187,33 @@ public final class ScenarioReportRecorder {
             long expectedDeadLetters,
             InvariantAuditor.AuditResult auditResult,
             String notes) {
+        return fromEventsAudit(
+                id, name, tag, status, durationMs, users,
+                holdsAttempted, holdsAccepted, holdsRejected, holdsRateLimited, holdsFailedOrLost,
+                eventIds, db, notifDiff, deadLettersDelta, expectedDeadLetters, auditResult, notes, null
+        );
+    }
+
+    public static ScenarioRecord fromEventsAudit(
+            String id,
+            String name,
+            String tag,
+            String status,
+            long durationMs,
+            int users,
+            int holdsAttempted,
+            int holdsAccepted,
+            int holdsRejected,
+            int holdsRateLimited,
+            int holdsFailedOrLost,
+            Collection<UUID> eventIds,
+            Db db,
+            Notifications.NotificationSnapshot notifDiff,
+            long deadLettersDelta,
+            long expectedDeadLetters,
+            InvariantAuditor.AuditResult auditResult,
+            String notes,
+            Double recoverySeconds) {
 
         Map<String, Integer> reservationsByStatus = new LinkedHashMap<>();
         int reservationsCommitted = 0;
@@ -243,7 +303,8 @@ public final class ScenarioReportRecorder {
                 deadLettersDelta,
                 expectedDeadLetters,
                 invMap,
-                notes
+                notes,
+                recoverySeconds
         );
     }
 
@@ -266,11 +327,39 @@ public final class ScenarioReportRecorder {
             long expectedDeadLetters,
             InvariantAuditor.AuditResult auditResult,
             String notes) {
+        return fromEventAudit(
+                id, name, tag, status, durationMs, users,
+                holdsAttempted, holdsAccepted, holdsRejected, holdsRateLimited, holdsFailedOrLost,
+                eventId, db, notifDiff, deadLettersDelta, expectedDeadLetters, auditResult, notes, null
+        );
+    }
+
+    public static ScenarioRecord fromEventAudit(
+            String id,
+            String name,
+            String tag,
+            String status,
+            long durationMs,
+            int users,
+            int holdsAttempted,
+            int holdsAccepted,
+            int holdsRejected,
+            int holdsRateLimited,
+            int holdsFailedOrLost,
+            UUID eventId,
+            Db db,
+            Notifications.NotificationSnapshot notifDiff,
+            long deadLettersDelta,
+            long expectedDeadLetters,
+            InvariantAuditor.AuditResult auditResult,
+            String notes,
+            Double recoverySeconds) {
         return fromEventsAudit(
                 id, name, tag, status, durationMs, users,
                 holdsAttempted, holdsAccepted, holdsRejected, holdsRateLimited, holdsFailedOrLost,
                 eventId != null ? List.of(eventId) : null,
-                db, notifDiff, deadLettersDelta, expectedDeadLetters, auditResult, notes
+                db, notifDiff, deadLettersDelta, expectedDeadLetters, auditResult, notes,
+                recoverySeconds
         );
     }
 
@@ -410,6 +499,9 @@ public final class ScenarioReportRecorder {
             md.append("### ").append(r.id()).append(" — ").append(r.name()).append("\n");
             md.append("- **Status**: `").append(r.status()).append("` (`").append(r.tag()).append("`, ")
                     .append(String.format("%.2f s", r.durationMs() / 1000.0)).append(")\n");
+            if (r.recoverySeconds() != null && r.recoverySeconds() > 0) {
+                md.append("- **Recovery time**: ").append(String.format("%.2f s", r.recoverySeconds())).append("\n");
+            }
             md.append("- **Users**: ").append(r.users())
                     .append(" | **HTTP Holds**: attempted=").append(r.holdsAttempted())
                     .append(", accepted(201)=").append(r.holdsAccepted())
@@ -445,6 +537,15 @@ public final class ScenarioReportRecorder {
                 : " (matches HTTP `201` holds accepted)";
         long unexpectedDlt = totalDlt - totalExpectedDlt;
 
+        Double maxRecovery = null;
+        for (ScenarioRecord r : fullRows) {
+            if (r.recoverySeconds() != null && r.recoverySeconds() > 0) {
+                if (maxRecovery == null || r.recoverySeconds() > maxRecovery) {
+                    maxRecovery = r.recoverySeconds();
+                }
+            }
+        }
+
         md.append("## 3. Summary of Totals & Global Guarantees\n\n");
         md.append("| Metric | Value |\n");
         md.append("|---|---|\n");
@@ -454,6 +555,9 @@ public final class ScenarioReportRecorder {
                 .append(", Disabled: ").append(disabledCount)
                 .append(", Not Run: ").append(notRunCount).append(") |\n");
         md.append("| Total Suite Runtime | ").append(String.format("%.2f s", totalDurationMs / 1000.0)).append(" |\n");
+        if (maxRecovery != null) {
+            md.append("| Maximum Recovery Time | ").append(String.format("%.2f s", maxRecovery)).append(" |\n");
+        }
         md.append("| Distinct Simulated Users (S1–S12) | ").append(totalUsers).append(" |\n");
         md.append("| HTTP Seat Holds (`Attempted / Accepted 201 / Conflict 409 / Rate-Limited 429 / Error or Lost`) | ")
                 .append(totalHoldsAttempted).append(" / ")
@@ -477,6 +581,21 @@ public final class ScenarioReportRecorder {
                 .append(totalDlt).append(" / ")
                 .append(totalExpectedDlt).append(" / ")
                 .append(unexpectedDlt).append(" |\n\n");
+
+        List<ScenarioRecord> chaosWithRecovery = fullRows.stream()
+                .filter(r -> r.recoverySeconds() != null && r.recoverySeconds() > 0)
+                .toList();
+        if (!chaosWithRecovery.isEmpty()) {
+            md.append("### Chaos Recovery Times\n\n");
+            md.append("| Scenario | Chaos Type | Measured Recovery Time | Failover Budget |\n");
+            md.append("|---|---|---:|---:|\n");
+            for (ScenarioRecord cr : chaosWithRecovery) {
+                md.append("| **").append(cr.id()).append("** (").append(cr.name()).append(") | `")
+                        .append(cr.tag()).append("` | ")
+                        .append(String.format("%.2f s", cr.recoverySeconds())).append(" | 60.00 s |\n");
+            }
+            md.append("\n");
+        }
 
         md.append("### Global Distributed System Guarantees (`I1`–`I8`)\n\n");
         md.append("| Code | Global Guarantee | Verification Mechanism | Status |\n");

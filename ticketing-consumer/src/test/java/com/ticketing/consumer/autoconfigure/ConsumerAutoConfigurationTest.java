@@ -94,7 +94,9 @@ class ConsumerAutoConfigurationTest {
                             .containsEntry(ConsumerConfig.ISOLATION_LEVEL_CONFIG, "read_committed")
                             .containsEntry(ConsumerConfig.AUTO_OFFSET_RESET_CONFIG, "earliest")
                             .containsEntry(ConsumerConfig.MAX_POLL_RECORDS_CONFIG, 100)
-                            .containsEntry(ConsumerConfig.MAX_POLL_INTERVAL_MS_CONFIG, 300_000);
+                            .containsEntry(ConsumerConfig.MAX_POLL_INTERVAL_MS_CONFIG, 300_000)
+                            .containsEntry(ConsumerConfig.SESSION_TIMEOUT_MS_CONFIG, 15_000)
+                            .containsEntry(ConsumerConfig.HEARTBEAT_INTERVAL_MS_CONFIG, 3_000);
 
                     @SuppressWarnings("unchecked")
                     ConcurrentKafkaListenerContainerFactory<String, String> containerFactory =
@@ -223,6 +225,53 @@ class ConsumerAutoConfigurationTest {
 
         contextRunner
                 .withPropertyValues("ticketing.consumer.cleanup.retention-hours=191")
+                .run(context -> assertThat(context).hasFailed());
+    }
+
+    @Test
+    void consumerSessionTimeoutAndHeartbeatCanBeOverriddenThroughProperties() {
+        contextRunner
+                .withPropertyValues(
+                        "ticketing.consumer.session-timeout-ms=24000",
+                        "ticketing.consumer.heartbeat-interval-ms=6000"
+                )
+                .run(context -> {
+                    assertThat(context).hasNotFailed();
+                    @SuppressWarnings("unchecked")
+                    ConsumerFactory<String, String> consumerFactory = context.getBean(ConsumerFactory.class);
+                    Map<String, Object> props = consumerFactory.getConfigurationProperties();
+                    assertThat(props)
+                            .containsEntry(ConsumerConfig.SESSION_TIMEOUT_MS_CONFIG, 24_000)
+                            .containsEntry(ConsumerConfig.HEARTBEAT_INTERVAL_MS_CONFIG, 6_000);
+                });
+    }
+
+    @Test
+    void failsStartupWhenSessionTimeoutOrHeartbeatAreInvalid() {
+        // session timeout below minimum (6000ms)
+        contextRunner
+                .withPropertyValues("ticketing.consumer.session-timeout-ms=5000")
+                .run(context -> assertThat(context).hasFailed());
+
+        // session timeout above maximum (60000ms)
+        contextRunner
+                .withPropertyValues("ticketing.consumer.session-timeout-ms=65000")
+                .run(context -> assertThat(context).hasFailed());
+
+        // heartbeat greater than one third of session timeout
+        contextRunner
+                .withPropertyValues(
+                        "ticketing.consumer.session-timeout-ms=15000",
+                        "ticketing.consumer.heartbeat-interval-ms=6000"
+                )
+                .run(context -> assertThat(context).hasFailed());
+
+        // heartbeat non-positive
+        contextRunner
+                .withPropertyValues(
+                        "ticketing.consumer.session-timeout-ms=15000",
+                        "ticketing.consumer.heartbeat-interval-ms=0"
+                )
                 .run(context -> assertThat(context).hasFailed());
     }
 

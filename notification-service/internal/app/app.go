@@ -200,14 +200,16 @@ func RunWithOptions(args []string, stdout, stderr io.Writer, opts Options) int {
 	reader := opts.Reader
 	if reader == nil {
 		reader = kafka.NewReader(kafka.ReaderConfig{
-			Brokers:        cfg.KafkaBootstrapServers,
-			GroupID:        cfg.KafkaGroupID,
-			Topic:          cfg.KafkaTopic,
-			MinBytes:       10e3,
-			MaxBytes:       10e6,
-			MaxWait:        500 * time.Millisecond,
-			StartOffset:    kafka.FirstOffset,
-			IsolationLevel: kafka.ReadCommitted,
+			Brokers:           cfg.KafkaBootstrapServers,
+			GroupID:           cfg.KafkaGroupID,
+			Topic:             cfg.KafkaTopic,
+			MinBytes:          10e3,
+			MaxBytes:          10e6,
+			MaxWait:           500 * time.Millisecond,
+			StartOffset:       kafka.FirstOffset,
+			IsolationLevel:    kafka.ReadCommitted,
+			SessionTimeout:    cfg.KafkaSessionTimeout,
+			HeartbeatInterval: cfg.KafkaHeartbeatInterval,
 		})
 	}
 

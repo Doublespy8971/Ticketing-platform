@@ -172,6 +172,8 @@ All configuration is provided via environment variables with defaults for local 
 | `NOTIFICATION_SENDER_MAX_BACKOFF_MS` | `800` | Maximum backoff delay between dispatch attempts in ms. |
 | `NOTIFICATION_SENDER_TIMEOUT_MS` | `5000` | Timeout per send attempt in ms. |
 | `REDIS_MAX_POLL_INTERVAL_MS` | `300000` | Maximum polling duration when Redis is unavailable (5 minutes). |
+| `KAFKA_SESSION_TIMEOUT_MS` | `15000` | Kafka consumer session timeout in ms (between 6,000 and 60,000 ms, default 15s). |
+| `KAFKA_HEARTBEAT_INTERVAL_MS` | `3000` | Kafka consumer heartbeat interval in ms (positive, at most 1/3 of session timeout, default 3s). |
 
 ---
 

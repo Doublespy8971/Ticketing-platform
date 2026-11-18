@@ -115,6 +115,8 @@ services:
       KAFKA_BOOTSTRAP_SERVERS: kafka:9092
       KAFKA_TOPIC: order.events
       KAFKA_GROUP_ID: notification-service-order-cg
+      KAFKA_SESSION_TIMEOUT_MS: "15000"
+      KAFKA_HEARTBEAT_INTERVAL_MS: "3000"
     depends_on:
       redis:
         condition: service_healthy

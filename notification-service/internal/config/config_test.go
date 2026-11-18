@@ -64,6 +64,12 @@ func TestLoadConfigDefaults(t *testing.T) {
 	if cfg.SenderTimeout != 5*time.Second {
 		t.Errorf("expected default SenderTimeout 5s, got %v", cfg.SenderTimeout)
 	}
+	if cfg.KafkaSessionTimeout != 15*time.Second {
+		t.Errorf("expected default KafkaSessionTimeout 15s, got %v", cfg.KafkaSessionTimeout)
+	}
+	if cfg.KafkaHeartbeatInterval != 3*time.Second {
+		t.Errorf("expected default KafkaHeartbeatInterval 3s, got %v", cfg.KafkaHeartbeatInterval)
+	}
 }
 
 func TestLoadConfigInvalidEnv(t *testing.T) {
@@ -96,6 +102,13 @@ func TestLoadConfigInvalidEnv(t *testing.T) {
 			"NOTIFICATION_SENDER_MAX_BACKOFF_MS":     "200",
 		}},
 		{"invalid redis max poll", map[string]string{"REDIS_MAX_POLL_INTERVAL_MS": "0"}},
+		{"kafka session timeout too low", map[string]string{"KAFKA_SESSION_TIMEOUT_MS": "5000"}},
+		{"kafka session timeout too high", map[string]string{"KAFKA_SESSION_TIMEOUT_MS": "65000"}},
+		{"kafka heartbeat greater than one third session timeout", map[string]string{
+			"KAFKA_SESSION_TIMEOUT_MS":   "15000",
+			"KAFKA_HEARTBEAT_INTERVAL_MS": "6000",
+		}},
+		{"kafka heartbeat non-positive", map[string]string{"KAFKA_HEARTBEAT_INTERVAL_MS": "0"}},
 	}
 
 	for _, tc := range testCases {
@@ -139,5 +152,23 @@ func TestLoadConfigRedisAndClaimSettings(t *testing.T) {
 	}
 	if cfg.SenderTimeout != 3*time.Second {
 		t.Errorf("expected SenderTimeout 3s, got %v", cfg.SenderTimeout)
+	}
+}
+
+func TestLoadConfigKafkaTimeoutOverrides(t *testing.T) {
+	os.Clearenv()
+	_ = os.Setenv("KAFKA_SESSION_TIMEOUT_MS", "24000")
+	_ = os.Setenv("KAFKA_HEARTBEAT_INTERVAL_MS", "6000")
+
+	cfg, err := LoadConfig()
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	if cfg.KafkaSessionTimeout != 24*time.Second {
+		t.Errorf("expected KafkaSessionTimeout 24s, got %v", cfg.KafkaSessionTimeout)
+	}
+	if cfg.KafkaHeartbeatInterval != 6*time.Second {
+		t.Errorf("expected KafkaHeartbeatInterval 6s, got %v", cfg.KafkaHeartbeatInterval)
 	}
 }
