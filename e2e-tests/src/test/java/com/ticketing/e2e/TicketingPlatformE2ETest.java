@@ -58,8 +58,7 @@ import static org.assertj.core.api.Assertions.assertThat;
 
 /**
  * Cross-service end-to-end verification suite exercising the real containerized
- * Ticketing Platform through {@code gateway-service}
- * ({@code http://localhost:8080})
+ * Ticketing Platform through {@code gateway-service} ({@code http://localhost:8080})
  * and proving the global distributed invariants I1–I8.
  */
 @ExtendWith(PreflightExtension.class)
@@ -70,7 +69,8 @@ class TicketingPlatformE2ETest {
             "CONFIRMED",
             "CANCELLED_EXPIRED",
             "CANCELLED_PAYMENT_FAILED",
-            "CANCELLED_REFUNDED");
+            "CANCELLED_REFUNDED"
+    );
 
     public static final Duration FAILOVER_BUDGET = Duration.ofSeconds(60);
 
@@ -116,16 +116,13 @@ class TicketingPlatformE2ETest {
         }, "e2e-stack-restore-shutdown-hook");
         Runtime.getRuntime().addShutdownHook(shutdownHook);
 
-        // Load any previously registered S11 REFUND_PENDING orders that still exist in
-        // order_db
+        // Load any previously registered S11 REFUND_PENDING orders that still exist in order_db
         loadPersistedRefundPendingRegistry();
 
-        // Fail fast if the stack contains active HELD reservations or non-terminal
-        // orders from earlier runs
+        // Fail fast if the stack contains active HELD reservations or non-terminal orders from earlier runs
         verifyCleanStackBeforeSuite();
 
-        // Ensure complete quiescence before capturing suite baselines using database
-        // clock
+        // Ensure complete quiescence before capturing suite baselines using database clock
         Instant dbNow = db.currentTimestampInInventoryDb();
         quiescence.markScenarioStart(dbNow);
         quiescence.awaitForEvents(List.of(), Duration.ofSeconds(60), true);
@@ -195,8 +192,7 @@ class TicketingPlatformE2ETest {
 
         List<Db.OrderRow> nonTerminalOrders = db.findOrders(null).stream()
                 .filter(o -> !TERMINAL_ORDER_STATUSES.contains(o.status()))
-                .filter(o -> !("REFUND_PENDING".equals(o.status())
-                        && declaredRefundPendingOrders.containsKey(o.orderId())))
+                .filter(o -> !("REFUND_PENDING".equals(o.status()) && declaredRefundPendingOrders.containsKey(o.orderId())))
                 .toList();
 
         if (!activeHeldReservations.isEmpty() || !nonTerminalOrders.isEmpty()) {
@@ -208,7 +204,8 @@ class TicketingPlatformE2ETest {
                     activeHeldReservations.size(),
                     nonTerminalOrders.size(),
                     activeHeldReservations,
-                    nonTerminalOrders));
+                    nonTerminalOrders
+            ));
         }
     }
 
@@ -227,8 +224,7 @@ class TicketingPlatformE2ETest {
                     .collect(Collectors.toMap(Db.OrderRow::orderId, o -> o, (a, b) -> a));
             for (String line : Files.readAllLines(file, StandardCharsets.UTF_8)) {
                 String trimmed = line.trim();
-                if (trimmed.isEmpty())
-                    continue;
+                if (trimmed.isEmpty()) continue;
                 String[] parts = trimmed.split(":");
                 UUID orderId = UUID.fromString(parts[0]);
                 long dltCount = parts.length > 1 ? Long.parseLong(parts[1]) : 1L;
@@ -261,12 +257,10 @@ class TicketingPlatformE2ETest {
         List<String> names = Arrays.stream(TicketingPlatformE2ETest.class.getDeclaredMethods())
                 .filter(m -> m.isAnnotationPresent(Test.class))
                 .sorted(Comparator.comparingInt(m -> m.isAnnotationPresent(Order.class)
-                        ? m.getAnnotation(Order.class).value()
-                        : Integer.MAX_VALUE))
+                        ? m.getAnnotation(Order.class).value() : Integer.MAX_VALUE))
                 .map(Method::getName)
                 .toList();
-        System.out.println(
-                "=== [TicketingPlatformE2ETest " + phase + "] Test methods (" + names.size() + "): " + names + " ===");
+        System.out.println("=== [TicketingPlatformE2ETest " + phase + "] Test methods (" + names.size() + "): " + names + " ===");
     }
 
     private static void recordDisabledScenariosIfAny() {
@@ -286,7 +280,8 @@ class TicketingPlatformE2ETest {
                             0, 0, 0, 0, 0, 0,
                             0, Map.of(), 0, Map.of(),
                             0, 0, 0, 0L, 0L, 0L, 0L, Map.of(),
-                            "Disabled due to genuine product bug: " + reason));
+                            "Disabled due to genuine product bug: " + reason
+                    ));
                 }
             }
         }
@@ -307,13 +302,12 @@ class TicketingPlatformE2ETest {
                     return resp.status() == 200
                             && resp.json() != null
                             && ("AWAITING_PAYMENT".equals(resp.json().path("status").asText())
-                                    || "RESERVED".equals(resp.json().path("status").asText()));
+                                || "RESERVED".equals(resp.json().path("status").asText()));
                 });
         return reservationId;
     }
 
-    private void awaitOrderStatusViaGateway(Fixtures.UserFixture user, UUID orderId, String expectedStatus,
-            Duration timeout) {
+    private void awaitOrderStatusViaGateway(Fixtures.UserFixture user, UUID orderId, String expectedStatus, Duration timeout) {
         Awaitility.await("Order " + orderId + " reaches status " + expectedStatus + " via gateway")
                 .atMost(timeout)
                 .pollInterval(Duration.ofMillis(200))
@@ -345,7 +339,8 @@ class TicketingPlatformE2ETest {
                 scenarioId, scenarioName, tag, scenarioStart, eventId,
                 usersCount, holdsAttempted, holdsAccepted, holdsRejected, holdsRateLimited, 0,
                 orderEventsStartOffsets, dltBefore, expectedDeadLetters, notifBefore,
-                0L, false, notes, null);
+                0L, false, notes, null
+        );
     }
 
     private InvariantAuditor.AuditResult finishAndAuditScenario(
@@ -369,7 +364,8 @@ class TicketingPlatformE2ETest {
                 scenarioId, scenarioName, tag, scenarioStart, eventId,
                 usersCount, holdsAttempted, holdsAccepted, holdsRejected, holdsRateLimited, 0,
                 orderEventsStartOffsets, dltBefore, expectedDeadLetters, notifBefore,
-                0L, false, notes, recoverySeconds);
+                0L, false, notes, recoverySeconds
+        );
     }
 
     private InvariantAuditor.AuditResult finishAndAuditScenario(
@@ -395,7 +391,8 @@ class TicketingPlatformE2ETest {
                 scenarioId, scenarioName, tag, scenarioStart, eventId,
                 usersCount, holdsAttempted, holdsAccepted, holdsRejected, holdsRateLimited,
                 holdsFailedOrLost, orderEventsStartOffsets, dltBefore, expectedDeadLetters,
-                notifBefore, expectedDuplicateNotifications, allowRefundPendingResting, notes, null);
+                notifBefore, expectedDuplicateNotifications, allowRefundPendingResting, notes, null
+        );
     }
 
     private InvariantAuditor.AuditResult finishAndAuditScenario(
@@ -435,7 +432,8 @@ class TicketingPlatformE2ETest {
                 notifBefore,
                 notifAfter,
                 expectedDuplicateNotifications,
-                declaredRefundPendingOrders.keySet());
+                declaredRefundPendingOrders.keySet()
+        );
         InvariantAuditor.AuditResult auditResult = auditor.auditScenario(ctx);
         long durationMs = Duration.between(scenarioStart, db.currentTimestampInInventoryDb()).toMillis();
 
@@ -458,7 +456,8 @@ class TicketingPlatformE2ETest {
                 expectedDeadLetters,
                 auditResult,
                 notes,
-                recoverySeconds));
+                recoverySeconds
+        ));
 
         auditResult.assertAllPassed();
         totalExpectedDeadLettersAcrossSuite += expectedDeadLetters;
@@ -492,14 +491,12 @@ class TicketingPlatformE2ETest {
 
         UUID orderId = awaitOrderMaterialized(buyer, reservationId, Duration.ofSeconds(15));
 
-        Api.ApiResponse checkoutResp = api.checkout(buyer.bearerToken(), orderId, UUID.randomUUID(),
-                Fixtures.TOK_SUCCESS);
+        Api.ApiResponse checkoutResp = api.checkout(buyer.bearerToken(), orderId, UUID.randomUUID(), Fixtures.TOK_SUCCESS);
         assertThat(checkoutResp.status()).isEqualTo(202);
 
         awaitOrderStatusViaGateway(buyer, orderId, "CONFIRMED", Duration.ofSeconds(20));
 
-        // Verify GET /api/v1/events/{eventId}/seats (unfiltered + filtered by SOLD and
-        // AVAILABLE)
+        // Verify GET /api/v1/events/{eventId}/seats (unfiltered + filtered by SOLD and AVAILABLE)
         Api.ApiResponse allSeatsResp = api.getSeats(event.eventId(), null, null, 200, null);
         assertThat(allSeatsResp.status()).isEqualTo(200);
         assertThat(allSeatsResp.headerValue("Cache-Control")).contains("max-age=1");
@@ -543,7 +540,8 @@ class TicketingPlatformE2ETest {
                 start, event.eventId(),
                 1, 1, 1, 0, 0,
                 orderOffsetsBefore, dltBefore, 0L, notifBefore,
-                "2 seats held and confirmed; public seat availability filters verified.");
+                "2 seats held and confirmed; public seat availability filters verified."
+        );
     }
 
     // =========================================================================
@@ -568,14 +566,12 @@ class TicketingPlatformE2ETest {
         Fixtures.UserFixture user2 = Fixtures.newUser(api);
 
         // User 1 holds seat and checks out with tok_decline
-        Api.ApiResponse hold1 = api.holdSeats(user1.bearerToken(), event.eventId(), List.of(contestedSeatId),
-                UUID.randomUUID());
+        Api.ApiResponse hold1 = api.holdSeats(user1.bearerToken(), event.eventId(), List.of(contestedSeatId), UUID.randomUUID());
         assertThat(hold1.status()).isEqualTo(201);
         UUID order1Id = UUID.fromString(hold1.json().get("reservationId").asText());
         awaitOrderMaterialized(user1, order1Id, Duration.ofSeconds(15));
 
-        Api.ApiResponse checkout1 = api.checkout(user1.bearerToken(), order1Id, UUID.randomUUID(),
-                Fixtures.TOK_DECLINE);
+        Api.ApiResponse checkout1 = api.checkout(user1.bearerToken(), order1Id, UUID.randomUUID(), Fixtures.TOK_DECLINE);
         assertThat(checkout1.status()).isEqualTo(202);
 
         awaitOrderStatusViaGateway(user1, order1Id, "CANCELLED_PAYMENT_FAILED", Duration.ofSeconds(20));
@@ -586,8 +582,7 @@ class TicketingPlatformE2ETest {
                 .pollInterval(Duration.ofMillis(200))
                 .until(() -> {
                     Api.ApiResponse seatsResp = api.getSeats(event.eventId(), null, "AVAILABLE", 200, null);
-                    if (seatsResp.status() != 200 || seatsResp.json() == null)
-                        return false;
+                    if (seatsResp.status() != 200 || seatsResp.json() == null) return false;
                     for (JsonNode n : seatsResp.json().get("items")) {
                         if (contestedSeatId.toString().equals(n.get("seatId").asText())) {
                             return true;
@@ -597,14 +592,12 @@ class TicketingPlatformE2ETest {
                 });
 
         // User 2 holds and buys that same seat with tok_success
-        Api.ApiResponse hold2 = api.holdSeats(user2.bearerToken(), event.eventId(), List.of(contestedSeatId),
-                UUID.randomUUID());
+        Api.ApiResponse hold2 = api.holdSeats(user2.bearerToken(), event.eventId(), List.of(contestedSeatId), UUID.randomUUID());
         assertThat(hold2.status()).isEqualTo(201);
         UUID order2Id = UUID.fromString(hold2.json().get("reservationId").asText());
         awaitOrderMaterialized(user2, order2Id, Duration.ofSeconds(15));
 
-        Api.ApiResponse checkout2 = api.checkout(user2.bearerToken(), order2Id, UUID.randomUUID(),
-                Fixtures.TOK_SUCCESS);
+        Api.ApiResponse checkout2 = api.checkout(user2.bearerToken(), order2Id, UUID.randomUUID(), Fixtures.TOK_SUCCESS);
         assertThat(checkout2.status()).isEqualTo(202);
 
         awaitOrderStatusViaGateway(user2, order2Id, "CONFIRMED", Duration.ofSeconds(20));
@@ -630,7 +623,8 @@ class TicketingPlatformE2ETest {
                 start, event.eventId(),
                 2, 2, 2, 0, 0,
                 orderOffsetsBefore, dltBefore, 0L, notifBefore,
-                "User 1 declined (FAILED), seat released to AVAILABLE and bought by User 2 (CONFIRMED).");
+                "User 1 declined (FAILED), seat released to AVAILABLE and bought by User 2 (CONFIRMED)."
+        );
     }
 
     // =========================================================================
@@ -662,8 +656,7 @@ class TicketingPlatformE2ETest {
         // Force expiry in inventory_db
         db.forceReservationExpiry(res1Id);
 
-        // Wait for expiry sweeper to transition reservation -> EXPIRED and order ->
-        // CANCELLED_EXPIRED
+        // Wait for expiry sweeper to transition reservation -> EXPIRED and order -> CANCELLED_EXPIRED
         awaitOrderStatusViaGateway(user1, res1Id, "CANCELLED_EXPIRED", Duration.ofSeconds(25));
 
         assertThat(db.findPaymentsByOrderIds(Set.of(res1Id))).isEmpty();
@@ -673,8 +666,7 @@ class TicketingPlatformE2ETest {
                 .pollInterval(Duration.ofMillis(200))
                 .until(() -> notifications.diff(notifBefore).sent("order.cancelled") == 1L);
 
-        // Verify seat is AVAILABLE and User 2 can now hold and complete purchase on
-        // that seat
+        // Verify seat is AVAILABLE and User 2 can now hold and complete purchase on that seat
         Api.ApiResponse hold2 = api.holdSeats(user2.bearerToken(), event.eventId(), List.of(seatId), UUID.randomUUID());
         assertThat(hold2.status()).isEqualTo(201);
         UUID res2Id = UUID.fromString(hold2.json().get("reservationId").asText());
@@ -688,7 +680,8 @@ class TicketingPlatformE2ETest {
                 start, event.eventId(),
                 2, 2, 2, 0, 0,
                 orderOffsetsBefore, dltBefore, 0L, notifBefore,
-                "Expired reservation produced 0 payments, 1 order.cancelled notification, and freed seat for User 2.");
+                "Expired reservation produced 0 payments, 1 order.cancelled notification, and freed seat for User 2."
+        );
     }
 
     // =========================================================================
@@ -715,17 +708,14 @@ class TicketingPlatformE2ETest {
 
         try {
             // 1. Buyer 1 holds the single seat and order reaches AWAITING_PAYMENT
-            Api.ApiResponse hold1 = api.holdSeats(buyer1.bearerToken(), event.eventId(), List.of(seatId),
-                    UUID.randomUUID());
+            Api.ApiResponse hold1 = api.holdSeats(buyer1.bearerToken(), event.eventId(), List.of(seatId), UUID.randomUUID());
             assertThat(hold1.status()).isEqualTo(201);
             UUID order1Id = UUID.fromString(hold1.json().get("reservationId").asText());
             awaitOrderMaterialized(buyer1, order1Id, Duration.ofSeconds(15));
 
-            // 2. Stop payment-service before checkout so order.payment.requested is
-            // guaranteed to sit in Kafka unconsumed
+            // 2. Stop payment-service before checkout so order.payment.requested is guaranteed to sit in Kafka unconsumed
             stack.stop("payment-service");
-            Api.ApiResponse checkout1 = api.checkout(buyer1.bearerToken(), order1Id, UUID.randomUUID(),
-                    Fixtures.TOK_SUCCESS);
+            Api.ApiResponse checkout1 = api.checkout(buyer1.bearerToken(), order1Id, UUID.randomUUID(), Fixtures.TOK_SUCCESS);
             assertThat(checkout1.status()).isEqualTo(202);
 
             Awaitility.await("order.payment.requested published to Kafka while payment-service is stopped")
@@ -734,8 +724,7 @@ class TicketingPlatformE2ETest {
                     .until(() -> db.countUnpublishedOutbox("order_db", event.eventId()) == 0
                             && kafkaProbe.totalConsumerGroupLag("payment-service-order-cg") >= 1L);
 
-            // Prove payment request is unconsumed before forcing expiry: lag > 0 and no
-            // payment row exists
+            // Prove payment request is unconsumed before forcing expiry: lag > 0 and no payment row exists
             assertThat(kafkaProbe.totalConsumerGroupLag("payment-service-order-cg")).isGreaterThanOrEqualTo(1L);
             assertThat(db.findPaymentsByOrderIds(Set.of(order1Id)))
                     .as("No payment row may exist for order1 while payment-service is stopped before forcing expiry")
@@ -761,16 +750,13 @@ class TicketingPlatformE2ETest {
                     });
 
             // 4. Buyer 2 holds that same seat while payment-service is still stopped
-            Api.ApiResponse hold2 = api.holdSeats(buyer2.bearerToken(), event.eventId(), List.of(seatId),
-                    UUID.randomUUID());
+            Api.ApiResponse hold2 = api.holdSeats(buyer2.bearerToken(), event.eventId(), List.of(seatId), UUID.randomUUID());
             assertThat(hold2.status()).isEqualTo(201);
             UUID order2Id = UUID.fromString(hold2.json().get("reservationId").asText());
             awaitOrderMaterialized(buyer2, order2Id, Duration.ofSeconds(15));
 
-            // 5. Buyer 2 submits checkout (queued in Kafka behind Buyer 1's payment
-            // request)
-            Api.ApiResponse checkout2 = api.checkout(buyer2.bearerToken(), order2Id, UUID.randomUUID(),
-                    Fixtures.TOK_SUCCESS);
+            // 5. Buyer 2 submits checkout (queued in Kafka behind Buyer 1's payment request)
+            Api.ApiResponse checkout2 = api.checkout(buyer2.bearerToken(), order2Id, UUID.randomUUID(), Fixtures.TOK_SUCCESS);
             assertThat(checkout2.status()).isEqualTo(202);
 
             // 6. Start payment-service and wait for both sagas to reach quiescence
@@ -782,8 +768,7 @@ class TicketingPlatformE2ETest {
             awaitOrderStatusViaGateway(buyer1, order1Id, "CANCELLED_REFUNDED", FAILOVER_BUDGET);
             s4RecoverySeconds = Duration.between(recoveryStart, Instant.now()).toMillis() / 1000.0;
 
-            // 7. Verify Buyer 1's payment was created and transitioned to REFUNDED with net
-            // charge 0
+            // 7. Verify Buyer 1's payment was created and transitioned to REFUNDED with net charge 0
             List<Db.PaymentRow> buyer1Payments = db.findPaymentsByOrderIds(Set.of(order1Id));
             assertThat(buyer1Payments).hasSize(1);
             Db.PaymentRow p1 = buyer1Payments.get(0);
@@ -827,7 +812,8 @@ class TicketingPlatformE2ETest {
                 2, 2, 2, 0, 0,
                 orderOffsetsBefore, dltBefore, 0L, notifBefore,
                 "Buyer 1 late charge automatically compensated (CANCELLED_EXPIRED -> REFUND_PENDING -> CANCELLED_REFUNDED); Buyer 2 CONFIRMED.",
-                s4RecoverySeconds);
+                s4RecoverySeconds
+        );
     }
 
     // =========================================================================
@@ -846,10 +832,8 @@ class TicketingPlatformE2ETest {
 
         int totalSeats = 20;
         int wave1UsersCount = 200;
-        // createOnSaleEvent mints 1 admin token via POST /api/v1/auth/token; we mint 4
-        // user tokens via gateway
-        // (total 5 tokens via gateway endpoint) and sign the remaining tokens locally
-        // so the token endpoint's
+        // createOnSaleEvent mints 1 admin token via POST /api/v1/auth/token; we mint 4 user tokens via gateway
+        // (total 5 tokens via gateway endpoint) and sign the remaining tokens locally so the token endpoint's
         // rate limit is never consumed by test setup.
         Fixtures.EventFixture event = Fixtures.createOnSaleEvent(api, totalSeats, 9_500L, "USD");
         suiteEventIds.add(event.eventId());
@@ -865,8 +849,7 @@ class TicketingPlatformE2ETest {
             }
             int count = (i < 20) ? 1 : (1 + rnd.nextInt(2));
             if (i < 20) {
-                // Guarantee every one of the 20 seats is targeted by at least one single-seat
-                // request
+                // Guarantee every one of the 20 seats is targeted by at least one single-seat request
                 wave1SeatChoices.add(List.of(allSeatIds.get(i)));
             } else if (count == 1) {
                 wave1SeatChoices.add(List.of(allSeatIds.get(rnd.nextInt(totalSeats))));
@@ -877,8 +860,7 @@ class TicketingPlatformE2ETest {
             }
         }
 
-        record HoldAttemptResult(Fixtures.UserFixture user, List<UUID> seats, Api.ApiResponse response) {
-        }
+        record HoldAttemptResult(Fixtures.UserFixture user, List<UUID> seats, Api.ApiResponse response) {}
 
         ExecutorService pool = Executors.newFixedThreadPool(64);
         int holdsAttemptedTotal = wave1UsersCount;
@@ -898,8 +880,7 @@ class TicketingPlatformE2ETest {
                 tasks.add(() -> {
                     readyLatch.countDown();
                     startLatch.await(10, TimeUnit.SECONDS);
-                    Api.ApiResponse resp = api.holdSeats(u.bearerToken(), event.eventId(), requestedSeats,
-                            UUID.randomUUID());
+                    Api.ApiResponse resp = api.holdSeats(u.bearerToken(), event.eventId(), requestedSeats, UUID.randomUUID());
                     return new HoldAttemptResult(u, requestedSeats, resp);
                 });
             }
@@ -917,14 +898,10 @@ class TicketingPlatformE2ETest {
 
             for (HoldAttemptResult r : wave1Results) {
                 int st = r.response().status();
-                if (st == 201)
-                    holds201Count++;
-                else if (st == 409)
-                    holds409Count++;
-                else if (st == 429)
-                    holds429Count++;
-                else
-                    holdsErrorCount++;
+                if (st == 201) holds201Count++;
+                else if (st == 409) holds409Count++;
+                else if (st == 429) holds429Count++;
+                else holdsErrorCount++;
             }
 
             int holds201 = 0;
@@ -963,8 +940,7 @@ class TicketingPlatformE2ETest {
                 wave1OrderIds.add(resId);
             }
 
-            // Concurrently checkout all wave 1 winners: first 5 use tok_decline, the rest
-            // use tok_success
+            // Concurrently checkout all wave 1 winners: first 5 use tok_decline, the rest use tok_success
             int declineCount = 5;
             List<UUID> declinedOrderIds = new ArrayList<>(declineCount);
             List<UUID> releasedSeatsFromDeclines = new ArrayList<>();
@@ -979,8 +955,8 @@ class TicketingPlatformE2ETest {
                     releasedSeatsFromDeclines.addAll(winner.seats());
                 }
                 final String token = shouldDecline ? Fixtures.TOK_DECLINE : Fixtures.TOK_SUCCESS;
-                checkoutFutures.add(pool
-                        .submit(() -> api.checkout(winner.user().bearerToken(), orderId, UUID.randomUUID(), token)));
+                checkoutFutures.add(pool.submit(() ->
+                        api.checkout(winner.user().bearerToken(), orderId, UUID.randomUUID(), token)));
             }
 
             for (Future<Api.ApiResponse> cf : checkoutFutures) {
@@ -990,15 +966,13 @@ class TicketingPlatformE2ETest {
                         .isEqualTo(202);
             }
 
-            // Wait for the 5 declined orders to reach CANCELLED_PAYMENT_FAILED and release
-            // their seats
+            // Wait for the 5 declined orders to reach CANCELLED_PAYMENT_FAILED and release their seats
             for (int i = 0; i < declineCount; i++) {
                 awaitOrderStatusViaGateway(wave1Winners.get(i).user(), declinedOrderIds.get(i),
                         "CANCELLED_PAYMENT_FAILED", Duration.ofSeconds(25));
             }
 
-            // Wait until all released seats from those 5 declined holds are AVAILABLE in
-            // inventory_db
+            // Wait until all released seats from those 5 declined holds are AVAILABLE in inventory_db
             Awaitility.await("Seats from 5 declined holds return to AVAILABLE")
                     .atMost(Duration.ofSeconds(15))
                     .pollInterval(Duration.ofMillis(200))
@@ -1058,15 +1032,13 @@ class TicketingPlatformE2ETest {
                     holds409,
                     holds429,
                     orderOffsetsBefore, dltBefore, 0L, notifBefore,
-                    String.format(
-                            "Wave 1: %d accepted (201), %d rejected (409), %d rate-limited (429); 5 declined & re-bought in Wave 2 (%d seats).",
-                            holds201, holds409, holds429, wave2Accepted));
+                    String.format("Wave 1: %d accepted (201), %d rejected (409), %d rate-limited (429); 5 declined & re-bought in Wave 2 (%d seats).",
+                            holds201, holds409, holds429, wave2Accepted)
+            );
         } catch (Throwable t) {
             // If S5 fails (e.g. INV-001 where holds under 64-thread contention return 5xx),
-            // expire any HELD reservations created in Wave 1 so subsequent scenarios and
-            // S13 reach
-            // terminal quiescence cleanly, record S5 as FAIL in the report, and rethrow the
-            // failure.
+            // expire any HELD reservations created in Wave 1 so subsequent scenarios and S13 reach
+            // terminal quiescence cleanly, record S5 as FAIL in the report, and rethrow the failure.
             try {
                 cleanupHeldReservationsOnScenarioFailure(event.eventId(), start);
                 Notifications.NotificationSnapshot notifAfter = notifications.snapshot();
@@ -1074,7 +1046,8 @@ class TicketingPlatformE2ETest {
                 KafkaProbe.DltDiff dltDiff = kafkaProbe.diffDltOffsets(dltBefore);
                 InvariantAuditor.ScenarioContext ctx = new InvariantAuditor.ScenarioContext(
                         event.eventId(), start, kafkaProbe, orderOffsetsBefore,
-                        dltBefore, 0L, notifBefore, notifAfter, 0L, declaredRefundPendingOrders.keySet());
+                        dltBefore, 0L, notifBefore, notifAfter, 0L, declaredRefundPendingOrders.keySet()
+                );
                 InvariantAuditor.AuditResult auditResult = auditor.auditScenario(ctx);
                 long durationMs = Duration.between(start, db.currentTimestampInInventoryDb()).toMillis();
                 String failMsg = t.getMessage() != null ? t.getMessage().replaceAll("\\s+", " ").trim() : t.toString();
@@ -1096,7 +1069,8 @@ class TicketingPlatformE2ETest {
                         dltDiff.totalDelta(),
                         0L,
                         auditResult,
-                        "Scenario failed assertion (INV-001): " + failMsg));
+                        "Scenario failed assertion (INV-001): " + failMsg
+                ));
             } catch (Exception cleanupEx) {
                 System.err.println("Warning during S5 failure cleanup/recording: " + cleanupEx.getMessage());
             }
@@ -1113,8 +1087,7 @@ class TicketingPlatformE2ETest {
                 .map(Db.ReservationRow::reservationId)
                 .toList();
         if (!heldIds.isEmpty()) {
-            // Wait for orders of those HELD reservations to materialize before expiring
-            // them
+            // Wait for orders of those HELD reservations to materialize before expiring them
             Awaitility.await("Materialize orders for HELD reservations before failure cleanup")
                     .atMost(Duration.ofSeconds(15))
                     .pollInterval(Duration.ofMillis(200))
@@ -1152,20 +1125,17 @@ class TicketingPlatformE2ETest {
         suiteEventIds.add(event.eventId());
         Fixtures.UserFixture buyer = Fixtures.newUser(api);
 
-        Api.ApiResponse holdResp = api.holdSeats(buyer.bearerToken(), event.eventId(), List.of(event.seatIds().get(0)),
-                UUID.randomUUID());
+        Api.ApiResponse holdResp = api.holdSeats(buyer.bearerToken(), event.eventId(), List.of(event.seatIds().get(0)), UUID.randomUUID());
         assertThat(holdResp.status()).isEqualTo(201);
         UUID orderId = UUID.fromString(holdResp.json().get("reservationId").asText());
         awaitOrderMaterialized(buyer, orderId, Duration.ofSeconds(15));
 
-        Api.ApiResponse checkoutResp = api.checkout(buyer.bearerToken(), orderId, UUID.randomUUID(),
-                Fixtures.TOK_SUCCESS);
+        Api.ApiResponse checkoutResp = api.checkout(buyer.bearerToken(), orderId, UUID.randomUUID(), Fixtures.TOK_SUCCESS);
         assertThat(checkoutResp.status()).isEqualTo(202);
         awaitOrderStatusViaGateway(buyer, orderId, "CONFIRMED", Duration.ofSeconds(20));
         quiescence.await(event.eventId(), Duration.ofSeconds(30));
 
-        // Snapshot outbox counts, payments table, and notifications after happy-path
-        // order is CONFIRMED
+        // Snapshot outbox counts, payments table, and notifications after happy-path order is CONFIRMED
         int invOutboxCountBefore = db.findInventoryOutboxByAggregateIds(Set.of(orderId)).size();
         int ordOutboxCountBefore = db.findOrderOutboxByAggregateIds(Set.of(orderId)).size();
         int payOutboxCountBefore = db.findPaymentOutboxByAggregateIds(Set.of(orderId)).size();
@@ -1173,25 +1143,20 @@ class TicketingPlatformE2ETest {
         assertThat(paymentsBeforeReplays).hasSize(1);
         Notifications.NotificationSnapshot notifAfterConfirm = notifications.snapshot();
 
-        // Find the original payment.succeeded, inventory.seat.reserved,
-        // order.payment.requested, and order.confirmed records from Kafka
-        KafkaProbe.ConsumedEvent origPaySucceeded = kafkaProbe
-                .readSince(KafkaProbe.TOPIC_PAYMENT_EVENTS, payOffsetsBefore)
+        // Find the original payment.succeeded, inventory.seat.reserved, order.payment.requested, and order.confirmed records from Kafka
+        KafkaProbe.ConsumedEvent origPaySucceeded = kafkaProbe.readSince(KafkaProbe.TOPIC_PAYMENT_EVENTS, payOffsetsBefore)
                 .stream()
                 .filter(e -> orderId.toString().equals(e.key()) && "payment.succeeded".equals(e.eventType()))
                 .findFirst()
                 .orElseThrow(() -> new AssertionError("Original payment.succeeded not found on payment.events"));
 
-        KafkaProbe.ConsumedEvent origSeatReserved = kafkaProbe
-                .readSince(KafkaProbe.TOPIC_INVENTORY_EVENTS, invOffsetsBefore)
+        KafkaProbe.ConsumedEvent origSeatReserved = kafkaProbe.readSince(KafkaProbe.TOPIC_INVENTORY_EVENTS, invOffsetsBefore)
                 .stream()
                 .filter(e -> orderId.toString().equals(e.key()) && "inventory.seat.reserved".equals(e.eventType()))
                 .findFirst()
-                .orElseThrow(
-                        () -> new AssertionError("Original inventory.seat.reserved not found on inventory.events"));
+                .orElseThrow(() -> new AssertionError("Original inventory.seat.reserved not found on inventory.events"));
 
-        List<KafkaProbe.ConsumedEvent> orderEvents = kafkaProbe.readSince(KafkaProbe.TOPIC_ORDER_EVENTS,
-                orderOffsetsBefore);
+        List<KafkaProbe.ConsumedEvent> orderEvents = kafkaProbe.readSince(KafkaProbe.TOPIC_ORDER_EVENTS, orderOffsetsBefore);
         KafkaProbe.ConsumedEvent origPaymentRequested = orderEvents.stream()
                 .filter(e -> orderId.toString().equals(e.key()) && "order.payment.requested".equals(e.eventType()))
                 .findFirst()
@@ -1211,7 +1176,9 @@ class TicketingPlatformE2ETest {
                         "event-type", "payment.succeeded",
                         "event-id", origPaySucceeded.eventId().toString(),
                         "schema-version", "1",
-                        "X-Correlation-Id", UUID.randomUUID().toString()));
+                        "X-Correlation-Id", UUID.randomUUID().toString()
+                )
+        );
 
         // (b) Produce second payment.succeeded for the same order with a NEW eventId
         UUID newEventId = UUID.randomUUID();
@@ -1225,10 +1192,11 @@ class TicketingPlatformE2ETest {
                         "event-type", "payment.succeeded",
                         "event-id", newEventId.toString(),
                         "schema-version", "1",
-                        "X-Correlation-Id", UUID.randomUUID().toString()));
+                        "X-Correlation-Id", UUID.randomUUID().toString()
+                )
+        );
 
-        // (c) Produce exact copy of already-processed inventory.seat.reserved (same
-        // eventId)
+        // (c) Produce exact copy of already-processed inventory.seat.reserved (same eventId)
         kafkaProbe.produceRaw(
                 KafkaProbe.TOPIC_INVENTORY_EVENTS,
                 orderId.toString(),
@@ -1237,7 +1205,9 @@ class TicketingPlatformE2ETest {
                         "event-type", "inventory.seat.reserved",
                         "event-id", origSeatReserved.eventId().toString(),
                         "schema-version", "1",
-                        "X-Correlation-Id", UUID.randomUUID().toString()));
+                        "X-Correlation-Id", UUID.randomUUID().toString()
+                )
+        );
 
         // (d) Replay order.payment.requested onto order.events with key orderId
         kafkaProbe.produceRaw(
@@ -1248,7 +1218,9 @@ class TicketingPlatformE2ETest {
                         "event-type", "order.payment.requested",
                         "event-id", origPaymentRequested.eventId().toString(),
                         "schema-version", "1",
-                        "X-Correlation-Id", UUID.randomUUID().toString()));
+                        "X-Correlation-Id", UUID.randomUUID().toString()
+                )
+        );
 
         // (e) Replay order.confirmed onto order.events with key orderId
         kafkaProbe.produceRaw(
@@ -1259,10 +1231,11 @@ class TicketingPlatformE2ETest {
                         "event-type", "order.confirmed",
                         "event-id", origOrderConfirmed.eventId().toString(),
                         "schema-version", "1",
-                        "X-Correlation-Id", UUID.randomUUID().toString()));
+                        "X-Correlation-Id", UUID.randomUUID().toString()
+                )
+        );
 
-        // Wait for all consumer groups to consume the replayed messages and reach lag
-        // 0,
+        // Wait for all consumer groups to consume the replayed messages and reach lag 0,
         // and for notification-service to record the duplicate order.confirmed event
         quiescence.await(event.eventId(), Duration.ofSeconds(30));
         Awaitility.await("notification-service duplicate counter increments by 1 for replayed order.confirmed")
@@ -1270,10 +1243,8 @@ class TicketingPlatformE2ETest {
                 .pollInterval(Duration.ofMillis(200))
                 .until(() -> notifications.diff(notifAfterConfirm).duplicate("order.confirmed") == 1L);
 
-        // Assert no state change, no new outbox rows anywhere, payments table
-        // unchanged,
-        // notification duplicate counter +1 while sent counter unchanged (+0), and 0
-        // DLT growth
+        // Assert no state change, no new outbox rows anywhere, payments table unchanged,
+        // notification duplicate counter +1 while sent counter unchanged (+0), and 0 DLT growth
         assertThat(db.findInventoryOutboxByAggregateIds(Set.of(orderId))).hasSize(invOutboxCountBefore);
         assertThat(db.findOrderOutboxByAggregateIds(Set.of(orderId))).hasSize(ordOutboxCountBefore);
         assertThat(db.findPaymentOutboxByAggregateIds(Set.of(orderId))).hasSize(payOutboxCountBefore);
@@ -1291,12 +1262,12 @@ class TicketingPlatformE2ETest {
                 1, 1, 1, 0, 0, 0,
                 orderOffsetsBefore, dltBefore, 0L, notifBefore,
                 1L, false,
-                "Replayed payment.succeeded (same & new eventId), inventory.seat.reserved, order.payment.requested, and order.confirmed: 0 new outbox rows, payments unchanged, notification duplicate=+1, sent=+0, 0 DLT.");
+                "Replayed payment.succeeded (same & new eventId), inventory.seat.reserved, order.payment.requested, and order.confirmed: 0 new outbox rows, payments unchanged, notification duplicate=+1, sent=+0, 0 DLT."
+        );
     }
 
     // =========================================================================
-    // S7 — Crash recovery (SIGKILL payment-service, inventory-service,
-    // order-service)
+    // S7 — Crash recovery (SIGKILL payment-service, inventory-service, order-service)
     // =========================================================================
     @Test
     @Order(7)
@@ -1322,8 +1293,7 @@ class TicketingPlatformE2ETest {
 
         ExecutorService pool = Executors.newFixedThreadPool(24);
         try {
-            // Part 1: Verify payment is in flight (no payment row yet and lag > 0) before
-            // SIGKILL on payment-service
+            // Part 1: Verify payment is in flight (no payment row yet and lag > 0) before SIGKILL on payment-service
             Fixtures.UserFixture user0 = Fixtures.newUser(api);
             Map<UUID, Fixtures.UserFixture> usersById = new ConcurrentHashMap<>();
             usersById.put(user0.userId(), user0);
@@ -1336,11 +1306,9 @@ class TicketingPlatformE2ETest {
             UUID order0Id = UUID.fromString(hold0.json().get("reservationId").asText());
             awaitOrderMaterialized(user0, order0Id, Duration.ofSeconds(15));
 
-            // Pause payment-service so the checkout event is published to order.events and
-            // guaranteed in-flight before SIGKILL
+            // Pause payment-service so the checkout event is published to order.events and guaranteed in-flight before SIGKILL
             stack.pause("payment-service");
-            Api.ApiResponse checkout0 = api.checkout(user0.bearerToken(), order0Id, UUID.randomUUID(),
-                    Fixtures.TOK_SUCCESS);
+            Api.ApiResponse checkout0 = api.checkout(user0.bearerToken(), order0Id, UUID.randomUUID(), Fixtures.TOK_SUCCESS);
             assertThat(checkout0.status()).isEqualTo(202);
 
             Awaitility.await("order.payment.requested published with consumer lag > 0 before SIGKILL")
@@ -1365,8 +1333,7 @@ class TicketingPlatformE2ETest {
             p1RecoverySeconds = Duration.between(p1RecoveryStart, Instant.now()).toMillis() / 1000.0;
             assertThat(db.findPaymentsByOrderIds(Set.of(order0Id))).hasSize(1);
 
-            // Part 2a: Kill -9 inventory-service while hold requests are actually in flight
-            // (using a latch)
+            // Part 2a: Kill -9 inventory-service while hold requests are actually in flight (using a latch)
             int trafficUsersCount = 45;
             List<Fixtures.UserFixture> trafficUsers = new ArrayList<>(trafficUsersCount);
             List<UUID> targetSeats = new ArrayList<>(trafficUsersCount);
@@ -1402,8 +1369,7 @@ class TicketingPlatformE2ETest {
                 }));
             }
 
-            // Wait until N hold requests have been dispatched and assert that requests are
-            // still in flight before SIGKILL
+            // Wait until N hold requests have been dispatched and assert that requests are still in flight before SIGKILL
             assertThat(holdsDispatchedLatch.await(10, TimeUnit.SECONDS)).isTrue();
             assertThat(completedHolds.get())
                     .as("Hold requests must still be in flight when inventory-service is killed")
@@ -1421,15 +1387,13 @@ class TicketingPlatformE2ETest {
                 holdsAttempted++;
                 Api.ApiResponse resp = f.get(30, TimeUnit.SECONDS);
                 int status = resp.status();
-                // During the declared SIGKILL outage window, gateway 502/503/504 or local
-                // transportError (status 0) is expected, never 500
+                // During the declared SIGKILL outage window, gateway 502/503/504 or local transportError (status 0) is expected, never 500
                 if (resp.transportError()) {
                     assertThat(status).isEqualTo(0);
                     holdsFailedOrLost++;
                 } else {
                     assertThat(status)
-                            .as("Unexpected HTTP status during inventory-service crash recovery: %d body=%s", status,
-                                    resp.body())
+                            .as("Unexpected HTTP status during inventory-service crash recovery: %d body=%s", status, resp.body())
                             .isIn(201, 409, 429, 502, 503, 504);
                     if (status == 201) {
                         holdsAccepted++;
@@ -1444,8 +1408,7 @@ class TicketingPlatformE2ETest {
                 }
             }
 
-            // Ensure we have at least 6 HELD reservations so Part 2b has multiple checkouts
-            // in flight when order-service is killed
+            // Ensure we have at least 6 HELD reservations so Part 2b has multiple checkouts in flight when order-service is killed
             List<Db.SeatRow> availableAfterHoldKill = db.findSeats(event.eventId()).stream()
                     .filter(s -> "AVAILABLE".equals(s.status()))
                     .toList();
@@ -1456,8 +1419,7 @@ class TicketingPlatformE2ETest {
                 Fixtures.UserFixture extraUser = trafficUsers.get(i);
                 holdsAttempted++;
                 Api.ApiResponse extraHold = api.holdSeats(
-                        extraUser.bearerToken(), event.eventId(), List.of(availableAfterHoldKill.get(i).seatId()),
-                        UUID.randomUUID());
+                        extraUser.bearerToken(), event.eventId(), List.of(availableAfterHoldKill.get(i).seatId()), UUID.randomUUID());
                 if (extraHold.status() == 201) {
                     holdsAccepted++;
                     currentHeldCount++;
@@ -1468,8 +1430,7 @@ class TicketingPlatformE2ETest {
             }
 
             // Reconcile 201 responses with reservation rows in inventory_db:
-            // Every HTTP 201 must exist in inventory_db; any additional reservation row in
-            // inventory_db is a hold
+            // Every HTTP 201 must exist in inventory_db; any additional reservation row in inventory_db is a hold
             // that committed right before SIGKILL dropped its HTTP response.
             List<Db.ReservationRow> allReservationsNow = db.findReservations(event.eventId());
             Set<UUID> dbReservationIds = allReservationsNow.stream()
@@ -1491,8 +1452,7 @@ class TicketingPlatformE2ETest {
                 awaitOrderMaterialized(owner, held.reservationId(), Duration.ofSeconds(30));
             }
 
-            // Part 2b: Kill -9 order-service while checkout requests are actually in flight
-            // (using a latch)
+            // Part 2b: Kill -9 order-service while checkout requests are actually in flight (using a latch)
             int checkoutCount = heldReservations.size();
             CountDownLatch checkoutsDispatchedLatch = new CountDownLatch(Math.min(2, checkoutCount));
             CountDownLatch checkoutSecondWaveGate = new CountDownLatch(1);
@@ -1509,8 +1469,7 @@ class TicketingPlatformE2ETest {
                             checkoutSecondWaveGate.await(5, TimeUnit.SECONDS);
                         }
                         checkoutsDispatchedLatch.countDown();
-                        return api.checkout(owner.bearerToken(), held.reservationId(), UUID.randomUUID(),
-                                Fixtures.TOK_SUCCESS);
+                        return api.checkout(owner.bearerToken(), held.reservationId(), UUID.randomUUID(), Fixtures.TOK_SUCCESS);
                     } finally {
                         completedCheckouts.incrementAndGet();
                     }
@@ -1534,14 +1493,12 @@ class TicketingPlatformE2ETest {
                     assertThat(cResp.status()).isEqualTo(0);
                 } else {
                     assertThat(cResp.status())
-                            .as("Unexpected HTTP status during order-service crash recovery: %d body=%s",
-                                    cResp.status(), cResp.body())
+                            .as("Unexpected HTTP status during order-service crash recovery: %d body=%s", cResp.status(), cResp.body())
                             .isIn(202, 409, 429, 502, 503, 504);
                 }
             }
 
-            // Retry checkout for any HELD reservation whose checkout failed during
-            // order-service SIGKILL
+            // Retry checkout for any HELD reservation whose checkout failed during order-service SIGKILL
             for (Db.ReservationRow held : heldReservations) {
                 Fixtures.UserFixture owner = usersById.get(held.userId());
                 Db.OrderRow currentOrder = db.findOrderById(held.reservationId()).orElseThrow();
@@ -1566,7 +1523,8 @@ class TicketingPlatformE2ETest {
         int lostHttp201Count = finalDbReservations - holdsAccepted;
         String reconciliationNote = String.format(
                 "SIGKILL on payment-service (in-flight payment), inventory-service (in-flight holds), and order-service (in-flight checkouts) recovered cleanly; HTTP 201s=%d, DB reservations=%d (%d committed in DB whose HTTP response was lost to SIGKILL).",
-                holdsAccepted, finalDbReservations, lostHttp201Count);
+                holdsAccepted, finalDbReservations, lostHttp201Count
+        );
 
         Double s7RecoverySeconds = null;
         if (p1RecoverySeconds != null || p2RecoverySeconds != null) {
@@ -1582,7 +1540,8 @@ class TicketingPlatformE2ETest {
                 orderOffsetsBefore, dltBefore, 0L, notifBefore,
                 0L, false,
                 reconciliationNote,
-                s7RecoverySeconds);
+                s7RecoverySeconds
+        );
     }
 
     // =========================================================================
@@ -1613,12 +1572,10 @@ class TicketingPlatformE2ETest {
         Double s8RecoverySeconds = null;
 
         try {
-            // 1. First 15 users hold 1 seat each and reach AWAITING_PAYMENT before Kafka
-            // stops
+            // 1. First 15 users hold 1 seat each and reach AWAITING_PAYMENT before Kafka stops
             for (int i = 0; i < 15; i++) {
                 Api.ApiResponse holdResp = api.holdSeats(
-                        users.get(i).bearerToken(), event.eventId(), List.of(event.seatIds().get(i)),
-                        UUID.randomUUID());
+                        users.get(i).bearerToken(), event.eventId(), List.of(event.seatIds().get(i)), UUID.randomUUID());
                 assertThat(holdResp.status()).isEqualTo(201);
                 UUID resId = UUID.fromString(holdResp.json().get("reservationId").asText());
                 firstHalfOrders.add(resId);
@@ -1632,26 +1589,22 @@ class TicketingPlatformE2ETest {
             Instant kafkaStoppedAt = Instant.now();
 
             // While Kafka is down:
-            // - First 15 orders execute checkout (buffering order.payment.requested in
-            // order_db.outbox_events)
+            // - First 15 orders execute checkout (buffering order.payment.requested in order_db.outbox_events)
             for (int i = 0; i < 15; i++) {
                 Api.ApiResponse checkoutResp = api.checkout(
                         users.get(i).bearerToken(), firstHalfOrders.get(i), UUID.randomUUID(), Fixtures.TOK_SUCCESS);
                 assertThat(checkoutResp.status()).isEqualTo(202);
             }
-            // - Second 15 users hold seats 15..29 (buffering inventory.seat.reserved in
-            // inventory_db.outbox_events)
+            // - Second 15 users hold seats 15..29 (buffering inventory.seat.reserved in inventory_db.outbox_events)
             for (int i = 15; i < 30; i++) {
                 Api.ApiResponse holdResp = api.holdSeats(
-                        users.get(i).bearerToken(), event.eventId(), List.of(event.seatIds().get(i)),
-                        UUID.randomUUID());
+                        users.get(i).bearerToken(), event.eventId(), List.of(event.seatIds().get(i)), UUID.randomUUID());
                 assertThat(holdResp.status()).isEqualTo(201);
                 UUID resId = UUID.fromString(holdResp.json().get("reservationId").asText());
                 secondHalfOrders.add(resId);
             }
 
-            // Verify outbox rows are buffered unpublished while Kafka is down, and wait
-            // full 15s outage window
+            // Verify outbox rows are buffered unpublished while Kafka is down, and wait full 15s outage window
             assertThat(db.countUnpublishedOutbox("inventory_db", event.eventId())).isGreaterThanOrEqualTo(15);
             assertThat(db.countUnpublishedOutbox("order_db", event.eventId())).isGreaterThanOrEqualTo(15);
 
@@ -1665,8 +1618,7 @@ class TicketingPlatformE2ETest {
             stack.start("kafka");
             stack.waitUntilHealthy("kafka", Duration.ofSeconds(60));
 
-            // 4. As inventory_db.outbox_events drains, the second 15 orders materialize;
-            // check them out
+            // 4. As inventory_db.outbox_events drains, the second 15 orders materialize; check them out
             for (int i = 0; i < 15; i++) {
                 Fixtures.UserFixture u = users.get(15 + i);
                 UUID orderId = secondHalfOrders.get(i);
@@ -1692,7 +1644,8 @@ class TicketingPlatformE2ETest {
                 orderCount, orderCount, orderCount, 0, 0,
                 orderOffsetsBefore, dltBefore, 0L, notifBefore,
                 "30 in-flight orders buffered in inventory_db and order_db outboxes during 15s Kafka stop; all 30 reached CONFIRMED after broker recovery.",
-                s8RecoverySeconds);
+                s8RecoverySeconds
+        );
     }
 
     // =========================================================================
@@ -1715,17 +1668,14 @@ class TicketingPlatformE2ETest {
         Fixtures.UserFixture user1 = Fixtures.newUser(api);
         Fixtures.UserFixture user2 = Fixtures.newUser(api);
 
-        // Order 1: two simultaneous checkout requests with the SAME Idempotency-Key and
-        // body
-        Api.ApiResponse hold1 = api.holdSeats(user1.bearerToken(), event.eventId(), List.of(event.seatIds().get(0)),
-                UUID.randomUUID());
+        // Order 1: two simultaneous checkout requests with the SAME Idempotency-Key and body
+        Api.ApiResponse hold1 = api.holdSeats(user1.bearerToken(), event.eventId(), List.of(event.seatIds().get(0)), UUID.randomUUID());
         assertThat(hold1.status()).isEqualTo(201);
         UUID order1Id = UUID.fromString(hold1.json().get("reservationId").asText());
         awaitOrderMaterialized(user1, order1Id, Duration.ofSeconds(15));
 
         // Order 2: two simultaneous checkout requests with DIFFERENT Idempotency-Keys
-        Api.ApiResponse hold2 = api.holdSeats(user2.bearerToken(), event.eventId(), List.of(event.seatIds().get(1)),
-                UUID.randomUUID());
+        Api.ApiResponse hold2 = api.holdSeats(user2.bearerToken(), event.eventId(), List.of(event.seatIds().get(1)), UUID.randomUUID());
         assertThat(hold2.status()).isEqualTo(201);
         UUID order2Id = UUID.fromString(hold2.json().get("reservationId").asText());
         awaitOrderMaterialized(user2, order2Id, Duration.ofSeconds(15));
@@ -1748,10 +1698,8 @@ class TicketingPlatformE2ETest {
             Api.ApiResponse respA1 = sameKey1.get(15, TimeUnit.SECONDS);
             Api.ApiResponse respA2 = sameKey2.get(15, TimeUnit.SECONDS);
 
-            // At least one must be 202; if both are 202, at least one must carry
-            // X-Idempotent-Replay: true;
-            // otherwise one is 202 and one is 409 with errorCode
-            // IDEMPOTENCY_REQUEST_IN_PROGRESS and Retry-After: 1
+            // At least one must be 202; if both are 202, at least one must carry X-Idempotent-Replay: true;
+            // otherwise one is 202 and one is 409 with errorCode IDEMPOTENCY_REQUEST_IN_PROGRESS and Retry-After: 1
             List<Integer> statusesA = List.of(respA1.status(), respA2.status());
             assertThat(statusesA).contains(202);
             for (Api.ApiResponse r : List.of(respA1, respA2)) {
@@ -1762,22 +1710,19 @@ class TicketingPlatformE2ETest {
                 }
             }
             if (respA1.status() == 202 && respA2.status() == 202) {
-                assertThat(
-                        List.of(respA1.headerValue("X-Idempotent-Replay"), respA2.headerValue("X-Idempotent-Replay")))
+                assertThat(List.of(respA1.headerValue("X-Idempotent-Replay"), respA2.headerValue("X-Idempotent-Replay")))
                         .as("When two identical-key requests both return 202, at least one must carry X-Idempotent-Replay: true")
                         .contains("true");
             } else {
                 assertThat(statusesA).containsExactlyInAnyOrder(202, 409);
             }
 
-            // Subsequent replay with the same Idempotency-Key and same body returns 202
-            // with X-Idempotent-Replay: true
+            // Subsequent replay with the same Idempotency-Key and same body returns 202 with X-Idempotent-Replay: true
             Api.ApiResponse replayResp = api.checkout(user1.bearerToken(), order1Id, sharedKey, Fixtures.TOK_SUCCESS);
             assertThat(replayResp.status()).isEqualTo(202);
             assertThat(replayResp.headerValue("X-Idempotent-Replay")).isEqualTo("true");
 
-            // Reusing the same Idempotency-Key with a DIFFERENT body returns 422
-            // IDEMPOTENCY_KEY_PAYLOAD_MISMATCH
+            // Reusing the same Idempotency-Key with a DIFFERENT body returns 422 IDEMPOTENCY_KEY_PAYLOAD_MISMATCH
             Api.ApiResponse mismatchResp = api.checkout(user1.bearerToken(), order1Id, sharedKey, Fixtures.TOK_DECLINE);
             assertThat(mismatchResp.status()).isEqualTo(422);
             assertThat(mismatchResp.errorCode()).isEqualTo("IDEMPOTENCY_KEY_PAYLOAD_MISMATCH");
@@ -1797,8 +1742,7 @@ class TicketingPlatformE2ETest {
             Api.ApiResponse respB1 = diffKey1.get(15, TimeUnit.SECONDS);
             Api.ApiResponse respB2 = diffKey2.get(15, TimeUnit.SECONDS);
 
-            // Exactly one wins the row lock (202) and the other sees PAYMENT_PENDING (409
-            // INVALID_ORDER_STATE)
+            // Exactly one wins the row lock (202) and the other sees PAYMENT_PENDING (409 INVALID_ORDER_STATE)
             assertThat(List.of(respB1.status(), respB2.status()))
                     .containsExactlyInAnyOrder(202, 409);
             Api.ApiResponse conflictB = respB1.status() == 409 ? respB1 : respB2;
@@ -1818,7 +1762,8 @@ class TicketingPlatformE2ETest {
                 start, event.eventId(),
                 2, 2, 2, 0, 0,
                 orderOffsetsBefore, dltBefore, 0L, notifBefore,
-                "Same-key concurrent + replay returned 202 (X-Idempotent-Replay: true), payload mismatch returned 422, different-key concurrent returned [202, 409 INVALID_ORDER_STATE]; 1 payment per order.");
+                "Same-key concurrent + replay returned 202 (X-Idempotent-Replay: true), payload mismatch returned 422, different-key concurrent returned [202, 409 INVALID_ORDER_STATE]; 1 payment per order."
+        );
     }
 
     // =========================================================================
@@ -1841,14 +1786,12 @@ class TicketingPlatformE2ETest {
         suiteEventIds.add(event.eventId());
         Fixtures.UserFixture buyer = Fixtures.newUser(api);
 
-        Api.ApiResponse holdResp = api.holdSeats(buyer.bearerToken(), event.eventId(), List.of(event.seatIds().get(0)),
-                UUID.randomUUID());
+        Api.ApiResponse holdResp = api.holdSeats(buyer.bearerToken(), event.eventId(), List.of(event.seatIds().get(0)), UUID.randomUUID());
         assertThat(holdResp.status()).isEqualTo(201);
         UUID orderId = UUID.fromString(holdResp.json().get("reservationId").asText());
         awaitOrderMaterialized(buyer, orderId, Duration.ofSeconds(15));
 
-        Api.ApiResponse checkoutResp = api.checkout(buyer.bearerToken(), orderId, UUID.randomUUID(),
-                Fixtures.TOK_ERROR);
+        Api.ApiResponse checkoutResp = api.checkout(buyer.bearerToken(), orderId, UUID.randomUUID(), Fixtures.TOK_ERROR);
         assertThat(checkoutResp.status()).isEqualTo(202);
 
         awaitOrderStatusViaGateway(buyer, orderId, "CONFIRMED", Duration.ofSeconds(30));
@@ -1873,8 +1816,8 @@ class TicketingPlatformE2ETest {
                 start, event.eventId(),
                 1, 1, 1, 0, 0,
                 orderOffsetsBefore, dltBefore, 0L, notifBefore,
-                "tok_error triggered retry topic (" + retryTopic + " countByKey=" + retryRecordCountForOrder
-                        + "), succeeded on retry with 1 charge and 0 DLT.");
+                "tok_error triggered retry topic (" + retryTopic + " countByKey=" + retryRecordCountForOrder + "), succeeded on retry with 1 charge and 0 DLT."
+        );
     }
 
     // =========================================================================
@@ -1897,15 +1840,13 @@ class TicketingPlatformE2ETest {
         Fixtures.UserFixture buyer = Fixtures.newUser(api);
 
         try {
-            Api.ApiResponse hold = api.holdSeats(buyer.bearerToken(), event.eventId(), List.of(seatId),
-                    UUID.randomUUID());
+            Api.ApiResponse hold = api.holdSeats(buyer.bearerToken(), event.eventId(), List.of(seatId), UUID.randomUUID());
             assertThat(hold.status()).isEqualTo(201);
             UUID orderId = UUID.fromString(hold.json().get("reservationId").asText());
             awaitOrderMaterialized(buyer, orderId, Duration.ofSeconds(15));
 
             stack.stop("payment-service");
-            Api.ApiResponse checkout = api.checkout(buyer.bearerToken(), orderId, UUID.randomUUID(),
-                    Fixtures.TOK_REFUND_DECLINE);
+            Api.ApiResponse checkout = api.checkout(buyer.bearerToken(), orderId, UUID.randomUUID(), Fixtures.TOK_REFUND_DECLINE);
             assertThat(checkout.status()).isEqualTo(202);
 
             Awaitility.await("order.payment.requested published while payment-service stopped")
@@ -1919,15 +1860,13 @@ class TicketingPlatformE2ETest {
             db.forceReservationExpiry(orderId);
             awaitOrderStatusViaGateway(buyer, orderId, "CANCELLED_EXPIRED", Duration.ofSeconds(25));
 
-            // Register orderId as expected to rest in REFUND_PENDING with 1 declared
-            // dead-letter record
+            // Register orderId as expected to rest in REFUND_PENDING with 1 declared dead-letter record
             registerExpectedRefundPendingOrder(orderId, 1L);
 
             stack.start("payment-service");
             stack.waitUntilHealthy("payment-service", Duration.ofSeconds(60));
 
-            // Wait for the declined refund to route to
-            // order.events-payment-service-order-cg-dlt and reach quiescence
+            // Wait for the declined refund to route to order.events-payment-service-order-cg-dlt and reach quiescence
             Awaitility.await("order.refund.requested routed to order.events-payment-service-order-cg-dlt")
                     .atMost(Duration.ofSeconds(30))
                     .pollInterval(Duration.ofMillis(250))
@@ -1972,7 +1911,8 @@ class TicketingPlatformE2ETest {
                 1, 1, 1, 0, 0, 0,
                 orderOffsetsBefore, dltBefore, 1L, notifBefore,
                 0L, true,
-                "Late payment with tok_refund_decline kept payment SUCCEEDED, order REFUND_PENDING, emitted 0 payment.refunded, and routed 1 order.refund.requested to DLT.");
+                "Late payment with tok_refund_decline kept payment SUCCEEDED, order REFUND_PENDING, emitted 0 payment.refunded, and routed 1 order.refund.requested to DLT."
+        );
     }
 
     // =========================================================================
@@ -1996,8 +1936,7 @@ class TicketingPlatformE2ETest {
         Fixtures.UserFixture userB = Fixtures.newUser(api);
         Fixtures.UserFixture userC = Fixtures.newUser(api);
 
-        // 1. User token rejected on admin routes (403 Forbidden), including when
-        // spoofing X-User-Roles: ADMIN
+        // 1. User token rejected on admin routes (403 Forbidden), including when spoofing X-User-Roles: ADMIN
         Api.ApiResponse forbiddenCreate = api.createEvent(
                 userA.bearerToken(), "Unauthorized Event", "Arena", Instant.now(), Instant.now().plusSeconds(3600));
         assertThat(forbiddenCreate.status()).isEqualTo(403);
@@ -2017,10 +1956,8 @@ class TicketingPlatformE2ETest {
         assertThat(spoofedAdminRoleStatus.status()).isEqualTo(403);
         assertThat(spoofedAdminRoleStatus.errorCode()).isEqualTo("FORBIDDEN");
 
-        // 2. Ownership check: User B cannot read or check out User A's order (with or
-        // without spoofed X-User-Id)
-        Api.ApiResponse holdA = api.holdSeats(userA.bearerToken(), event.eventId(), List.of(event.seatIds().get(0)),
-                UUID.randomUUID());
+        // 2. Ownership check: User B cannot read or check out User A's order (with or without spoofed X-User-Id)
+        Api.ApiResponse holdA = api.holdSeats(userA.bearerToken(), event.eventId(), List.of(event.seatIds().get(0)), UUID.randomUUID());
         assertThat(holdA.status()).isEqualTo(201);
         UUID orderAId = UUID.fromString(holdA.json().get("reservationId").asText());
         awaitOrderMaterialized(userA, orderAId, Duration.ofSeconds(15));
@@ -2043,8 +1980,7 @@ class TicketingPlatformE2ETest {
                 userB.bearerToken(), orderAId, UUID.randomUUID(), Fixtures.TOK_SUCCESS,
                 Map.of("X-User-Id", userA.userId().toString()));
 
-        // All return 409 ORDER_NOT_READY without leaking whether the order exists for
-        // another user
+        // All return 409 ORDER_NOT_READY without leaking whether the order exists for another user
         assertThat(crossUserCheckout.status()).isEqualTo(409);
         assertThat(crossUserCheckout.errorCode()).isEqualTo("ORDER_NOT_READY");
         assertThat(spoofedCheckout.status()).isEqualTo(unknownOrderCheckout.status()).isEqualTo(409);
@@ -2053,13 +1989,11 @@ class TicketingPlatformE2ETest {
                 .isEqualTo("ORDER_NOT_READY");
 
         // User A's order is untouched and User A can check it out normally
-        Api.ApiResponse validCheckoutA = api.checkout(userA.bearerToken(), orderAId, UUID.randomUUID(),
-                Fixtures.TOK_SUCCESS);
+        Api.ApiResponse validCheckoutA = api.checkout(userA.bearerToken(), orderAId, UUID.randomUUID(), Fixtures.TOK_SUCCESS);
         assertThat(validCheckoutA.status()).isEqualTo(202);
         awaitOrderStatusViaGateway(userA, orderAId, "CONFIRMED", Duration.ofSeconds(20));
 
-        // 3. Burst of requests from User C hits 429 with Retry-After while User B's
-        // request at the same moment succeeds
+        // 3. Burst of requests from User C hits 429 with Retry-After while User B's request at the same moment succeeds
         int rateLimitedCount = 0;
         for (int i = 0; i < 20; i++) {
             Api.ApiResponse burstResp = api.getOrder(userC.bearerToken(), orderAId);
@@ -2072,15 +2006,12 @@ class TicketingPlatformE2ETest {
                 .as("Expected User C burst of 20 requests (capacity=10) to trigger 429")
                 .isGreaterThanOrEqualTo(1);
 
-        // Immediately verify User B is unaffected by User C's rate limit and can hold &
-        // buy the second seat
-        Api.ApiResponse holdB = api.holdSeats(userB.bearerToken(), event.eventId(), List.of(event.seatIds().get(1)),
-                UUID.randomUUID());
+        // Immediately verify User B is unaffected by User C's rate limit and can hold & buy the second seat
+        Api.ApiResponse holdB = api.holdSeats(userB.bearerToken(), event.eventId(), List.of(event.seatIds().get(1)), UUID.randomUUID());
         assertThat(holdB.status()).isEqualTo(201);
         UUID orderBId = UUID.fromString(holdB.json().get("reservationId").asText());
         awaitOrderMaterialized(userB, orderBId, Duration.ofSeconds(15));
-        Api.ApiResponse checkoutB = api.checkout(userB.bearerToken(), orderBId, UUID.randomUUID(),
-                Fixtures.TOK_SUCCESS);
+        Api.ApiResponse checkoutB = api.checkout(userB.bearerToken(), orderBId, UUID.randomUUID(), Fixtures.TOK_SUCCESS);
         assertThat(checkoutB.status()).isEqualTo(202);
         awaitOrderStatusViaGateway(userB, orderBId, "CONFIRMED", Duration.ofSeconds(20));
 
@@ -2089,13 +2020,12 @@ class TicketingPlatformE2ETest {
                 start, event.eventId(),
                 3, 2, 2, 0, 0,
                 orderOffsetsBefore, dltBefore, 0L, notifBefore,
-                "RBAC & spoofed X-User-Roles: ADMIN returned 403, User B read of User A order returned 403, User B checkout of User A order returned 409 ORDER_NOT_READY, User C GET burst hit 429 ("
-                        + rateLimitedCount + "x) while User B hold+checkout succeeded.");
+                "RBAC & spoofed X-User-Roles: ADMIN returned 403, User B read of User A order returned 403, User B checkout of User A order returned 409 ORDER_NOT_READY, User C GET burst hit 429 (" + rateLimitedCount + "x) while User B hold+checkout succeeded."
+        );
     }
 
     // =========================================================================
-    // S13 — Final global audit across all databases, Kafka consumer groups, and
-    // DLTs
+    // S13 — Final global audit across all databases, Kafka consumer groups, and DLTs
     // =========================================================================
     @Test
     @Order(13)
@@ -2106,8 +2036,7 @@ class TicketingPlatformE2ETest {
         logSeed("S13", 0x5D0013L);
         Instant start = db.currentTimestampInInventoryDb();
 
-        // 1. Wait for complete global quiescence across ALL events in inventory_db,
-        // order_db, payment_db, and Kafka
+        // 1. Wait for complete global quiescence across ALL events in inventory_db, order_db, payment_db, and Kafka
         List<UUID> allEventIdsInDb = db.findEvents(null).stream().map(Db.EventRow::eventId).toList();
         quiescence.awaitForEvents(allEventIdsInDb, Duration.ofSeconds(60), true);
 
@@ -2119,19 +2048,16 @@ class TicketingPlatformE2ETest {
                     .isEqualTo(0L);
         }
 
-        // 3. Assert total DLT growth across the whole run equals sum of declared
-        // expected dead letters
+        // 3. Assert total DLT growth across the whole run equals sum of declared expected dead letters
         KafkaProbe.DltDiff globalDltDiff = kafkaProbe.diffDltOffsets(suiteStartDltSnapshot);
         assertThat(globalDltDiff.totalDelta())
                 .as("Global dead-letter growth must equal declared expected dead letters (%d), got %s",
                         totalExpectedDeadLettersAcrossSuite, globalDltDiff.deltaByTopic())
                 .isEqualTo(totalExpectedDeadLettersAcrossSuite);
 
-        // 4. Run InvariantAuditor over ALL rows of all three databases (eventIds =
-        // null)
+        // 4. Run InvariantAuditor over ALL rows of all three databases (eventIds = null)
         Notifications.NotificationSnapshot suiteEndNotifications = notifications.snapshot();
-        Notifications.NotificationSnapshot globalNotifDiff = Notifications.diff(suiteStartNotifications,
-                suiteEndNotifications);
+        Notifications.NotificationSnapshot globalNotifDiff = Notifications.diff(suiteStartNotifications, suiteEndNotifications);
 
         InvariantAuditor.AuditResult fullGlobalAudit = auditor.auditGlobalAllRows(
                 kafkaProbe,
@@ -2142,7 +2068,8 @@ class TicketingPlatformE2ETest {
                 suiteEndNotifications,
                 totalExpectedDuplicateNotificationsAcrossSuite,
                 declaredRefundPendingOrders.keySet(),
-                baselineOrderOutboxEventIds);
+                baselineOrderOutboxEventIds
+        );
 
         long durationMs = Duration.between(start, db.currentTimestampInInventoryDb()).toMillis();
 
@@ -2164,7 +2091,8 @@ class TicketingPlatformE2ETest {
                 globalDltDiff.totalDelta(),
                 totalExpectedDeadLettersAcrossSuite,
                 fullGlobalAudit,
-                "Audited all rows across inventory_db, order_db, and payment_db, all 13 Kafka consumer groups (lag=0), DLT delta, and exact notification-service counter equality."));
+                "Audited all rows across inventory_db, order_db, and payment_db, all 13 Kafka consumer groups (lag=0), DLT delta, and exact notification-service counter equality."
+        ));
 
         fullGlobalAudit.assertAllPassed();
     }

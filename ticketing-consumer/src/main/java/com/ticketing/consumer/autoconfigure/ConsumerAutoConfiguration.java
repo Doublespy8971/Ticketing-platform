@@ -79,37 +79,30 @@ import java.util.function.Consumer;
 /**
  * Spring Boot auto-configuration for {@code ticketing-consumer}:
  * <ul>
- * <li>Ordered {@code before = KafkaAutoConfiguration.class} so the consumer
- * side
- * ({@link ConsumerFactory} and {@link ConcurrentKafkaListenerContainerFactory}
- * with
- * {@code AckMode.RECORD}, {@code enable.auto.commit=false},
- * {@code isolation.level=read_committed},
- * {@code max.poll.records=100}, {@code max.poll.interval.ms=300000}, and
- * {@link CorrelationRecordInterceptor}) takes precedence over Spring Boot's
- * defaults without
- * replacing or altering the application's default {@link KafkaTemplate} or
- * {@link ProducerFactory}.</li>
- * <li>Dedicated retry/DLT {@link KafkaTemplate} ({@code acks=all},
- * {@code enable.idempotence=true})
- * encapsulated in {@link RetryKafkaTemplateHolder} so Spring Boot's default
- * {@code kafkaTemplate}
- * and {@code kafkaProducerFactory} do not back off.</li>
- * <li>Non-blocking retry topics ({@code -retry-0} at 2,000 ms, {@code -retry-1}
- * at 10,000 ms) and
- * dead-letter topic ({@code -dlt}) via
- * {@link TicketingRetryTopicNamesProviderFactory} and
- * {@link TicketingDeadLetterPublishingRecoverer}.</li>
- * <li>Lifecycle-managed {@code ticketingRetryBackoffScheduler} and
- * {@code ticketingConsumerCleanupScheduler}.</li>
+ *     <li>Ordered {@code before = KafkaAutoConfiguration.class} so the consumer side
+ *         ({@link ConsumerFactory} and {@link ConcurrentKafkaListenerContainerFactory} with
+ *         {@code AckMode.RECORD}, {@code enable.auto.commit=false}, {@code isolation.level=read_committed},
+ *         {@code max.poll.records=100}, {@code max.poll.interval.ms=300000}, and
+ *         {@link CorrelationRecordInterceptor}) takes precedence over Spring Boot's defaults without
+ *         replacing or altering the application's default {@link KafkaTemplate} or {@link ProducerFactory}.</li>
+ *     <li>Dedicated retry/DLT {@link KafkaTemplate} ({@code acks=all}, {@code enable.idempotence=true})
+ *         encapsulated in {@link RetryKafkaTemplateHolder} so Spring Boot's default {@code kafkaTemplate}
+ *         and {@code kafkaProducerFactory} do not back off.</li>
+ *     <li>Non-blocking retry topics ({@code -retry-0} at 2,000 ms, {@code -retry-1} at 10,000 ms) and
+ *         dead-letter topic ({@code -dlt}) via {@link TicketingRetryTopicNamesProviderFactory} and
+ *         {@link TicketingDeadLetterPublishingRecoverer}.</li>
+ *     <li>Lifecycle-managed {@code ticketingRetryBackoffScheduler} and {@code ticketingConsumerCleanupScheduler}.</li>
  * </ul>
  */
-@AutoConfiguration(before = KafkaAutoConfiguration.class, after = {
-        JdbcTemplateAutoConfiguration.class,
-        DataSourceTransactionManagerAutoConfiguration.class
-})
-@ConditionalOnClass({ JdbcTemplate.class, KafkaTemplate.class })
-@EnableConfigurationProperties({ ConsumerCleanupProperties.class, ConsumerTimeoutProperties.class })
+@AutoConfiguration(
+        before = KafkaAutoConfiguration.class,
+        after = {
+                JdbcTemplateAutoConfiguration.class,
+                DataSourceTransactionManagerAutoConfiguration.class
+        }
+)
+@ConditionalOnClass({JdbcTemplate.class, KafkaTemplate.class})
+@EnableConfigurationProperties({ConsumerCleanupProperties.class, ConsumerTimeoutProperties.class})
 public class ConsumerAutoConfiguration {
 
     public static final int MAX_ATTEMPTS = 3;
@@ -150,25 +143,26 @@ public class ConsumerAutoConfiguration {
     @Bean
     @ConditionalOnMissingBean
     public IdempotentEventProcessor idempotentEventProcessor(JdbcTemplate jdbcTemplate,
-            PlatformTransactionManager transactionManager,
-            ConsumerMetrics consumerMetrics,
-            ConsumerEnvelopeParser consumerEnvelopeParser) {
+                                                             PlatformTransactionManager transactionManager,
+                                                             ConsumerMetrics consumerMetrics,
+                                                             ConsumerEnvelopeParser consumerEnvelopeParser) {
         return new IdempotentEventProcessor(
                 jdbcTemplate,
                 new org.springframework.transaction.support.TransactionTemplate(transactionManager),
                 consumerMetrics,
-                consumerEnvelopeParser);
+                consumerEnvelopeParser
+        );
     }
 
     @Bean
-    public DefaultKafkaConsumerFactoryCustomizer ticketingConsumerFactoryCustomizer(
-            ConsumerTimeoutProperties timeoutProperties) {
+    public DefaultKafkaConsumerFactoryCustomizer ticketingConsumerFactoryCustomizer(ConsumerTimeoutProperties timeoutProperties) {
         return consumerFactory -> {
             Map<String, Object> overrides = new HashMap<>();
             TicketingConsumerProperties.applyConsumerSettings(
                     overrides,
                     timeoutProperties.getSessionTimeoutMs(),
-                    timeoutProperties.getHeartbeatIntervalMs());
+                    timeoutProperties.getHeartbeatIntervalMs()
+            );
             consumerFactory.updateConfigs(overrides);
         };
     }
@@ -178,8 +172,8 @@ public class ConsumerAutoConfiguration {
     public ConsumerFactory<String, String> kafkaConsumerFactory(
             @Value("${spring.kafka.bootstrap-servers:localhost:9092}") String bootstrapServers,
             ObjectProvider<DefaultKafkaConsumerFactoryCustomizer> customizers) {
-        DefaultKafkaConsumerFactory<String, String> factory = new DefaultKafkaConsumerFactory<>(
-                TicketingConsumerProperties.defaults(bootstrapServers));
+        DefaultKafkaConsumerFactory<String, String> factory =
+                new DefaultKafkaConsumerFactory<>(TicketingConsumerProperties.defaults(bootstrapServers));
         customizers.orderedStream().forEach(customizer -> customizer.customize(factory));
         return factory;
     }
@@ -199,7 +193,7 @@ public class ConsumerAutoConfiguration {
 
     @Bean(name = "kafkaListenerContainerFactory")
     @ConditionalOnMissingBean(name = "kafkaListenerContainerFactory")
-    @SuppressWarnings({ "unchecked", "rawtypes" })
+    @SuppressWarnings({"unchecked", "rawtypes"})
     public ConcurrentKafkaListenerContainerFactory<String, String> kafkaListenerContainerFactory(
             ConsumerFactory<?, ?> consumerFactory,
             ObjectProvider<RecordInterceptor<?, ?>> recordInterceptorProvider,
@@ -209,14 +203,15 @@ public class ConsumerAutoConfiguration {
             TicketingConsumerProperties.applyConsumerSettings(
                     overrides,
                     timeoutProperties.getSessionTimeoutMs(),
-                    timeoutProperties.getHeartbeatIntervalMs());
+                    timeoutProperties.getHeartbeatIntervalMs()
+            );
             defaultFactory.updateConfigs(overrides);
         }
-        ConcurrentKafkaListenerContainerFactory<String, String> factory = new ConcurrentKafkaListenerContainerFactory<>();
+        ConcurrentKafkaListenerContainerFactory<String, String> factory =
+                new ConcurrentKafkaListenerContainerFactory<>();
         factory.setConsumerFactory((ConsumerFactory) consumerFactory);
         factory.getContainerProperties().setAckMode(ContainerProperties.AckMode.RECORD);
-        RecordInterceptor recordInterceptor = recordInterceptorProvider
-                .getIfAvailable(CorrelationRecordInterceptor::new);
+        RecordInterceptor recordInterceptor = recordInterceptorProvider.getIfAvailable(CorrelationRecordInterceptor::new);
         factory.setRecordInterceptor(recordInterceptor);
         return factory;
     }
@@ -263,12 +258,9 @@ public class ConsumerAutoConfiguration {
     }
 
     /**
-     * Holds the dedicated {@link KafkaTemplate} and
-     * {@link DefaultKafkaProducerFactory} used exclusively
-     * for publishing retry ({@code -retry-0}, {@code -retry-1}) and dead-letter
-     * ({@code -dlt}) records
-     * without registering a top-level {@link KafkaTemplate} or
-     * {@link ProducerFactory} bean that would
+     * Holds the dedicated {@link KafkaTemplate} and {@link DefaultKafkaProducerFactory} used exclusively
+     * for publishing retry ({@code -retry-0}, {@code -retry-1}) and dead-letter ({@code -dlt}) records
+     * without registering a top-level {@link KafkaTemplate} or {@link ProducerFactory} bean that would
      * cause Spring Boot's {@link KafkaAutoConfiguration} defaults to back off.
      */
     public static final class RetryKafkaTemplateHolder implements DisposableBean {
@@ -312,9 +304,9 @@ public class ConsumerAutoConfiguration {
         private final RetryKafkaTemplateHolder retryKafkaTemplateHolder;
 
         RetryTopicInfrastructureConfiguration(ConsumerMetrics consumerMetrics,
-                ConsumerEnvelopeParser envelopeParser,
-                RetryTopicNamesProviderFactory namesProviderFactory,
-                RetryKafkaTemplateHolder retryKafkaTemplateHolder) {
+                                              ConsumerEnvelopeParser envelopeParser,
+                                              RetryTopicNamesProviderFactory namesProviderFactory,
+                                              RetryKafkaTemplateHolder retryKafkaTemplateHolder) {
             this.consumerMetrics = consumerMetrics;
             this.envelopeParser = envelopeParser;
             this.namesProviderFactory = namesProviderFactory;
@@ -331,17 +323,17 @@ public class ConsumerAutoConfiguration {
         protected Consumer<DeadLetterPublishingRecovererFactory> configureDeadLetterPublishingContainerFactory() {
             return factory -> {
                 factory.setRetainAllRetryHeaderValues(false);
-                factory.setPartitionResolver((consumerRecord,
-                        nextTopic) -> nextTopic != null
-                                && nextTopic.endsWith(TicketingRetryTopicNamesProviderFactory.DLT_SUFFIX)
-                                        ? -1
-                                        : consumerRecord.partition());
-                factory.setDeadLetterPublisherCreator(
-                        (templateResolver, destinationResolver) -> new TicketingDeadLetterPublishingRecoverer(
+                factory.setPartitionResolver((consumerRecord, nextTopic) ->
+                        nextTopic != null && nextTopic.endsWith(TicketingRetryTopicNamesProviderFactory.DLT_SUFFIX)
+                                ? -1
+                                : consumerRecord.partition());
+                factory.setDeadLetterPublisherCreator((templateResolver, destinationResolver) ->
+                        new TicketingDeadLetterPublishingRecoverer(
                                 retryKafkaTemplateHolder.kafkaTemplate(),
                                 destinationResolver,
                                 consumerMetrics,
-                                envelopeParser));
+                                envelopeParser
+                        ));
             };
         }
 
@@ -363,19 +355,21 @@ public class ConsumerAutoConfiguration {
                             destinationTopicProcessor,
                             factoryResolver,
                             containerFactoryConfigurer,
-                            retryTopicNamesProviderFactory) {
+                            retryTopicNamesProviderFactory
+                    ) {
                         @Override
                         protected EndpointCustomizer<MethodKafkaListenerEndpoint<?, ?>> createEndpointCustomizer(
                                 EndpointHandlerMethod endpointHandlerMethod,
                                 DestinationTopic.Properties properties) {
-                            EndpointCustomizer<MethodKafkaListenerEndpoint<?, ?>> delegate = super.createEndpointCustomizer(
-                                    endpointHandlerMethod, properties);
+                            EndpointCustomizer<MethodKafkaListenerEndpoint<?, ?>> delegate =
+                                    super.createEndpointCustomizer(endpointHandlerMethod, properties);
                             return endpoint -> {
                                 String baseGroup = TicketingRetryTopicNamesProviderFactory
                                         .validateWhitelistedConsumerGroup(endpoint.getGroupId());
                                 return TicketingRetryTopicNamesProviderFactory.withConsumerGroup(
                                         baseGroup,
-                                        () -> delegate.customizeEndpointAndCollectTopics(endpoint));
+                                        () -> delegate.customizeEndpointAndCollectTopics(endpoint)
+                                );
                             };
                         }
                     };
@@ -387,21 +381,29 @@ public class ConsumerAutoConfiguration {
         @Bean(name = "org.springframework.kafka.config.internalKafkaConsumerBackOffManager")
         public KafkaConsumerBackoffManager kafkaConsumerBackoffManager(
                 ApplicationContext applicationContext,
-                @Qualifier(KafkaListenerConfigUtils.KAFKA_LISTENER_ENDPOINT_REGISTRY_BEAN_NAME) ListenerContainerRegistry registry,
+                @Qualifier(KafkaListenerConfigUtils.KAFKA_LISTENER_ENDPOINT_REGISTRY_BEAN_NAME)
+                ListenerContainerRegistry registry,
                 ObjectProvider<RetryTopicComponentFactory> componentFactoryProvider,
                 RetryTopicSchedulerWrapper wrapper,
-                @Qualifier("ticketingRetryBackoffScheduler") TaskScheduler taskScheduler) {
+                @Qualifier("ticketingRetryBackoffScheduler")
+                TaskScheduler taskScheduler) {
             return super.kafkaConsumerBackoffManager(
                     applicationContext,
                     registry,
                     componentFactoryProvider,
                     wrapper,
-                    taskScheduler);
+                    taskScheduler
+            );
         }
     }
 
     @Configuration(proxyBeanMethods = false)
-    @ConditionalOnProperty(prefix = "ticketing.consumer.cleanup", name = "enabled", havingValue = "true", matchIfMissing = true)
+    @ConditionalOnProperty(
+            prefix = "ticketing.consumer.cleanup",
+            name = "enabled",
+            havingValue = "true",
+            matchIfMissing = true
+    )
     @EnableScheduling
     static class CleanupSchedulingConfiguration {
 
