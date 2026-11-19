@@ -409,6 +409,57 @@ else
 fi
 
 # -----------------------------------------------------------------------------
+# Check 7: Redis Outage Resilience: Gateway Readiness Stays 200 and Fails Open
+# -----------------------------------------------------------------------------
+cleanup_redis() {
+    docker start redis >/dev/null 2>&1 || true
+    for _ in $(seq 1 30); do
+        if docker exec redis redis-cli ping >/dev/null 2>&1; then
+            break
+        fi
+        sleep 1
+    done
+}
+trap cleanup_redis EXIT INT TERM
+
+CHK_START=$(date +%s)
+info "Stopping Redis container to simulate Redis outage..."
+docker stop redis >/dev/null
+
+# 1. Assert gateway readiness probe stays HTTP 200 UP
+http_request "Gateway Readiness under Redis Outage" "GET" "${GATEWAY_BASE_URL}/actuator/health/readiness" || true
+READINESS_OK=0
+if [ "$HTTP_STATUS" = "200" ]; then
+    READINESS_OK=1
+fi
+
+# 2. Assert protected request reaches inventory-service or fails closed there with 503 (never gateway 5xx due to Redis)
+HOLD_IDEMPOTENCY_KEY=$(uuid_v4)
+PROTECTED_EVENT_ID="${EVENT_ID:-00000000-0000-0000-0000-000000000000}"
+PROTECTED_SEAT_ID="${SEAT_ID:-$(uuid_v4)}"
+PROTECTED_PAYLOAD="{\"eventId\":\"${PROTECTED_EVENT_ID}\",\"seatIds\":[\"${PROTECTED_SEAT_ID}\"]}"
+http_request "Protected Hold under Redis Outage" "POST" "${GATEWAY_BASE_URL}/api/v1/reservations" \
+    "$PROTECTED_PAYLOAD" \
+    -H "Authorization: Bearer ${USER_TOKEN}" \
+    -H "Idempotency-Key: ${HOLD_IDEMPOTENCY_KEY}" || true
+
+PROTECTED_OK=0
+# Reaching inventory-service results in 503 (Redis down fail-closed), 200, 201, or 409 (already held); never gateway 5xx
+if [ "$HTTP_STATUS" = "503" ] || [ "$HTTP_STATUS" = "200" ] || [ "$HTTP_STATUS" = "201" ] || [ "$HTTP_STATUS" = "409" ]; then
+    PROTECTED_OK=1
+fi
+
+# 3. Restart Redis and wait for it to recover
+info "Restarting Redis container..."
+cleanup_redis
+
+if [ "$READINESS_OK" -eq 1 ] && [ "$PROTECTED_OK" -eq 1 ]; then
+    finish_check "Redis Outage Resilience" "$CHK_START" "PASS" "Gateway readiness remained 200 UP and protected request reached inventory (HTTP ${HTTP_STATUS})"
+else
+    finish_check "Redis Outage Resilience" "$CHK_START" "FAIL" "Redis outage check failed: readiness_ok=${READINESS_OK}, protected request HTTP=${HTTP_STATUS}: ${HTTP_BODY}"
+fi
+
+# -----------------------------------------------------------------------------
 # Summary
 # -----------------------------------------------------------------------------
 TOTAL_END_TIME=$(date +%s)

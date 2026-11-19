@@ -26,6 +26,21 @@ The ticketing platform observability stack runs alongside the 10-container appli
 7. **Grafana Provisioning & Auth**: Anonymous access is disabled (`GF_AUTH_ANONYMOUS_ENABLED=false`). Provisioning directories under `infra/observability/grafana/provisioning/` are mounted read-only and intentionally empty until dashboards are added. Development-only credentials are sourced from `infra/.env` (`infra/.env.example`).
 8. **Optional / Lazy Metrics**: Metrics that require fault injection, dead letters, duplicate redelivery, or Go non-HTTP server design are allowlisted with one-line justifications in `scripts/metrics-optional.txt`.
 
+### Health and Readiness Semantics
+
+Probes determine traffic routing (readiness) and container restarts (liveness). Spring Boot health groups configure probe membership explicitly to avoid cascading total platform outages when non-critical dependencies fluctuate:
+
+| Service | Liveness Includes | Readiness Includes | Excluded / Rationale |
+| :--- | :--- | :--- | :--- |
+| `gateway-service` (`:8080`) | `livenessState` | `readinessState` | `redis` excluded (rate limiting deliberately fails open; a Redis outage must not evict gateway pods); downstream HTTP reachability excluded; Kafka not used |
+| `inventory-service` (`:8081`) | `livenessState` | `readinessState`, `db`, `redis` | Keeps DB and Redis (concurrency seat hold gate fails closed without Redis or DB); Kafka excluded (outbox buffers events asynchronously) |
+| `order-service` (`:8082`) | `livenessState` | `readinessState`, `db` | Keeps DB (fails closed without DB); Kafka excluded (outbox buffers events asynchronously); Redis not used |
+| `payment-service` (`:8083`) | `livenessState` | `readinessState`, `db` | Keeps DB (fails closed without DB); Kafka excluded (outbox buffers events asynchronously); Redis not used |
+| `notification-service` (`:8084`) | Process liveness | Redis, Kafka | Go worker readiness checks Redis (dedup) and Kafka broker connectivity |
+
+- **Aggregate Health (`/actuator/health`)**: Remains available on all services with `show-details: never`. Its aggregate status reflects all components (e.g. status `DOWN` 503 if Redis or DB is unreachable) for infrastructure observability and Prometheus alerting.
+- **Dedicated Probes (`/actuator/health/readiness` & `/actuator/health/liveness`)**: In Kubernetes and Docker orchestrators, pods route traffic based solely on `/actuator/health/readiness`. When Redis experiences an outage, `gateway-service` remains `UP` (HTTP 200) and serves requests with rate limits failed open.
+
 ---
 
 ## 2. How to Start & Verify

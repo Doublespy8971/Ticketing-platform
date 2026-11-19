@@ -44,12 +44,12 @@ groups:
       - alert: Gateway5xxRatioHigh
         expr: |
           (
-            sum(rate(gateway_requests_total{service="gateway-service",route!="actuator",status_class="5xx"}[5m]))
+            sum(rate(gateway_requests_total{service="gateway-service",status_class="5xx"}[5m]))
             /
-            sum(rate(gateway_requests_total{service="gateway-service",route!="actuator"}[5m]))
+            sum(rate(gateway_requests_total{service="gateway-service"}[5m]))
           ) > 0.01
           and
-          sum(rate(gateway_requests_total{service="gateway-service",route!="actuator"}[5m])) > 0.1
+          sum(rate(gateway_requests_total{service="gateway-service"}[5m])) > 0.1
         for: 2m
         labels:
           severity: critical

@@ -130,13 +130,27 @@ All custom metrics use the `ticketing_` prefix, lowercase `snake_case`, and base
 
 ### 10.5 Health & Observability Endpoints
 
-| Service | Liveness Endpoint | Readiness Endpoint (Checks DB / Redis / Kafka) | Prometheus Metrics Endpoint |
+| Service | Liveness Endpoint | Readiness Endpoint | Prometheus Metrics Endpoint |
 | :--- | :--- | :--- | :--- |
-| `gateway-service` (`:8080`) | `GET /actuator/health/liveness` | `GET /actuator/health/readiness` (Redis 7) | `GET /actuator/prometheus` |
-| `inventory-service` (`:8081`) | `GET /actuator/health/liveness` | `GET /actuator/health/readiness` (`inventory_db`, Redis 7, Kafka) | `GET /actuator/prometheus` |
-| `order-service` (`:8082`) | `GET /actuator/health/liveness` | `GET /actuator/health/readiness` (`order_db`, Kafka) | `GET /actuator/prometheus` |
-| `payment-service` (`:8083`) | `GET /actuator/health/liveness` | `GET /actuator/health/readiness` (`payment_db`, Kafka) | `GET /actuator/prometheus` |
-| `notification-service` (`:8084`) | `GET /health/liveness` | `GET /health/readiness` (Redis 7, Kafka) | `GET /metrics` |
+| `gateway-service` (`:8080`) | `GET /actuator/health/liveness` | `GET /actuator/health/readiness` | `GET /actuator/prometheus` |
+| `inventory-service` (`:8081`) | `GET /actuator/health/liveness` | `GET /actuator/health/readiness` | `GET /actuator/prometheus` |
+| `order-service` (`:8082`) | `GET /actuator/health/liveness` | `GET /actuator/health/readiness` | `GET /actuator/prometheus` |
+| `payment-service` (`:8083`) | `GET /actuator/health/liveness` | `GET /actuator/health/readiness` | `GET /actuator/prometheus` |
+| `notification-service` (`:8084`) | `GET /health/liveness` | `GET /health/readiness` | `GET /metrics` |
+
+#### Health and Readiness Semantics
+
+Readiness probes indicate whether a service replica can accept incoming traffic without causing avoidable outages. Liveness probes indicate whether the process is alive or deadlocked.
+
+| Service | Liveness Includes | Readiness Includes | Excluded / Rationale |
+| :--- | :--- | :--- | :--- |
+| `gateway-service` (`:8080`) | `livenessState` | `readinessState` | `redis` excluded (rate limiting deliberately fails open; a Redis outage must not evict gateway pods); downstream HTTP reachability excluded; Kafka not used |
+| `inventory-service` (`:8081`) | `livenessState` | `readinessState`, `db`, `redis` | Keeps DB and Redis (concurrency seat hold gate fails closed without Redis or DB); Kafka excluded (outbox buffers events asynchronously) |
+| `order-service` (`:8082`) | `livenessState` | `readinessState`, `db` | Keeps DB (fails closed without DB); Kafka excluded (outbox buffers events asynchronously); Redis not used |
+| `payment-service` (`:8083`) | `livenessState` | `readinessState`, `db` | Keeps DB (fails closed without DB); Kafka excluded (outbox buffers events asynchronously); Redis not used |
+| `notification-service` (`:8084`) | Process liveness | Redis, Kafka | Go worker readiness checks Redis (dedup) and Kafka broker connectivity |
+
+> **Aggregate Health vs Probe Groups**: In all Java services, the aggregate endpoint `GET /actuator/health` reflects the overall health of all components (including `db`, `redis`, `diskSpace`) with `show-details: never` so external monitoring can observe component state. Container orchestrators (Kubernetes / Docker) use the dedicated probe groups (`/actuator/health/readiness` and `/actuator/health/liveness`) to manage traffic routing and container lifecycles.
 
 > **Production Management Port Rule**: In production (`prod` profile), `gateway-service` binds actuator endpoints to a dedicated internal management port (`management.server.port: 8085`) exposing only `health`, `info`, and `prometheus`. Port 8085 must never be exposed publicly. Health component details are disabled (`management.endpoint.health.show-details: never`). Netty limits: `connection-timeout: 5s`, `idle-timeout: 15s`, `max-http-request-header-size: 16KB`.
 

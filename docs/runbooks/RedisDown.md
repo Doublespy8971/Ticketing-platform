@@ -5,6 +5,7 @@
 
 ## Impact
 Seat hold concurrency gate fails closed (503), rate limiting degrades/blocks, and notification dedup stalls.
+**Gateway behavior**: `gateway-service` keeps serving with rate limits failed open; its readiness probe (`/actuator/health/readiness`) stays `UP` (HTTP 200) so gateway pods are not removed from rotation during Redis outages.
 
 ## Diagnose
 ```bash
@@ -14,7 +15,7 @@ docker compose -f infra/docker-compose.yml exec redis redis-cli ping
 ```
 
 ## Mitigate
-Restart `redis` (`docker compose -f infra/docker-compose.yml up -d redis`) and verify `inventory-service` / `notification-service` readiness probes recover.
+Restart `redis` (`docker compose -f infra/docker-compose.yml up -d redis`) and verify `inventory-service` / `notification-service` readiness probes recover. Gateway readiness stays `UP` throughout.
 
 ## Related scenario
 `INV-001` (Redis dependency failure).
