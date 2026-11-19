@@ -1,12 +1,15 @@
 COMPOSE := docker compose -f infra/docker-compose.yml
 COMPOSE_FULL := docker compose -f infra/docker-compose.yml -f infra/docker-compose.full.yml
+COMPOSE_OBS := docker compose -f infra/docker-compose.yml -f infra/docker-compose.full.yml -f infra/docker-compose.observability.yml
 HEALTHY_SERVICES := kafka postgres-inventory postgres-order postgres-payment redis
 APP_SERVICES := gateway-service inventory-service order-service payment-service notification-service
+OBS_SERVICES := prometheus grafana kafka-exporter redis-exporter postgres-inventory-exporter postgres-order-exporter postgres-payment-exporter
 
 .PHONY: infra-up infra-down infra-reset infra-topics infra-psql-inventory infra-psql-order infra-psql-payment infra-redis-cli \
         smoke-inventory smoke-order smoke-payment smoke-gateway run-gateway smoke-notification run-notification \
         stack-build stack-up stack-down stack-reset stack-logs stack-ps smoke-all smoke-selftest \
-        e2e e2e-fast e2e-chaos e2e-full
+        e2e e2e-fast e2e-chaos e2e-full \
+        obs-up obs-down obs-reset obs-urls obs-rules-check obs-targets-check metrics-check
 
 infra-up:
 	@test -f infra/.env || cp infra/.env.example infra/.env
@@ -99,10 +102,10 @@ stack-up:
 	done
 
 stack-down:
-	$(COMPOSE_FULL) down
+	$(COMPOSE_OBS) down
 
 stack-reset:
-	$(COMPOSE_FULL) down -v
+	$(COMPOSE_OBS) down -v
 	$(MAKE) stack-up
 
 stack-logs:
@@ -167,6 +170,35 @@ e2e-full:
 	$(MAKE) stack-reset
 	$(MAKE) e2e
 	@echo "E2E report written to: $$(pwd)/e2e-tests/target/e2e-report.md"
+
+obs-up:
+	@test -f infra/.env || cp infra/.env.example infra/.env
+	$(COMPOSE_OBS) up -d --wait
+	@echo "[OK] Stack + observability services are healthy!"
+	@$(MAKE) --no-print-directory obs-urls
+
+obs-down:
+	$(COMPOSE_OBS) rm -s -f $(OBS_SERVICES)
+
+obs-reset:
+	$(COMPOSE_OBS) rm -s -f -v $(OBS_SERVICES)
+	docker volume rm -f ticketing-infra_prometheus-data ticketing-infra_grafana-data 2>/dev/null || true
+	$(MAKE) obs-up
+
+obs-urls:
+	@echo "Observability URLs (bound to 127.0.0.1 only):"
+	@echo "  Prometheus: http://127.0.0.1:9090"
+	@echo "  Grafana:    http://127.0.0.1:3000 (credentials in infra/.env)"
+
+obs-rules-check:
+	docker run --rm --entrypoint promtool -v "$(CURDIR)/infra/observability/prometheus:/etc/prometheus:ro" prom/prometheus:v2.55.1 check config /etc/prometheus/prometheus.yml
+	docker run --rm --entrypoint promtool -v "$(CURDIR)/infra/observability/prometheus:/etc/prometheus:ro" prom/prometheus:v2.55.1 check rules /etc/prometheus/rules/slo.rules.yml /etc/prometheus/rules/alerts.rules.yml
+
+obs-targets-check:
+	bash scripts/check-obs-targets.sh
+
+metrics-check:
+	bash scripts/check-metrics.sh
 
 
 

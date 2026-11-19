@@ -1,0 +1,294 @@
+groups:
+  - name: ticketing_slo_recording_rules
+    rules:
+      # -----------------------------------------------------------------------
+      # 1. Seat Hold Availability SLI (docs/arch/09-conventions.md: target >= 99.95%, error budget 0.0005)
+      # -----------------------------------------------------------------------
+      - record: sli:hold_availability_error_ratio:rate5m
+        expr: |
+          (
+            sum(rate(http_server_requests_seconds_count{service="inventory-service",uri="/api/v1/reservations",method="POST",status=~"5.."}[5m]))
+            or
+            (sum(rate(http_server_requests_seconds_count{service="inventory-service",uri="/api/v1/reservations",method="POST"}[5m])) * 0)
+          )
+          /
+          (sum(rate(http_server_requests_seconds_count{service="inventory-service",uri="/api/v1/reservations",method="POST"}[5m])) > 0)
+
+      - record: sli:hold_availability_error_ratio:rate30m
+        expr: |
+          (
+            sum(rate(http_server_requests_seconds_count{service="inventory-service",uri="/api/v1/reservations",method="POST",status=~"5.."}[30m]))
+            or
+            (sum(rate(http_server_requests_seconds_count{service="inventory-service",uri="/api/v1/reservations",method="POST"}[30m])) * 0)
+          )
+          /
+          (sum(rate(http_server_requests_seconds_count{service="inventory-service",uri="/api/v1/reservations",method="POST"}[30m])) > 0)
+
+      - record: sli:hold_availability_error_ratio:rate1h
+        expr: |
+          (
+            sum(rate(http_server_requests_seconds_count{service="inventory-service",uri="/api/v1/reservations",method="POST",status=~"5.."}[1h]))
+            or
+            (sum(rate(http_server_requests_seconds_count{service="inventory-service",uri="/api/v1/reservations",method="POST"}[1h])) * 0)
+          )
+          /
+          (sum(rate(http_server_requests_seconds_count{service="inventory-service",uri="/api/v1/reservations",method="POST"}[1h])) > 0)
+
+      - record: sli:hold_availability_error_ratio:rate6h
+        expr: |
+          (
+            sum(rate(http_server_requests_seconds_count{service="inventory-service",uri="/api/v1/reservations",method="POST",status=~"5.."}[6h]))
+            or
+            (sum(rate(http_server_requests_seconds_count{service="inventory-service",uri="/api/v1/reservations",method="POST"}[6h])) * 0)
+          )
+          /
+          (sum(rate(http_server_requests_seconds_count{service="inventory-service",uri="/api/v1/reservations",method="POST"}[6h])) > 0)
+
+      - record: sli:hold_availability_error_ratio:rate30d
+        expr: |
+          (
+            sum(rate(http_server_requests_seconds_count{service="inventory-service",uri="/api/v1/reservations",method="POST",status=~"5.."}[30d]))
+            or
+            (sum(rate(http_server_requests_seconds_count{service="inventory-service",uri="/api/v1/reservations",method="POST"}[30d])) * 0)
+          )
+          /
+          (sum(rate(http_server_requests_seconds_count{service="inventory-service",uri="/api/v1/reservations",method="POST"}[30d])) > 0)
+
+      - record: sli:hold_availability:ratio5m
+        expr: 1 - sli:hold_availability_error_ratio:rate5m
+
+      - record: sli:hold_availability:ratio30m
+        expr: 1 - sli:hold_availability_error_ratio:rate30m
+
+      - record: sli:hold_availability:ratio1h
+        expr: 1 - sli:hold_availability_error_ratio:rate1h
+
+      - record: sli:hold_availability:ratio6h
+        expr: 1 - sli:hold_availability_error_ratio:rate6h
+
+      - record: slo:hold_availability:error_budget_remaining_ratio30d
+        expr: 1 - (sli:hold_availability_error_ratio:rate30d / 0.0005)
+
+      - record: slo:hold_availability:burnrate_fast
+        expr: |
+          (sli:hold_availability_error_ratio:rate5m > bool (14.4 * 0.0005))
+          *
+          (sli:hold_availability_error_ratio:rate1h > bool (14.4 * 0.0005))
+
+      - record: slo:hold_availability:burnrate_slow
+        expr: |
+          (sli:hold_availability_error_ratio:rate30m > bool (6 * 0.0005))
+          *
+          (sli:hold_availability_error_ratio:rate6h > bool (6 * 0.0005))
+
+      # -----------------------------------------------------------------------
+      # 2. Seat Hold Latency (201 Created): target p95 <= 45ms, p99 <= 120ms
+      # -----------------------------------------------------------------------
+      - record: sli:hold_201_latency_seconds:p95_5m
+        expr: |
+          histogram_quantile(0.95,
+            sum by (le) (rate(http_server_requests_seconds_bucket{service="inventory-service",uri="/api/v1/reservations",method="POST",status="201"}[5m]))
+          )
+
+      - record: sli:hold_201_latency_seconds:p99_5m
+        expr: |
+          histogram_quantile(0.99,
+            sum by (le) (rate(http_server_requests_seconds_bucket{service="inventory-service",uri="/api/v1/reservations",method="POST",status="201"}[5m]))
+          )
+
+      - record: sli:hold_201_latency_seconds:p99_30m
+        expr: |
+          histogram_quantile(0.99,
+            sum by (le) (rate(http_server_requests_seconds_bucket{service="inventory-service",uri="/api/v1/reservations",method="POST",status="201"}[30m]))
+          )
+
+      - record: sli:hold_201_latency_seconds:p99_1h
+        expr: |
+          histogram_quantile(0.99,
+            sum by (le) (rate(http_server_requests_seconds_bucket{service="inventory-service",uri="/api/v1/reservations",method="POST",status="201"}[1h]))
+          )
+
+      - record: sli:hold_201_latency_seconds:p99_6h
+        expr: |
+          histogram_quantile(0.99,
+            sum by (le) (rate(http_server_requests_seconds_bucket{service="inventory-service",uri="/api/v1/reservations",method="POST",status="201"}[6h]))
+          )
+
+      # -----------------------------------------------------------------------
+      # 3. Seat Hold Fast-Reject Latency (409 Conflict): target p95 <= 8ms, p99 <= 20ms
+      # -----------------------------------------------------------------------
+      - record: sli:hold_409_latency_seconds:p95_5m
+        expr: |
+          histogram_quantile(0.95,
+            sum by (le) (rate(http_server_requests_seconds_bucket{service="inventory-service",uri="/api/v1/reservations",method="POST",status="409"}[5m]))
+          )
+
+      - record: sli:hold_409_latency_seconds:p99_5m
+        expr: |
+          histogram_quantile(0.99,
+            sum by (le) (rate(http_server_requests_seconds_bucket{service="inventory-service",uri="/api/v1/reservations",method="POST",status="409"}[5m]))
+          )
+
+      - record: sli:hold_409_latency_seconds:p99_30m
+        expr: |
+          histogram_quantile(0.99,
+            sum by (le) (rate(http_server_requests_seconds_bucket{service="inventory-service",uri="/api/v1/reservations",method="POST",status="409"}[30m]))
+          )
+
+      - record: sli:hold_409_latency_seconds:p99_1h
+        expr: |
+          histogram_quantile(0.99,
+            sum by (le) (rate(http_server_requests_seconds_bucket{service="inventory-service",uri="/api/v1/reservations",method="POST",status="409"}[1h]))
+          )
+
+      - record: sli:hold_409_latency_seconds:p99_6h
+        expr: |
+          histogram_quantile(0.99,
+            sum by (le) (rate(http_server_requests_seconds_bucket{service="inventory-service",uri="/api/v1/reservations",method="POST",status="409"}[6h]))
+          )
+
+      # -----------------------------------------------------------------------
+      # 4. Order Checkout Availability SLI (docs/arch/09-conventions.md: target >= 99.95%, error budget 0.0005)
+      # -----------------------------------------------------------------------
+      - record: sli:checkout_availability_error_ratio:rate5m
+        expr: |
+          (
+            sum(rate(http_server_requests_seconds_count{service="order-service",uri="/api/v1/orders/{orderId}/checkout",method="POST",status=~"5.."}[5m]))
+            or
+            (sum(rate(http_server_requests_seconds_count{service="order-service",uri="/api/v1/orders/{orderId}/checkout",method="POST"}[5m])) * 0)
+          )
+          /
+          (sum(rate(http_server_requests_seconds_count{service="order-service",uri="/api/v1/orders/{orderId}/checkout",method="POST"}[5m])) > 0)
+
+      - record: sli:checkout_availability_error_ratio:rate30m
+        expr: |
+          (
+            sum(rate(http_server_requests_seconds_count{service="order-service",uri="/api/v1/orders/{orderId}/checkout",method="POST",status=~"5.."}[30m]))
+            or
+            (sum(rate(http_server_requests_seconds_count{service="order-service",uri="/api/v1/orders/{orderId}/checkout",method="POST"}[30m])) * 0)
+          )
+          /
+          (sum(rate(http_server_requests_seconds_count{service="order-service",uri="/api/v1/orders/{orderId}/checkout",method="POST"}[30m])) > 0)
+
+      - record: sli:checkout_availability_error_ratio:rate1h
+        expr: |
+          (
+            sum(rate(http_server_requests_seconds_count{service="order-service",uri="/api/v1/orders/{orderId}/checkout",method="POST",status=~"5.."}[1h]))
+            or
+            (sum(rate(http_server_requests_seconds_count{service="order-service",uri="/api/v1/orders/{orderId}/checkout",method="POST"}[1h])) * 0)
+          )
+          /
+          (sum(rate(http_server_requests_seconds_count{service="order-service",uri="/api/v1/orders/{orderId}/checkout",method="POST"}[1h])) > 0)
+
+      - record: sli:checkout_availability_error_ratio:rate6h
+        expr: |
+          (
+            sum(rate(http_server_requests_seconds_count{service="order-service",uri="/api/v1/orders/{orderId}/checkout",method="POST",status=~"5.."}[6h]))
+            or
+            (sum(rate(http_server_requests_seconds_count{service="order-service",uri="/api/v1/orders/{orderId}/checkout",method="POST"}[6h])) * 0)
+          )
+          /
+          (sum(rate(http_server_requests_seconds_count{service="order-service",uri="/api/v1/orders/{orderId}/checkout",method="POST"}[6h])) > 0)
+
+      - record: sli:checkout_availability_error_ratio:rate30d
+        expr: |
+          (
+            sum(rate(http_server_requests_seconds_count{service="order-service",uri="/api/v1/orders/{orderId}/checkout",method="POST",status=~"5.."}[30d]))
+            or
+            (sum(rate(http_server_requests_seconds_count{service="order-service",uri="/api/v1/orders/{orderId}/checkout",method="POST"}[30d])) * 0)
+          )
+          /
+          (sum(rate(http_server_requests_seconds_count{service="order-service",uri="/api/v1/orders/{orderId}/checkout",method="POST"}[30d])) > 0)
+
+      - record: sli:checkout_availability:ratio5m
+        expr: 1 - sli:checkout_availability_error_ratio:rate5m
+
+      - record: sli:checkout_availability:ratio30m
+        expr: 1 - sli:checkout_availability_error_ratio:rate30m
+
+      - record: sli:checkout_availability:ratio1h
+        expr: 1 - sli:checkout_availability_error_ratio:rate1h
+
+      - record: sli:checkout_availability:ratio6h
+        expr: 1 - sli:checkout_availability_error_ratio:rate6h
+
+      - record: slo:checkout_availability:error_budget_remaining_ratio30d
+        expr: 1 - (sli:checkout_availability_error_ratio:rate30d / 0.0005)
+
+      - record: slo:checkout_availability:burnrate_fast
+        expr: |
+          (sli:checkout_availability_error_ratio:rate5m > bool (14.4 * 0.0005))
+          *
+          (sli:checkout_availability_error_ratio:rate1h > bool (14.4 * 0.0005))
+
+      - record: slo:checkout_availability:burnrate_slow
+        expr: |
+          (sli:checkout_availability_error_ratio:rate30m > bool (6 * 0.0005))
+          *
+          (sli:checkout_availability_error_ratio:rate6h > bool (6 * 0.0005))
+
+      # -----------------------------------------------------------------------
+      # 5. Order Checkout Latency (202 Accepted): target p95 <= 50ms, p99 <= 150ms
+      # -----------------------------------------------------------------------
+      - record: sli:checkout_202_latency_seconds:p95_5m
+        expr: |
+          histogram_quantile(0.95,
+            sum by (le) (rate(http_server_requests_seconds_bucket{service="order-service",uri="/api/v1/orders/{orderId}/checkout",method="POST",status="202"}[5m]))
+          )
+
+      - record: sli:checkout_202_latency_seconds:p99_5m
+        expr: |
+          histogram_quantile(0.99,
+            sum by (le) (rate(http_server_requests_seconds_bucket{service="order-service",uri="/api/v1/orders/{orderId}/checkout",method="POST",status="202"}[5m]))
+          )
+
+      - record: sli:checkout_202_latency_seconds:p99_30m
+        expr: |
+          histogram_quantile(0.99,
+            sum by (le) (rate(http_server_requests_seconds_bucket{service="order-service",uri="/api/v1/orders/{orderId}/checkout",method="POST",status="202"}[30m]))
+          )
+
+      - record: sli:checkout_202_latency_seconds:p99_1h
+        expr: |
+          histogram_quantile(0.99,
+            sum by (le) (rate(http_server_requests_seconds_bucket{service="order-service",uri="/api/v1/orders/{orderId}/checkout",method="POST",status="202"}[1h]))
+          )
+
+      - record: sli:checkout_202_latency_seconds:p99_6h
+        expr: |
+          histogram_quantile(0.99,
+            sum by (le) (rate(http_server_requests_seconds_bucket{service="order-service",uri="/api/v1/orders/{orderId}/checkout",method="POST",status="202"}[6h]))
+          )
+
+      # -----------------------------------------------------------------------
+      # 6. Order Materialization Lag: target p95 <= 350ms, p99 <= 800ms
+      # -----------------------------------------------------------------------
+      - record: sli:order_materialization_lag_seconds:p95_5m
+        expr: |
+          histogram_quantile(0.95,
+            sum by (le) (rate(ticketing_orders_materialization_lag_seconds_bucket{service="order-service"}[5m]))
+          )
+
+      - record: sli:order_materialization_lag_seconds:p99_5m
+        expr: |
+          histogram_quantile(0.99,
+            sum by (le) (rate(ticketing_orders_materialization_lag_seconds_bucket{service="order-service"}[5m]))
+          )
+
+      - record: sli:order_materialization_lag_seconds:p99_30m
+        expr: |
+          histogram_quantile(0.99,
+            sum by (le) (rate(ticketing_orders_materialization_lag_seconds_bucket{service="order-service"}[30m]))
+          )
+
+      - record: sli:order_materialization_lag_seconds:p99_1h
+        expr: |
+          histogram_quantile(0.99,
+            sum by (le) (rate(ticketing_orders_materialization_lag_seconds_bucket{service="order-service"}[1h]))
+          )
+
+      - record: sli:order_materialization_lag_seconds:p99_6h
+        expr: |
+          histogram_quantile(0.99,
+            sum by (le) (rate(ticketing_orders_materialization_lag_seconds_bucket{service="order-service"}[6h]))
+          )

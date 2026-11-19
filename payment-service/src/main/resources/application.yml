@@ -36,7 +36,20 @@ ticketing:
         max-latency-ms: ${MOCK_PAYMENT_MAX_LATENCY_MS:300}
 
 management:
+  metrics:
+    tags:
+      service: payment-service
+    distribution:
+      percentiles-histogram:
+        http.server.requests: true
+      slo:
+        http.server.requests: 25ms,50ms,100ms,250ms,500ms,1s,2500ms,5s
   endpoints:
     web:
       exposure:
         include: health,info,prometheus
+  endpoint:
+    health:
+      show-details: never
+      probes:
+        enabled: true

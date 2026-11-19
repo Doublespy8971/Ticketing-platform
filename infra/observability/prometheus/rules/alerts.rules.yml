@@ -1,0 +1,212 @@
+groups:
+  - name: ticketing_platform_alerts
+    rules:
+      - alert: ServiceDown
+        expr: up == 0
+        for: 1m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Target {{ $labels.job }} ({{ $labels.instance }}) is down"
+          description: "Prometheus scrape target {{ $labels.job }} at {{ $labels.instance }} has been unreachable for more than 1 minute."
+          runbook_url: "docs/runbooks/ServiceDown.md"
+
+      - alert: HoldSLOFastBurn
+        expr: slo:hold_availability:burnrate_fast == 1
+        for: 2m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Seat hold SLO fast error-budget burn (14.4x over 5m & 1h)"
+          description: "POST /api/v1/reservations is burning error budget at >=14.4x across both 5m and 1h windows."
+          runbook_url: "docs/runbooks/HoldSLOFastBurn.md"
+
+      - alert: HoldSLOSlowBurn
+        expr: slo:hold_availability:burnrate_slow == 1
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Seat hold SLO slow error-budget burn (6x over 30m & 6h)"
+          description: "POST /api/v1/reservations is burning error budget at >=6x across both 30m and 6h windows."
+          runbook_url: "docs/runbooks/HoldSLOSlowBurn.md"
+
+      - alert: CheckoutSLOFastBurn
+        expr: slo:checkout_availability:burnrate_fast == 1
+        for: 2m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Order checkout SLO fast error-budget burn (14.4x over 5m & 1h)"
+          description: "POST /api/v1/orders/{orderId}/checkout is burning error budget at >=14.4x across both 5m and 1h windows."
+          runbook_url: "docs/runbooks/CheckoutSLOFastBurn.md"
+
+      - alert: Gateway5xxRatioHigh
+        expr: |
+          (
+            sum(rate(gateway_requests_total{service="gateway-service",route!="actuator",status_class="5xx"}[5m]))
+            /
+            sum(rate(gateway_requests_total{service="gateway-service",route!="actuator"}[5m]))
+          ) > 0.01
+          and
+          sum(rate(gateway_requests_total{service="gateway-service",route!="actuator"}[5m])) > 0.1
+        for: 2m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Gateway 5xx error ratio above 1%"
+          description: "More than 1% of requests handled by gateway-service are failing with 5xx responses over the last 5 minutes."
+          runbook_url: "docs/runbooks/Gateway5xxRatioHigh.md"
+
+      - alert: Gateway429Spike
+        expr: sum(rate(gateway_rate_limited_total{service="gateway-service"}[5m])) > 1
+        for: 2m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Spike in Gateway HTTP 429 rate-limited requests"
+          description: "gateway-service is rejecting >1 req/s with HTTP 429 over 2 minutes."
+          runbook_url: "docs/runbooks/Gateway429Spike.md"
+
+      - alert: DeadLetterGrowth
+        expr: sum by (topic) (increase(kafka_topic_partition_current_offset{topic=~".*-dlt"}[5m])) > 0
+        for: 0m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Dead-letter topic {{ $labels.topic }} received new record(s)"
+          description: "End offset of dead-letter topic {{ $labels.topic }} increased in the last 5 minutes."
+          runbook_url: "docs/runbooks/DeadLetterGrowth.md"
+
+      - alert: RetryTopicBacklog
+        expr: sum by (topic, consumergroup) (kafka_consumergroup_lag{topic=~".*-retry-[01]"} > 0) > 0
+        for: 2m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Unconsumed backlog on retry topic {{ $labels.topic }}"
+          description: "Consumer group {{ $labels.consumergroup }} has persistent lag on retry topic {{ $labels.topic }} for 2 minutes."
+          runbook_url: "docs/runbooks/RetryTopicBacklog.md"
+
+      - alert: ConsumerLagHigh
+        expr: sum by (consumergroup, topic) (kafka_consumergroup_lag > 0) > 100
+        for: 2m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Kafka consumer lag > 100 on {{ $labels.consumergroup }} ({{ $labels.topic }})"
+          description: "Consumer group {{ $labels.consumergroup }} has lag > 100 messages on topic {{ $labels.topic }} for more than 2 minutes."
+          runbook_url: "docs/runbooks/ConsumerLagHigh.md"
+
+      - alert: OutboxStuck
+        expr: outbox_oldest_pending_age_seconds > 30
+        for: 1m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Outbox publisher stuck in {{ $labels.service }}"
+          description: "Oldest unpublished row in outbox_events for {{ $labels.service }} is older than 30s for 1 minute."
+          runbook_url: "docs/runbooks/OutboxStuck.md"
+
+      - alert: OutboxPendingGrowing
+        expr: ticketing_outbox_unpublished_records > 50 and deriv(ticketing_outbox_unpublished_records[5m]) > 0
+        for: 2m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Pending outbox queue growing in {{ $labels.service }}"
+          description: "Unpublished outbox records exceed 50 and continue growing in {{ $labels.service }}."
+          runbook_url: "docs/runbooks/OutboxPendingGrowing.md"
+
+      - alert: ExpirySweeperBehind
+        expr: inventory_oldest_overdue_hold_seconds{service="inventory-service"} > 90
+        for: 1m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Hold expiry sweeper behind in inventory-service"
+          description: "Oldest overdue HELD reservation in inventory_db exceeds 90s for more than 1 minute."
+          runbook_url: "docs/runbooks/ExpirySweeperBehind.md"
+
+      - alert: RedisGateUnavailable
+        expr: sum(rate(inventory_redis_unavailable_total{service="inventory-service"}[2m])) > 0
+        for: 1m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Inventory Redis concurrency gate unavailable"
+          description: "inventory-service is failing closed with HTTP 503 due to Redis unavailability in hold_inventory.lua."
+          runbook_url: "docs/runbooks/RedisGateUnavailable.md"
+
+      - alert: RedisDown
+        expr: redis_up == 0
+        for: 30s
+        labels:
+          severity: critical
+        annotations:
+          summary: "Redis instance is down"
+          description: "redis_exporter reports redis_up == 0 for at least 30 seconds."
+          runbook_url: "docs/runbooks/RedisDown.md"
+
+      - alert: PaymentProviderErrors
+        expr: sum(rate(payment_provider_calls_total{service="payment-service",outcome="error"}[5m])) > 0.05
+        for: 2m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Elevated payment provider technical errors"
+          description: "payment-service technical error rate from the payment provider exceeds 0.05/s over 2 minutes."
+          runbook_url: "docs/runbooks/PaymentProviderErrors.md"
+
+      - alert: PaymentRefundDeclined
+        expr: sum(increase(payment_refund_declined_total{service="payment-service"}[5m])) > 0
+        for: 0m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Compensating payment refund declined"
+          description: "payment-service recorded a declined refund requiring manual reconciliation of REFUND_PENDING orders."
+          runbook_url: "docs/runbooks/PaymentRefundDeclined.md"
+
+      - alert: NotificationFailures
+        expr: sum(rate(notification_events_total{service="notification-service",outcome="failed"}[5m])) > 0
+        for: 1m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Notification dispatch failures detected"
+          description: "notification-service is exhausting send retries and dropping notifications (at-most-once)."
+          runbook_url: "docs/runbooks/NotificationFailures.md"
+
+      - alert: NotificationServiceStalled
+        expr: |
+          sum(kafka_consumergroup_lag{consumergroup="notification-service-order-cg",topic="order.events"} > 0) > 0
+          and
+          (sum(increase(notification_events_total{service="notification-service",outcome="sent"}[5m])) or vector(0)) == 0
+        for: 1m
+        labels:
+          severity: critical
+        annotations:
+          summary: "notification-service appears stalled with unread order.events lag"
+          description: "Consumer group notification-service-order-cg has lag > 0 while zero notifications were sent in the last 5 minutes."
+          runbook_url: "docs/runbooks/NotificationServiceStalled.md"
+
+      - alert: PostgresDown
+        expr: pg_up == 0
+        for: 30s
+        labels:
+          severity: critical
+        annotations:
+          summary: "PostgreSQL instance down ({{ $labels.job }})"
+          description: "postgres_exporter ({{ $labels.job }}) reports pg_up == 0 for more than 30 seconds."
+          runbook_url: "docs/runbooks/PostgresDown.md"
+
+      - alert: KafkaBrokerDown
+        expr: kafka_brokers < 1 or up{job="kafka-exporter"} == 0
+        for: 30s
+        labels:
+          severity: critical
+        annotations:
+          summary: "Kafka broker unreachable"
+          description: "kafka-exporter reports fewer than 1 active broker or kafka-exporter scrape is failing."
+          runbook_url: "docs/runbooks/KafkaBrokerDown.md"

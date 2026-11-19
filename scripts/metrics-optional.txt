@@ -1,0 +1,21 @@
+# Format: <service>:<metric_name> | <one-line justification>
+gateway-service:gateway_rate_limited_total | Lazily registered on HTTP 429 rate-limit rejection (requires burst exceeding limiter capacity)
+gateway-service:gateway_auth_failures_total | Lazily registered on missing/invalid/expired JWT or forbidden role rejection
+inventory-service:ticketing_reservations_created_total | Registered in ReservationService as ticketing_reservations_created_total; PrometheusMeterRegistry strips the reserved OpenMetrics _created suffix and exports it as ticketing_reservations_total
+inventory-service:ticketing_reservations_rejected_total | Lazily registered only when a seat hold fails (EVENT_NOT_OPEN or SEAT_ALREADY_TAKEN)
+inventory-service:ticketing_kafka_consumer_dlt_total | Lazily registered by ConsumerMetrics only when an event routes to a *-dlt topic
+inventory-service:consumer_events_duplicate_total | Lazily registered by ConsumerMetrics only when duplicate Kafka delivery hits processed_events
+inventory-service:consumer_events_retried_total | Lazily registered by ConsumerMetrics only when transient failure forwards to -retry-0/-retry-1
+inventory-service:inventory_redis_unavailable_total | Lazily registered only when Redis unavailability/timeout triggers fail-closed HTTP 503
+order-service:ticketing_kafka_consumer_dlt_total | Lazily registered by ConsumerMetrics only when an event routes to a *-dlt topic
+order-service:consumer_events_duplicate_total | Lazily registered by ConsumerMetrics only when duplicate Kafka delivery hits processed_events
+order-service:consumer_events_retried_total | Lazily registered by ConsumerMetrics only when transient failure forwards to -retry-0/-retry-1
+payment-service:ticketing_kafka_consumer_dlt_total | Lazily registered by ConsumerMetrics only when an event routes to a *-dlt topic
+payment-service:consumer_events_duplicate_total | Lazily registered by ConsumerMetrics only when duplicate Kafka delivery hits processed_events
+payment-service:consumer_events_retried_total | Lazily registered by ConsumerMetrics only when transient failure forwards to -retry-0/-retry-1
+payment-service:payment_refund_declined_total | Lazily registered only when compensating refund is declined (e.g. tok_refund_decline)
+notification-service:http_server_requests_seconds | Go consumer exposes /health*, /ready, /metrics without Spring Boot Micrometer HTTP server; HTTP SLO applies to Java services
+notification-service:ticketing_kafka_consumer_dlt_total | notification-service has no retry or DLT topics by design per docs/arch/03-kafka.md
+notification-service:notification_dedup_redis_errors_total | Prometheus CounterVec only emits series after a Redis deduplication error occurs
+notification-service:notification_claim_wait_total | Prometheus CounterVec only emits series when concurrent workers contend on an IN_PROGRESS claim
+notification-service:notification_claim_release_total | Prometheus CounterVec only emits series when a claim is released before promotion (failure/cancel/panic/commit_error)
