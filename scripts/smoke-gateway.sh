@@ -423,6 +423,26 @@ cleanup_redis() {
 trap cleanup_redis EXIT INT TERM
 
 CHK_START=$(date +%s)
+
+# Create a dedicated seat and user for Check 7 before stopping Redis
+CHK7_USER_ID=$(uuid_v4)
+CHK7_USER_TOKEN=$(mint_jwt "$CHK7_USER_ID" "USER")
+CHK7_SEAT_NUMBER=$(( (RANDOM % 8000) + 1000 ))
+CHK7_EVENT_ID="${EVENT_ID:-00000000-0000-0000-0000-000000000000}"
+CHK7_SEAT_ID=""
+
+if [ -n "$EVENT_ID" ]; then
+    CHK7_BULK_PAYLOAD="{\"seats\":[{\"sectionCode\":\"S7\",\"rowLabel\":\"R\",\"seatNumber\":\"${CHK7_SEAT_NUMBER}\",\"priceCents\":6000}]}"
+    http_request "Admin Add Seat Check 7" "POST" "${GATEWAY_BASE_URL}/api/v1/admin/events/${EVENT_ID}/seats/bulk" \
+        "$CHK7_BULK_PAYLOAD" \
+        -H "Authorization: Bearer ${ADMIN_TOKEN}" || true
+    CHK7_SEAT_ID=$(python3 -c "import json, sys; data = json.loads(sys.argv[1]); print(data['seats'][0]['seatId'])" "$HTTP_BODY" 2>/dev/null || echo "")
+fi
+
+if [ -z "$CHK7_SEAT_ID" ]; then
+    CHK7_SEAT_ID=$(uuid_v4)
+fi
+
 info "Stopping Redis container to simulate Redis outage..."
 docker stop redis >/dev/null
 
@@ -431,32 +451,57 @@ http_request "Gateway Readiness under Redis Outage" "GET" "${GATEWAY_BASE_URL}/a
 READINESS_OK=0
 if [ "$HTTP_STATUS" = "200" ]; then
     READINESS_OK=1
+else
+    fail "Gateway readiness probe failed under Redis outage: expected HTTP 200 UP, got HTTP ${HTTP_STATUS}: ${HTTP_BODY}"
 fi
 
-# 2. Assert protected request reaches inventory-service or fails closed there with 503 (never gateway 5xx due to Redis)
+# 2. Hold request through gateway while Redis is stopped must return exactly HTTP 503 with errorCode SERVICE_UNAVAILABLE and Retry-After header
 HOLD_IDEMPOTENCY_KEY=$(uuid_v4)
-PROTECTED_EVENT_ID="${EVENT_ID:-00000000-0000-0000-0000-000000000000}"
-PROTECTED_SEAT_ID="${SEAT_ID:-$(uuid_v4)}"
-PROTECTED_PAYLOAD="{\"eventId\":\"${PROTECTED_EVENT_ID}\",\"seatIds\":[\"${PROTECTED_SEAT_ID}\"]}"
-http_request "Protected Hold under Redis Outage" "POST" "${GATEWAY_BASE_URL}/api/v1/reservations" \
-    "$PROTECTED_PAYLOAD" \
-    -H "Authorization: Bearer ${USER_TOKEN}" \
+HOLD_PAYLOAD="{\"eventId\":\"${CHK7_EVENT_ID}\",\"seatIds\":[\"${CHK7_SEAT_ID}\"]}"
+http_request "Hold under Redis Outage" "POST" "${GATEWAY_BASE_URL}/api/v1/reservations" \
+    "$HOLD_PAYLOAD" \
+    -H "Authorization: Bearer ${CHK7_USER_TOKEN}" \
     -H "Idempotency-Key: ${HOLD_IDEMPOTENCY_KEY}" || true
 
-PROTECTED_OK=0
-# Reaching inventory-service results in 503 (Redis down fail-closed), 200, 201, or 409 (already held); never gateway 5xx
-if [ "$HTTP_STATUS" = "503" ] || [ "$HTTP_STATUS" = "200" ] || [ "$HTTP_STATUS" = "201" ] || [ "$HTTP_STATUS" = "409" ]; then
-    PROTECTED_OK=1
+HOLD_STATUS_OK=0
+ERR_CODE=$(json_field "$HTTP_BODY" 'data.get("errorCode", "")')
+RETRY_AFTER=$(printf "%s" "$HTTP_HEADERS" | grep -i '^retry-after:' | head -n 1 | awk '{print $2}' | tr -d '\r\n')
+
+if [ "$HTTP_STATUS" != "503" ]; then
+    fail "Hold request while Redis stopped: expected exactly HTTP 503, got HTTP ${HTTP_STATUS} (body: ${HTTP_BODY})"
+elif [ "$ERR_CODE" != "SERVICE_UNAVAILABLE" ]; then
+    fail "Hold request while Redis stopped: expected errorCode SERVICE_UNAVAILABLE, got '${ERR_CODE}' (body: ${HTTP_BODY})"
+elif [ -z "$RETRY_AFTER" ]; then
+    fail "Hold request while Redis stopped: missing required Retry-After header in response headers: ${HTTP_HEADERS}"
+else
+    HOLD_STATUS_OK=1
 fi
 
-# 3. Restart Redis and wait for it to recover
+# 3. Assert no new reservation row was created in inventory_db for user and seat used in the check
+POSTGRES_CONTAINER="${POSTGRES_CONTAINER:-postgres-inventory}"
+POSTGRES_USER="${POSTGRES_USER:-ticketing}"
+POSTGRES_DB="inventory_db"
+
+USER_RES_COUNT=$(docker exec "${POSTGRES_CONTAINER}" psql -U "${POSTGRES_USER}" -d "${POSTGRES_DB}" -t -A -c \
+    "SELECT count(*) FROM reservations WHERE user_id = '${CHK7_USER_ID}'::uuid;" 2>/dev/null || echo "error")
+SEAT_RES_COUNT=$(docker exec "${POSTGRES_CONTAINER}" psql -U "${POSTGRES_USER}" -d "${POSTGRES_DB}" -t -A -c \
+    "SELECT count(*) FROM reservation_items WHERE seat_id = '${CHK7_SEAT_ID}'::uuid;" 2>/dev/null || echo "error")
+
+DB_ASSERT_OK=0
+if [ "$USER_RES_COUNT" = "0" ] && [ "$SEAT_RES_COUNT" = "0" ]; then
+    DB_ASSERT_OK=1
+else
+    fail "Reservation rows found in inventory_db for failed hold during Redis outage: user_reservations=${USER_RES_COUNT}, seat_items=${SEAT_RES_COUNT}"
+fi
+
+# 4. Restart Redis and wait for it to recover
 info "Restarting Redis container..."
 cleanup_redis
 
-if [ "$READINESS_OK" -eq 1 ] && [ "$PROTECTED_OK" -eq 1 ]; then
-    finish_check "Redis Outage Resilience" "$CHK_START" "PASS" "Gateway readiness remained 200 UP and protected request reached inventory (HTTP ${HTTP_STATUS})"
+if [ "$READINESS_OK" -eq 1 ] && [ "$HOLD_STATUS_OK" -eq 1 ] && [ "$DB_ASSERT_OK" -eq 1 ]; then
+    finish_check "Redis Outage Resilience" "$CHK_START" "PASS" "Gateway readiness remained 200 UP, hold failed closed with HTTP 503 SERVICE_UNAVAILABLE + Retry-After, and 0 reservation rows created in inventory_db"
 else
-    finish_check "Redis Outage Resilience" "$CHK_START" "FAIL" "Redis outage check failed: readiness_ok=${READINESS_OK}, protected request HTTP=${HTTP_STATUS}: ${HTTP_BODY}"
+    finish_check "Redis Outage Resilience" "$CHK_START" "FAIL" "Redis outage check failed: readiness_ok=${READINESS_OK}, hold_503_ok=${HOLD_STATUS_OK}, db_clean_ok=${DB_ASSERT_OK} (HTTP ${HTTP_STATUS})"
 fi
 
 # -----------------------------------------------------------------------------

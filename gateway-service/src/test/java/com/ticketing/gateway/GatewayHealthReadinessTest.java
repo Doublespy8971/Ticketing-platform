@@ -11,6 +11,9 @@ import org.springframework.boot.test.context.TestConfiguration;
 import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.Primary;
 import org.springframework.test.context.ActiveProfiles;
+import org.springframework.test.context.TestExecutionListeners;
+import org.springframework.test.context.support.DependencyInjectionTestExecutionListener;
+import org.springframework.test.context.support.DirtiesContextTestExecutionListener;
 import org.springframework.test.web.reactive.server.WebTestClient;
 import reactor.core.publisher.Mono;
 
@@ -20,6 +23,10 @@ import reactor.core.publisher.Mono;
 })
 @ActiveProfiles("local")
 @AutoConfigureWebTestClient
+@TestExecutionListeners(listeners = {
+        DependencyInjectionTestExecutionListener.class,
+        DirtiesContextTestExecutionListener.class
+})
 public class GatewayHealthReadinessTest {
 
     @TestConfiguration
