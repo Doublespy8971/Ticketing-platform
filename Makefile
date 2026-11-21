@@ -10,7 +10,8 @@ OBS_SERVICES := prometheus grafana kafka-exporter redis-exporter postgres-invent
         stack-build stack-up stack-down stack-reset stack-logs stack-ps smoke-all smoke-selftest \
         e2e e2e-fast e2e-chaos e2e-full \
         obs-up obs-down obs-reset obs-urls obs-rules-check obs-targets-check metrics-check \
-        dashboards-gen dashboards-check traffic traffic-long
+        dashboards-gen dashboards-check traffic traffic-long \
+        load-flash load-journey load-all load-fresh load-report load-audit
 
 infra-up:
 	@test -f infra/.env || cp infra/.env.example infra/.env
@@ -212,6 +213,26 @@ traffic:
 
 traffic-long:
 	python3 scripts/traffic.py --duration 900 --rate 5 --force-expiry
+
+load-flash:
+	bash scripts/loadtest-run.sh flash
+
+load-journey:
+	bash scripts/loadtest-run.sh journey
+
+load-all:
+	bash scripts/loadtest-run.sh all
+
+load-fresh:
+	$(MAKE) stack-reset
+	$(MAKE) obs-up
+	$(MAKE) load-all
+
+load-report:
+	bash scripts/loadtest-run.sh report
+
+load-audit:
+	bash scripts/loadtest-run.sh audit
 
 
 

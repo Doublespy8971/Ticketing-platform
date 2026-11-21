@@ -23,3 +23,7 @@ Thumbs.db
 # Environment & Tooling
 .junie/
 .env
+
+# Load test results
+loadtest/results/*
+!loadtest/results/.gitkeep
