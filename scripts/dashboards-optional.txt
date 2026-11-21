@@ -1,0 +1,30 @@
+# Allowlist of metrics / recording rules that may legitimately return NO DATA in steady-state operation
+# Format: <metric_or_rule_name> | <one-line justification>
+consumer_events_retried_total | Lazily emitted by ConsumerMetrics only when transient Kafka delivery errors route to retry topics
+consumer_events_duplicate_total | Lazily emitted by ConsumerMetrics only when duplicate event delivery is detected by processed_events
+payment_refund_declined_total | Lazily emitted by PaymentMetrics only when a compensating refund is declined by the payment provider
+payment_provider_calls_total | Refund operations only execute during compensating transactions for cancelled orders
+ticketing_kafka_consumer_dlt_total | Lazily emitted by ConsumerMetrics only when unrecoverable poison records route to *-dlt topics
+notification_claim_release_total | Counter only increments when a Go notification worker releases an unpromoted deduplication claim
+notification_claim_wait_total | Counter only increments when concurrent Go notification workers contend on an IN_PROGRESS claim
+notification_dedup_redis_errors_total | Counter only increments when Redis errors occur during notification deduplication
+kafka_topic_partitions | Under-replicated partitions metric only reports series when partition replication is degraded
+redis_rejected_connections_total | Counter only increments if Redis maxclients connection limit is exceeded
+redis_keyspace_hits_total | Only emitted by redis_exporter when keyspace queries hit existing keys
+redis_keyspace_misses_total | Only emitted by redis_exporter when keyspace queries miss keys
+inventory_redis_unavailable_total | Counter only increments when Redis seat hold gate is unreachable or times out
+inventory_redis_confirm_failures_total | Counter only increments when Redis seat confirmation fails after retries
+inventory_redis_release_failures_total | Counter only increments when Redis seat release fails after retries
+pg_stat_database_deadlocks | Counter only increments if PostgreSQL detects transactional deadlocks
+pg_locks_count | Table lock counts are absent or zero on quiescent PostgreSQL databases
+ticketing_reservations_expired_total | Counter only increments when held reservations exceed TTL and are swept by the background cleaner
+ALERTS | Prometheus only creates ALERTS series when alerting rules are in pending or firing state
+slo:hold_availability:burnrate_fast | Evaluates to empty when no 5xx errors occur on POST /api/v1/reservations
+slo:hold_availability:burnrate_slow | Evaluates to empty when no 5xx errors occur on POST /api/v1/reservations
+slo:checkout_availability:burnrate_fast | Evaluates to empty when no 5xx errors occur on POST /api/v1/orders/{orderId}/checkout
+slo:checkout_availability:burnrate_slow | Evaluates to empty when no 5xx errors occur on POST /api/v1/orders/{orderId}/checkout
+sli:hold_409_latency_seconds:p95_5m | Latency quantile only exists when seat hold rejections (HTTP 409) occur in the scrape window
+sli:hold_409_latency_seconds:p99_5m | Latency quantile only exists when seat hold rejections (HTTP 409) occur in the scrape window
+gateway_rate_limited_total | Lazily emitted only when incoming client requests exceed the Redis rate limiter threshold
+gateway_redis_failures_total | Lazily emitted only when the Redis rate limiter script encounters connectivity errors
+hikaricp_connections_active | HikariCP metrics are emitted only by JDBC-backed Spring services (inventory, order, payment)

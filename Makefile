@@ -9,7 +9,8 @@ OBS_SERVICES := prometheus grafana kafka-exporter redis-exporter postgres-invent
         smoke-inventory smoke-order smoke-payment smoke-gateway run-gateway smoke-notification run-notification \
         stack-build stack-up stack-down stack-reset stack-logs stack-ps smoke-all smoke-selftest \
         e2e e2e-fast e2e-chaos e2e-full \
-        obs-up obs-down obs-reset obs-urls obs-rules-check obs-targets-check metrics-check
+        obs-up obs-down obs-reset obs-urls obs-rules-check obs-targets-check metrics-check \
+        dashboards-gen dashboards-check traffic traffic-long
 
 infra-up:
 	@test -f infra/.env || cp infra/.env.example infra/.env
@@ -199,6 +200,19 @@ obs-targets-check:
 
 metrics-check:
 	bash scripts/check-metrics.sh
+
+dashboards-gen:
+	python3 scripts/gen-dashboards.py
+
+dashboards-check:
+	bash scripts/check-dashboards.sh
+
+traffic:
+	python3 scripts/traffic.py --duration 180 --rate 5 --force-expiry
+
+traffic-long:
+	python3 scripts/traffic.py --duration 900 --rate 5 --force-expiry
+
 
 
 

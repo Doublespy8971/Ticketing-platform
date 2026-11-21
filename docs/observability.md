@@ -23,8 +23,9 @@ The ticketing platform observability stack runs alongside the 10-container appli
 4. **OpenMetrics `_created` Normalization**: `ReservationService` registers `Counter.builder("ticketing_reservations_created_total")` per `docs/arch/09-conventions.md`; Micrometer 1.13's `PrometheusMeterRegistry` (`prometheus-metrics-core`) treats `_created` as an OpenMetrics timestamp suffix and exports the series as `ticketing_reservations_total`. Both are documented and accounted for in `scripts/metrics-optional.txt` and `scripts/check-metrics.sh`.
 5. **Prometheus Histogram Buckets**: `management.metrics.distribution.percentiles-histogram.http.server.requests: true` and explicit SLO buckets (`25ms,50ms,100ms,250ms,500ms,1s,2500ms,5s`) are enabled across all four Java services (`2500ms` is used instead of `2.5s` for Spring Boot `DurationStyle` compatibility). `order-service` additionally enables percentile histograms on `ticketing_orders_materialization_lag_seconds`.
 6. **Uninitialized Consumer Offsets (`kafka_consumergroup_lag`)**: `kafka-exporter` emits `-1` on partitions with no committed offset yet; alert rules and `scripts/obs-queries.sh` clamp or filter `> 0` before aggregating lag.
-7. **Grafana Provisioning & Auth**: Anonymous access is disabled (`GF_AUTH_ANONYMOUS_ENABLED=false`). Provisioning directories under `infra/observability/grafana/provisioning/` are mounted read-only and intentionally empty until dashboards are added. Development-only credentials are sourced from `infra/.env` (`infra/.env.example`).
-8. **Optional / Lazy Metrics**: Metrics that require fault injection, dead letters, duplicate redelivery, or Go non-HTTP server design are allowlisted with one-line justifications in `scripts/metrics-optional.txt`.
+7. **Grafana Provisioning & Auth**: Anonymous access is disabled (`GF_AUTH_ANONYMOUS_ENABLED=false`). Development-only credentials (`admin:admin`) are sourced from `infra/.env` (`infra/.env.example`). Provisioning configuration files under `infra/observability/grafana/provisioning/` mount Prometheus datasource (`uid: prometheus`) and provision the 5 platform dashboards (`editable: false`) from `infra/observability/grafana/dashboards` into `/var/lib/grafana/dashboards:ro`.
+8. **Optional / Lazy Metrics**: Metrics that require fault injection, dead letters, duplicate redelivery, or Go non-HTTP server design are allowlisted with one-line justifications in `scripts/metrics-optional.txt` and `scripts/dashboards-optional.txt`.
+9. **Dashboards as Code & Traffic Generation**: All 5 Grafana dashboards are built programmatically from compact panel definitions via `scripts/gen-dashboards.py` (`make dashboards-gen`). Metric presence in steady-state vs failure conditions is validated via `scripts/check-dashboards.sh` (`make dashboards-check`). Realistic multi-user load is generated via `scripts/traffic.py` (`make traffic` / `make traffic-long`).
 
 ### Health and Readiness Semantics
 
@@ -192,3 +193,55 @@ Every alert below uses verified live metrics and links directly to its <=25-line
 | `NotificationServiceStalled` | `critical` | `kafka_consumergroup_lag`, `notification_events_total` | `kafka-exporter`, `metrics.go` | `1m` | [NotificationServiceStalled.md](runbooks/NotificationServiceStalled.md) |
 | `PostgresDown` | `critical` | `pg_up` | `postgres-exporter` (x3) | `30s` | [PostgresDown.md](runbooks/PostgresDown.md) |
 | `KafkaBrokerDown` | `critical` | `kafka_brokers`, `up` | `kafka-exporter` | `30s` | [KafkaBrokerDown.md](runbooks/KafkaBrokerDown.md) |
+
+---
+
+## 6. Grafana Dashboards as Code & Traffic Generator
+
+Grafana runs at `http://127.0.0.1:3000` with anonymous authentication disabled. All dashboards are maintained as code, provisioned read-only, and verified automatically against Prometheus.
+
+### 6.1 How to Access Grafana
+
+1. **Start the Stack & Observability Services**:
+   ```bash
+   make stack-up
+   make obs-up
+   ```
+2. **Open Grafana in Browser**:
+   Navigate to [http://127.0.0.1:3000](http://127.0.0.1:3000).
+3. **Log In**:
+   - **Username**: `admin` (or `${GRAFANA_ADMIN_USER}` from `infra/.env`)
+   - **Password**: `admin` (or `${GRAFANA_ADMIN_PASSWORD}` from `infra/.env`)
+4. **Locate Dashboards**:
+   Navigate to **Dashboards** in the left sidebar menu (or open direct URLs below). All dashboards are provisioned with `editable: false`.
+
+---
+
+### 6.2 Dashboard Catalog
+
+| Dashboard | UID / URL | What It Answers | Related Platform Alerts | Templated Variables |
+|---|---|---|---|---|
+| **Platform Overview** | `platform-overview`<br>`http://127.0.0.1:3000/d/platform-overview/platform-overview` | What is overall platform health? Request rates, 5xx error ratios, p50/p95/p99 latencies, container scrape up-status, JVM memory/threads, Hikari pools, CPU utilization, and active firing alerts. | `ServiceDown`<br>`Gateway5xxRatioHigh`<br>`Gateway429Spike` | `$service` (bounded to platform services) |
+| **Business Flow** | `business-flow`<br>`http://127.0.0.1:3000/d/business-flow/business-flow` | How are users progressing through the ticketing funnel? Seat holds created and rejected, checkouts by outcome, p95 order materialization lag, payments by status/failure code, compensating refunds, notification dispatches, and sweeper expired reservations rate. | `HoldSLOFastBurn`<br>`HoldSLOSlowBurn`<br>`CheckoutSLOFastBurn`<br>`ExpirySweeperBehind`<br>`PaymentProviderErrors`<br>`PaymentRefundDeclined`<br>`NotificationFailures` | `$service` (bounded to domain services) |
+| **Messaging** | `messaging`<br>`http://127.0.0.1:3000/d/messaging/messaging` | Is the asynchronous event pipeline healthy? Consumer group lag per topic, retry and dead-letter topic offsets + 1h growth, outbox unpublished rows and oldest pending age, duplicate deliveries, and notification claim locks. | `ConsumerLagHigh`<br>`RetryTopicBacklog`<br>`DeadLetterGrowth`<br>`OutboxStuck`<br>`OutboxPendingGrowing`<br>`NotificationServiceStalled` | `$service` (bounded to domain consumers) |
+| **SLO** | `slo`<br>`http://127.0.0.1:3000/d/slo/slo` | Are platform SLO commitments met? 5m availability SLI ratios, 30-day remaining error budgets, p95/p99 latency SLIs, multi-window fast (14.4x) and slow (6x) burn rates with threshold alert lines, and active alert list. | `HoldSLOFastBurn`<br>`HoldSLOSlowBurn`<br>`CheckoutSLOFastBurn` | None (fixed platform SLO scope) |
+| **Dependencies** | `dependencies`<br>`http://127.0.0.1:3000/d/dependencies/dependencies` | Are backing infrastructure dependencies healthy? Redis 7 (up, memory, clients, command rate, keyspace hit/miss, rejected connections), PostgreSQL 16 x3 (up, connections, commit rate, locks, deadlocks, buffer cache hit ratio), and Kafka KRaft (brokers, partition offset rates, under-replicated partitions). | `RedisDown`<br>`RedisGateUnavailable`<br>`PostgresDown`<br>`KafkaBrokerDown` | `$database` (bounded to `inventory_db`, `order_db`, `payment_db`) |
+
+---
+
+### 6.3 Dashboard Generation, Traffic & Verification Commands
+
+```bash
+# Generate dashboard JSON files from Python code into infra/observability/grafana/dashboards/
+make dashboards-gen
+
+# Run realistic user traffic through gateway (default 3m @ 5 req/s with 80% success, 10% decline, 10% abandon + conflicts)
+make traffic
+
+# Run 15-minute extended traffic generation
+make traffic-long
+
+# Validate dashboard JSON syntax, UIDs, unique panel IDs, datasource uid, PromQL validity, and Grafana API provisioning
+make dashboards-check
+```
+
