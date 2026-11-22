@@ -35,7 +35,7 @@ services:
     deploy:
       resources:
         limits:
-          memory: 512m
+          memory: 768m
 
   order-service:
     image: ticketing/order-service:latest
@@ -65,7 +65,7 @@ services:
     deploy:
       resources:
         limits:
-          memory: 512m
+          memory: 768m
 
   payment-service:
     image: ticketing/payment-service:latest
@@ -96,7 +96,7 @@ services:
     deploy:
       resources:
         limits:
-          memory: 512m
+          memory: 768m
 
   notification-service:
     image: ticketing/notification-service:latest
@@ -165,4 +165,4 @@ services:
     deploy:
       resources:
         limits:
-          memory: 512m
+          memory: 768m

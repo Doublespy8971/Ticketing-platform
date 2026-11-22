@@ -19,6 +19,7 @@ Spring Boot services automatically discover `ConsumerAutoConfiguration` via `MET
 - `com.ticketing.consumer.TicketingDeadLetterPublishingRecoverer` — Custom `DeadLetterPublishingRecoverer` that strips pre-existing `kafka_dlt-*` headers on initial main-topic failures, preserves first-failure `kafka_dlt-original-*` headers across retry hops, writes unwrapped latest `kafka_dlt-exception-*` headers (preferring `NonRetryableEventException` in the cause chain), and increments retry/DLT counters using trusted listener/destination configuration.
 - `com.ticketing.consumer.ConsumerMetrics` — Registers and records `ticketing_kafka_consumer_dlt_total`, `consumer_events_processed_total`, `consumer_events_duplicate_total`, `consumer_events_retried_total`, and `consumer_event_processing_seconds` with whitelisted `event_type`, `topic`, and `consumer_group` tags (fallback `"unknown"`).
 - `com.ticketing.consumer.TicketingConsumerProperties` — Enforces mandatory consumer settings (`StringDeserializer`, `enable.auto.commit=false`, `isolation.level=read_committed`, `auto.offset.reset=earliest`, `max.poll.records=100`, `max.poll.interval.ms=300000`).
+- `com.ticketing.consumer.ConsumerTimeoutProperties` — `@ConfigurationProperties(prefix = "ticketing.consumer")` configuring `session-timeout-ms` (`6000..60000`, default `15000`), `heartbeat-interval-ms` (`1..sessionTimeoutMs/3`, default `3000`), and `concurrency` (`1..12`, default `1`) applied to `ConcurrentKafkaListenerContainerFactory`.
 - `com.ticketing.consumer.ConsumerCleanupProperties` — `@ConfigurationProperties(prefix = "ticketing.consumer.cleanup")` validating `retention-hours >= 192` and `batch-size` in `1..10000` at startup.
 - `com.ticketing.consumer.ProcessedEventsRetentionCleaner` — Scheduled batch cleaner running on `ticketingConsumerCleanupScheduler` (`0 0 * * * *`) that purges `processed_events` rows older than 192 hours using `FOR UPDATE SKIP LOCKED` and stops early when the thread is interrupted.
 - `com.ticketing.consumer.autoconfigure.ConsumerAutoConfiguration` — Single Spring Boot auto-configuration ordered `before = KafkaAutoConfiguration.class` wiring consumer factories, listener containers (`AckMode.RECORD` + `CorrelationRecordInterceptor`), retry topics, dedicated retry `KafkaTemplate`, lifecycle-managed `ticketingRetryBackoffScheduler` and `ticketingConsumerCleanupScheduler`, metrics, and retention cleanup.
@@ -47,6 +48,17 @@ Consequently, **every domain event handler must be written as an explicit state-
 1. Lock the target domain row (`SELECT ... FOR UPDATE`) inside `IdempotentEventProcessor.process(...)`.
 2. Check whether the current domain status permits the transition (for example, `RESERVED -> PAYMENT_PENDING`, or `HELD -> CONFIRMED`).
 3. Ignore or compensate out-of-order transitions deterministically rather than assuming strict arrival order across retry hops.
+
+## Listener Concurrency & Per-Key Ordering Safety
+
+`ticketing.consumer.concurrency` (default `1`, validated in `1..12` matching the 12 topic partitions in Compose) sets `ConcurrentKafkaListenerContainerFactory.setConcurrency(n)`. Current service defaults:
+- `payment-service`: `6` (addresses blocking payment provider latency on `payment-service-order-cg`)
+- `order-service`: `3`
+- `inventory-service`: `3`
+
+**Why parallel consumption is safe**:
+1. **Per-key ordering is preserved**: Kafka assigns each topic partition to at most one consumer thread within a consumer group; partitions are never shared between threads. Because every domain event uses `orderId` (`reservationId`) as its Kafka message key, all events for a single order land on the same partition and execute sequentially on one thread.
+2. **Provider & DB idempotency**: `payment-service` passes `idempotencyKey = orderId` (charge) and `idempotencyKey = paymentId` (refund) to `PaymentProvider`, and commits domain rows alongside `processed_events` (`UNIQUE (event_id, consumer_group)`) and `payments` (`UNIQUE (order_id)`), so parallel consumption across distinct orders and redeliveries across rebalances remain strictly idempotent.
 
 ## Failure Windows & Recovery Guarantees
 

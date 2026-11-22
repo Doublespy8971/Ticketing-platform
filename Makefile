@@ -11,7 +11,7 @@ OBS_SERVICES := prometheus grafana kafka-exporter redis-exporter postgres-invent
         e2e e2e-fast e2e-chaos e2e-full \
         obs-up obs-down obs-reset obs-urls obs-rules-check obs-targets-check metrics-check \
         dashboards-gen dashboards-check traffic traffic-long \
-        load-flash load-journey load-all load-fresh load-report load-audit
+        load-flash load-journey load-all load-fresh load-report load-audit jvm-check
 
 infra-up:
 	@test -f infra/.env || cp infra/.env.example infra/.env
@@ -72,21 +72,21 @@ stack-up:
 	@start_time=$$(date +%s); \
 	while true; do \
 		ps_json=$$($(COMPOSE_FULL) ps --format json 2>/dev/null || true); \
-		unhealthy=$$(echo "$$ps_json" | jq -r 'select(.Health == "unhealthy") | .Name' 2>/dev/null || true); \
-		dead=$$(echo "$$ps_json" | jq -r 'select(.State == "dead") | .Name' 2>/dev/null || true); \
+		unhealthy=$$(printf '%s\n' "$$ps_json" | jq -r 'select(.Health == "unhealthy") | .Name' 2>/dev/null || true); \
+		dead=$$(printf '%s\n' "$$ps_json" | jq -r 'select(.State == "dead") | .Name' 2>/dev/null || true); \
 		if [ -n "$$unhealthy" ] || [ -n "$$dead" ]; then \
 			echo "\n[ERROR] Containers reported unhealthy or dead: $$unhealthy $$dead"; \
 			$(COMPOSE_FULL) ps; \
 			exit 1; \
 		fi; \
-		exited=$$(echo "$$ps_json" | jq -r 'select(.State == "exited" and .Service != "kafka-init") | .Name' 2>/dev/null || true); \
+		exited=$$(printf '%s\n' "$$ps_json" | jq -r 'select(.State == "exited" and .Service != "kafka-init") | .Name' 2>/dev/null || true); \
 		if [ -n "$$exited" ]; then \
 			echo "\n[ERROR] Containers exited unexpectedly: $$exited"; \
 			$(COMPOSE_FULL) ps; \
 			exit 1; \
 		fi; \
-		starting=$$(echo "$$ps_json" | jq -r 'select(.Health == "starting") | .Name' 2>/dev/null || true); \
-		healthy_count=$$(echo "$$ps_json" | jq -r 'select(.Health == "healthy") | .Name' 2>/dev/null | wc -l | tr -d ' '); \
+		starting=$$(printf '%s\n' "$$ps_json" | jq -r 'select(.Health == "starting") | .Name' 2>/dev/null || true); \
+		healthy_count=$$(printf '%s\n' "$$ps_json" | jq -r 'select(.Health == "healthy") | .Name' 2>/dev/null | wc -l | tr -d ' '); \
 		if [ -z "$$starting" ] && [ "$$healthy_count" -ge 10 ]; then \
 			echo "\n[OK] All services are healthy!"; \
 			$(COMPOSE_FULL) ps; \
@@ -233,6 +233,9 @@ load-report:
 
 load-audit:
 	bash scripts/loadtest-run.sh audit
+
+jvm-check:
+	bash scripts/check-jvm-flags.sh
 
 
 

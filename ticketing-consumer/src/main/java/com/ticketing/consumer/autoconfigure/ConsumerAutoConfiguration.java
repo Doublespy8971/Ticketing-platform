@@ -210,6 +210,7 @@ public class ConsumerAutoConfiguration {
         ConcurrentKafkaListenerContainerFactory<String, String> factory =
                 new ConcurrentKafkaListenerContainerFactory<>();
         factory.setConsumerFactory((ConsumerFactory) consumerFactory);
+        factory.setConcurrency(timeoutProperties.getConcurrency());
         factory.getContainerProperties().setAckMode(ContainerProperties.AckMode.RECORD);
         RecordInterceptor recordInterceptor = recordInterceptorProvider.getIfAvailable(CorrelationRecordInterceptor::new);
         factory.setRecordInterceptor(recordInterceptor);

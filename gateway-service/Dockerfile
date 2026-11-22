@@ -30,9 +30,10 @@ COPY --from=build --chown=app:app /app.jar app.jar
 USER app:app
 EXPOSE 8080
 
-ENV JAVA_TOOL_OPTIONS="-XX:MaxRAMPercentage=75 -XX:+ExitOnOutOfMemoryError"
+ENV JAVA_OPTS="-XX:+UseG1GC -XX:MaxGCPauseMillis=100 -XX:MaxRAMPercentage=75 -XX:+ExitOnOutOfMemoryError -Xlog:gc+init=info"
+ENV JAVA_OPTS_EXTRA=""
 
 HEALTHCHECK --interval=5s --timeout=3s --retries=10 --start-period=20s \
     CMD wget --no-verbose --tries=1 --spider http://127.0.0.1:8080/actuator/health || exit 1
 
-ENTRYPOINT ["java", "-XX:MaxRAMPercentage=75", "-XX:+ExitOnOutOfMemoryError", "-jar", "app.jar"]
+ENTRYPOINT ["sh", "-c", "exec java ${JAVA_OPTS_EXTRA:-$JAVA_OPTS} -jar app.jar"]

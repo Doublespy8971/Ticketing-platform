@@ -243,6 +243,41 @@ def collect_prometheus_metrics(prom_url, run_meta, enable_live=True):
     ) or []
     out["max_inflight_checkouts_http"] = float(inflight_http[0]["value"][1]) if inflight_http else 0.0
 
+    # 6. 5xx count by service over run window
+    svc_5xx_res = prom_query(
+        prom_url,
+        f'sum by (service) (increase(http_server_requests_seconds_count{{status=~"5.."}}[{window_s}s]))',
+        eval_t,
+    ) or []
+    svc_5xx = {
+        r["metric"].get("service", "unknown"): float(r["value"][1])
+        for r in svc_5xx_res if "value" in r
+    }
+    svc_5xx["gateway-service"] = max(svc_5xx.get("gateway-service", 0.0), out["gateway_5xx_count"])
+    out["service_5xx_counts"] = svc_5xx
+
+    # 7. Peak HikariCP pending connections per service
+    hikari_res = prom_query(
+        prom_url,
+        f"max_over_time(hikaricp_connections_pending[{window_s}s:5s])",
+        eval_t,
+    ) or []
+    out["peak_hikari_pending"] = {
+        r["metric"].get("service", r["metric"].get("pool", "unknown")): float(r["value"][1])
+        for r in hikari_res if "value" in r
+    }
+
+    # 8. Total JVM GC pause seconds per service over run window (jvm_gc_pause_seconds_sum)
+    gc_res = prom_query(
+        prom_url,
+        f"sum by (service) (increase(jvm_gc_pause_seconds_sum[{window_s}s]))",
+        eval_t,
+    ) or []
+    out["total_jvm_gc_pause_seconds"] = {
+        r["metric"].get("service", "unknown"): float(r["value"][1])
+        for r in gc_res if "value" in r
+    }
+
     return out
 
 
@@ -389,6 +424,9 @@ def generate_report(results_dir, prom_url="http://127.0.0.1:9090", publish=False
 
     env = collect_environment(results_dir, run_meta, enable_live=enable_live)
     prom = collect_prometheus_metrics(prom_url, run_meta, enable_live=enable_live)
+    if prom.get("available"):
+        with open(os.path.join(results_dir, "prometheus-metrics.json"), "w") as f:
+            json.dump(prom, f, indent=2)
     docker_stats = parse_docker_stats(os.path.join(results_dir, "docker-stats.csv"))
     container_health = summarize_container_health(results_dir)
 
@@ -625,6 +663,12 @@ def generate_report(results_dir, prom_url="http://127.0.0.1:9090", publish=False
             lines.append(f"| Peak Outbox Oldest Pending Age | `{svc}` | {val:.3f} s |")
         for svc, val in sorted(prom.get("peak_jvm_heap_ratio", {}).items()):
             lines.append(f"| Peak JVM Heap Used Ratio | `{svc}` | {val * 100.0:.1f}% |")
+        for svc, val in sorted(prom.get("peak_hikari_pending", {}).items()):
+            lines.append(f"| Peak HikariCP Pending | `{svc}` | {val:.1f} |")
+        for svc, val in sorted(prom.get("total_jvm_gc_pause_seconds", {}).items()):
+            lines.append(f"| Total JVM GC Pause Time | `{svc}` | {val:.3f} s |")
+        for svc, val in sorted(prom.get("service_5xx_counts", {}).items()):
+            lines.append(f"| Service 5xx Count | `{svc}` | {val:.1f} |")
         lines.append("")
 
     # 5. Container Resource Usage
