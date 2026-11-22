@@ -414,13 +414,47 @@ def generate_report(results_dir, prom_url="http://127.0.0.1:9090", publish=False
     meta_path = os.path.join(results_dir, "run-meta.json")
     run_meta = load_json_if_exists(meta_path, {})
 
-    flash_path = os.path.join(results_dir, "flash-sale-summary.json")
-    journey_path = os.path.join(results_dir, "checkout-journey-summary.json")
-    audit_path = os.path.join(results_dir, "audit.json")
+    invalid_path = os.path.join(results_dir, "INVALID")
+    is_invalid = os.path.isfile(invalid_path)
+    invalid_reason = open(invalid_path).read().strip() if is_invalid else ""
 
-    flash_data = load_json_if_exists(flash_path)
-    journey_data = load_json_if_exists(journey_path)
+    flash_path = os.path.join(results_dir, "flash-sale-summary.json")
+    sust_hold_path = os.path.join(results_dir, "sustained-hold-summary.json")
+    bp_hold_path = os.path.join(results_dir, "breakpoint-hold-summary.json")
+
+    journey_path = os.path.join(results_dir, "checkout-journey-summary.json")
+    sust_journey_path = os.path.join(results_dir, "sustained-journey-summary.json")
+    bp_journey_path = os.path.join(results_dir, "breakpoint-journey-summary.json")
+    soak_path = os.path.join(results_dir, "soak-summary.json")
+
+    audit_path = os.path.join(results_dir, "audit.json")
+    breakpoint_md_path = os.path.join(results_dir, "breakpoint.md")
+    soak_md_path = os.path.join(results_dir, "soak-report.md")
+    soak_json_path = os.path.join(results_dir, "soak-report.json")
+
+    flash_data = load_json_if_exists(flash_path) or load_json_if_exists(sust_hold_path)
+    hold_scenario_label = (
+        "Sustained Hold (`loadtest/sustained-hold.js`)"
+        if (not os.path.isfile(flash_path) and os.path.isfile(sust_hold_path))
+        else "Flash Sale (`loadtest/flash-sale.js`)"
+    )
+
+    journey_data = (
+        load_json_if_exists(journey_path)
+        or load_json_if_exists(sust_journey_path)
+        or load_json_if_exists(soak_path)
+    )
+    if not os.path.isfile(journey_path) and os.path.isfile(sust_journey_path):
+        journey_scenario_label = "Sustained Journey (`loadtest/sustained-journey.js`)"
+    elif not os.path.isfile(journey_path) and os.path.isfile(soak_path):
+        journey_scenario_label = "Soak Journey (`loadtest/soak.js`)"
+    else:
+        journey_scenario_label = "Checkout Journey (`loadtest/checkout-journey.js`)"
+
+    bp_hold_data = load_json_if_exists(bp_hold_path)
+    bp_journey_data = load_json_if_exists(bp_journey_path)
     audit_data = load_json_if_exists(audit_path)
+    soak_report_data = load_json_if_exists(soak_json_path)
 
     env = collect_environment(results_dir, run_meta, enable_live=enable_live)
     prom = collect_prometheus_metrics(prom_url, run_meta, enable_live=enable_live)
@@ -434,8 +468,9 @@ def generate_report(results_dir, prom_url="http://127.0.0.1:9090", publish=False
     journey_thresholds = extract_thresholds(journey_data) if journey_data else []
 
     all_thresholds = flash_thresholds + journey_thresholds
-    scenarios_present = bool(flash_data or journey_data)
-    thresholds_ok = scenarios_present and all(t["ok"] for t in all_thresholds)
+    is_breakpoint_only = (bp_hold_data is not None or bp_journey_data is not None) and not (flash_data or journey_data)
+    scenarios_present = bool(flash_data or journey_data or bp_hold_data or bp_journey_data)
+    thresholds_ok = scenarios_present and (True if is_breakpoint_only else all(t["ok"] for t in all_thresholds))
 
     if audit_data is None:
         audit_status = "NOT RUN"
@@ -446,8 +481,14 @@ def generate_report(results_dir, prom_url="http://127.0.0.1:9090", publish=False
         audit_ok = bool(audit_items) and q_ok and all(it.get("status") == "PASS" for it in audit_items)
         audit_status = status_str(audit_ok)
 
-    overall_ok = thresholds_ok and audit_ok
-    overall_status = status_str(overall_ok) if audit_data is not None else ("FAIL" if not thresholds_ok else "INCOMPLETE (AUDIT NOT RUN)")
+    soak_ok = True if soak_report_data is None else bool(soak_report_data.get("passed", False))
+
+    if is_invalid:
+        overall_ok = False
+        overall_status = "INVALID (NOT COUNTED)"
+    else:
+        overall_ok = thresholds_ok and audit_ok and soak_ok
+        overall_status = status_str(overall_ok) if audit_data is not None else ("FAIL" if not thresholds_ok else "INCOMPLETE (AUDIT NOT RUN)")
 
     run_id = run_meta.get("run_id") or os.path.basename(results_dir)
     generated_at = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
@@ -455,9 +496,14 @@ def generate_report(results_dir, prom_url="http://127.0.0.1:9090", publish=False
     lines = []
     lines.append(f"# Ticketing Platform Load Test Report — `{run_id}`")
     lines.append("")
+    if is_invalid:
+        lines.append("> [!CAUTION]")
+        lines.append(f"> **RUN INVALID — NOT COUNTED**: {invalid_reason}")
+        lines.append("")
     lines.append(f"- **Generated (UTC)**: `{generated_at}`")
     lines.append(f"- **Results Directory**: `{results_dir}`")
     lines.append(f"- **Load Scale**: `{run_meta.get('load_scale', 'unknown')}`")
+    lines.append(f"- **Run Validity**: **{'INVALID — NOT COUNTED' if is_invalid else 'VALID'}**")
     lines.append(f"- **Overall Verdict**: **{overall_status}**")
     lines.append(f"- **Thresholds Verdict**: **{status_str(thresholds_ok) if scenarios_present else 'NOT RUN'}** ({sum(1 for t in all_thresholds if t['ok'])}/{len(all_thresholds)} passed)")
     lines.append(f"- **Post-Run Audit Verdict**: **{audit_status}**")
@@ -487,8 +533,8 @@ def generate_report(results_dir, prom_url="http://127.0.0.1:9090", publish=False
             lines.append(f"| `{cname}` | `{lim}` |")
         lines.append("")
 
-    # 2. Scenario A: Flash Sale
-    lines.append("## 2. Scenario A — Flash Sale (`loadtest/flash-sale.js`)")
+    # 2. Scenario A: Hold / Flash Sale
+    lines.append(f"## 2. Scenario A — {hold_scenario_label}")
     lines.append("")
     if flash_data is None:
         lines.append("_Scenario A was NOT RUN in this results directory._")
@@ -501,10 +547,10 @@ def generate_report(results_dir, prom_url="http://127.0.0.1:9090", publish=False
 
         lines.append("### Configuration")
         lines.append("")
-        lines.append(f"- **Executor**: `ramping-arrival-rate` (scale=`{fmeta.get('load_scale', 'n/a')}`)")
+        lines.append(f"- **Executor**: `ramping-arrival-rate` (scale=`{fmeta.get('load_scale', '1.0')}`)")
         lines.append(f"- **Stages**: `{stage_desc}`")
         lines.append(f"- **VUs**: `preAllocatedVUs={fmeta.get('pre_allocated_vus', 'n/a')}`, `maxVUs={fmeta.get('max_vus', 'n/a')}`")
-        lines.append(f"- **Pool / Inventory**: `{fmeta.get('user_pool_size', 'n/a')}` distinct users, `{fmeta.get('seats_per_event', 'n/a')}` seats (uniform random contention)")
+        lines.append(f"- **Pool / Inventory**: `{fmeta.get('user_pool_size', 'n/a')}` distinct users, `{fmeta.get('seats_per_event', 'n/a')}` seats/event")
         lines.append("")
 
         lines.append("### Thresholds")
@@ -522,6 +568,7 @@ def generate_report(results_dir, prom_url="http://127.0.0.1:9090", publish=False
         h_conflict = cnt(fm, "hold_conflict")
         h_429 = cnt(fm, "hold_rate_limited")
         h_unexp = cnt(fm, "hold_unexpected")
+        h_unk = cnt(fm, "hold_unknown_outcome")
         h_total = h_created + h_conflict + h_429 + h_unexp
         h_5xx_rate = float(fm.get("hold_5xx", {}).get("values", {}).get("rate", 0.0) or 0.0)
         dropped_iters = cnt(fm, "dropped_iterations")
@@ -534,6 +581,7 @@ def generate_report(results_dir, prom_url="http://127.0.0.1:9090", publish=False
         lines.append(f"| `409 Conflict` (`hold_conflict`) | {h_conflict} |")
         lines.append(f"| `429 Rate Limited` (`hold_rate_limited`) | {h_429} |")
         lines.append(f"| Unexpected / Other (`hold_unexpected`) | {h_unexp} |")
+        lines.append(f"| Unknown Client Outcome (`hold_unknown_outcome`: 0/500/502/504) | {h_unk} |")
         lines.append(f"| **Total Hold Requests** | **{h_total}** |")
         lines.append(f"| `hold_5xx` Rate | `{h_5xx_rate:.6f}` |")
         lines.append(f"| k6 `dropped_iterations` | {dropped_iters} |")
@@ -553,7 +601,8 @@ def generate_report(results_dir, prom_url="http://127.0.0.1:9090", publish=False
         lines.append("| Window | Requests | Duration (s) | Target (req/s) | Achieved (req/s) |")
         lines.append("| :--- | ---: | ---: | ---: | ---: |")
         lines.append(f"| Plateau 1 | {p1_reqs} | {p1_dur:.0f} | {fmeta.get('plateau1_target_rps', 'n/a')} | **{p1_ach:.2f}** |")
-        lines.append(f"| Plateau 2 | {p2_reqs} | {p2_dur:.0f} | {fmeta.get('plateau2_target_rps', 'n/a')} | **{p2_ach:.2f}** |")
+        if p2_dur > 0:
+            lines.append(f"| Plateau 2 | {p2_reqs} | {p2_dur:.0f} | {fmeta.get('plateau2_target_rps', 'n/a')} | **{p2_ach:.2f}** |")
         lines.append(f"| Overall Run Avg (`http_reqs`) | {cnt(fm, 'http_reqs')} | {float(flash_data.get('state', {}).get('testRunDurationMs', 0)) / 1000.0:.1f} | — | {overall_rps:.2f} |")
         lines.append("")
 
@@ -566,7 +615,7 @@ def generate_report(results_dir, prom_url="http://127.0.0.1:9090", publish=False
         lines.append("")
 
     # 3. Scenario B: Checkout Journey
-    lines.append("## 3. Scenario B — Checkout Journey (`loadtest/checkout-journey.js`)")
+    lines.append(f"## 3. Scenario B — {journey_scenario_label}")
     lines.append("")
     if journey_data is None:
         lines.append("_Scenario B was NOT RUN in this results directory._")
@@ -595,6 +644,7 @@ def generate_report(results_dir, prom_url="http://127.0.0.1:9090", publish=False
             return int(jm.get(key, {}).get("values", {}).get("count", 0) or 0)
 
         j_holds = jcnt("hold_created")
+        j_unk = jcnt("hold_unknown_outcome")
         j_conf = jcnt("journey_confirmed")
         j_decl = jcnt("journey_payment_failed")
         j_aban = jcnt("journey_abandoned")
@@ -602,10 +652,11 @@ def generate_report(results_dir, prom_url="http://127.0.0.1:9090", publish=False
         j_unexp = jcnt("unexpected_statuses")
         j_retries = jcnt("order_not_ready_retries")
         j_iters = jcnt("iterations")
+        j_p1 = jcnt("plateau1_reqs")
         j_dropped = jcnt("dropped_iterations")
         j_dur_s = float(journey_data.get("state", {}).get("testRunDurationMs", 0) or 0) / 1000.0
         j_target_dur_s = float(jmeta.get("journey_duration_s") or j_dur_s or 1.0)
-        j_achieved_jps = j_iters / j_target_dur_s if j_target_dur_s > 0 else 0.0
+        j_achieved_jps = (j_p1 / j_target_dur_s) if j_p1 > 0 and j_target_dur_s > 0 else (j_iters / j_target_dur_s if j_target_dur_s > 0 else 0.0)
         j_http_rps = float(jm.get("http_reqs", {}).get("values", {}).get("rate", 0.0) or 0.0)
 
         lines.append("### Journey Counts by Outcome")
@@ -613,6 +664,7 @@ def generate_report(results_dir, prom_url="http://127.0.0.1:9090", publish=False
         lines.append("| Outcome | Count |")
         lines.append("| :--- | ---: |")
         lines.append(f"| Holds Created (`hold_created`) | {j_holds} |")
+        lines.append(f"| Unknown Hold Outcome (`hold_unknown_outcome`: 0/500/502/504) | {j_unk} |")
         lines.append(f"| Final `CONFIRMED` (`journey_confirmed`) | {j_conf} |")
         lines.append(f"| Final `CANCELLED_PAYMENT_FAILED` (`journey_payment_failed`) | {j_decl} |")
         lines.append(f"| Abandoned Holds (`journey_abandoned`) | {j_aban} |")
@@ -626,7 +678,8 @@ def generate_report(results_dir, prom_url="http://127.0.0.1:9090", publish=False
         lines.append("")
         lines.append("| Metric | Achieved |")
         lines.append("| :--- | ---: |")
-        lines.append(f"| Completed Journeys / Target Duration ({j_iters} / {j_target_dur_s:.0f}s) | **{j_achieved_jps:.2f} journeys/s** |")
+        j_num_label = j_p1 if j_p1 > 0 else j_iters
+        lines.append(f"| Completed Journeys / Target Duration ({j_num_label} / {j_target_dur_s:.0f}s) | **{j_achieved_jps:.2f} journeys/s** |")
         lines.append(f"| Total HTTP Request Rate (`http_reqs`) | {j_http_rps:.2f} req/s |")
         lines.append("")
 
@@ -720,6 +773,21 @@ def generate_report(results_dir, prom_url="http://127.0.0.1:9090", publish=False
             lines.append(f"| `{it['id']}` | **{it['status']}** | {it['name']} | {it['detail']} |")
         lines.append("")
 
+    # Optional Breakpoint / Soak embedded sections
+    if os.path.isfile(breakpoint_md_path):
+        lines.append("## Breakpoint Analysis")
+        lines.append("")
+        with open(breakpoint_md_path) as bf:
+            lines.append(bf.read().strip())
+        lines.append("")
+
+    if os.path.isfile(soak_md_path):
+        lines.append("## Soak Drift Analysis")
+        lines.append("")
+        with open(soak_md_path) as sf:
+            lines.append(sf.read().strip())
+        lines.append("")
+
     # 7. Findings & Limits
     lines.append("## 7. Findings and Limits")
     lines.append("")
@@ -736,7 +804,7 @@ def generate_report(results_dir, prom_url="http://127.0.0.1:9090", publish=False
     published = False
     publish_message = ""
     if publish:
-        if overall_ok:
+        if overall_ok and not is_invalid:
             dest = publish_dest or os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "docs", "load-test-report.md"))
             os.makedirs(os.path.dirname(dest), exist_ok=True)
             shutil.copyfile(report_path, dest)
@@ -744,6 +812,8 @@ def generate_report(results_dir, prom_url="http://127.0.0.1:9090", publish=False
             publish_message = f"Published passing report to {dest}"
         else:
             reasons = []
+            if is_invalid:
+                reasons.append(f"run is INVALID ({invalid_reason})")
             if not scenarios_present:
                 reasons.append("no k6 scenario summaries present")
             elif not thresholds_ok:
@@ -752,6 +822,8 @@ def generate_report(results_dir, prom_url="http://127.0.0.1:9090", publish=False
                 reasons.append("audit was NOT RUN")
             elif not audit_ok:
                 reasons.append("one or more audit items failed")
+            if not soak_ok:
+                reasons.append("soak drift or soak gate failed")
             publish_message = f"Skipped publishing docs/load-test-report.md because: {'; '.join(reasons)}"
     else:
         publish_message = "LOAD_PUBLISH is not enabled; report kept in results directory only."
@@ -761,19 +833,204 @@ def generate_report(results_dir, prom_url="http://127.0.0.1:9090", publish=False
         "overall_ok": overall_ok,
         "overall_status": overall_status,
         "audit_status": audit_status,
+        "invalid": is_invalid,
         "published": published,
         "publish_message": publish_message,
     }
 
 
+def publish_sustained_report(sustained_dirs, profile_path="loadtest/sustainable-profile.json",
+                             overload_dirs=None, publish_dest=None, enable_live=True):
+    """
+    Publishes docs/load-test-report.md ONLY if all sustained runs (3 valid runs)
+    are VALID, pass every k6 threshold, and pass every audit item A1..A9.
+    Includes breakpoint tables, derivation, environment, sustained results,
+    'Behavior beyond capacity' overload summary, and honest limits.
+    """
+    import statistics
+
+    results_root = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "loadtest", "results"))
+    dest = publish_dest or os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "docs", "load-test-report.md"))
+
+    if len(sustained_dirs) < 3:
+        return {"published": False, "reason": f"need 3 valid sustained runs, got {len(sustained_dirs)}"}
+
+    run_summaries = []
+    blockers = []
+    for rd in sustained_dirs:
+        rd = os.path.abspath(rd)
+        rid = os.path.basename(rd)
+        if os.path.isfile(os.path.join(rd, "INVALID")):
+            blockers.append(f"{rid}: INVALID")
+            continue
+        sh_p = os.path.join(rd, "sustained-hold-summary.json")
+        sj_p = os.path.join(rd, "sustained-journey-summary.json")
+        au_p = os.path.join(rd, "audit.json")
+        if not (os.path.isfile(sh_p) and os.path.isfile(sj_p) and os.path.isfile(au_p)):
+            blockers.append(f"{rid}: missing sustained summaries or audit.json")
+            continue
+        sh = json.load(open(sh_p))
+        sj = json.load(open(sj_p))
+        au = json.load(open(au_p))
+        th = extract_thresholds(sh) + extract_thresholds(sj)
+        th_ok = bool(th) and all(t["ok"] for t in th)
+        au_ok = au.get("overall") == "PASS"
+        if not th_ok:
+            blockers.append(f"{rid}: k6 thresholds failed ({sum(1 for t in th if t['ok'])}/{len(th)})")
+        if not au_ok:
+            blockers.append(f"{rid}: audit failed")
+        hm = sh.get("metrics", {})
+        hmeta = sh.get("_meta", {})
+        jm = sj.get("metrics", {})
+        jmeta = sj.get("_meta", {})
+        h_p1 = int(hm.get("plateau1_reqs", {}).get("values", {}).get("count", 0) or 0)
+        h_dur = float(hmeta.get("plateau1_duration_s") or 300)
+        j_p1 = int(jm.get("plateau1_reqs", {}).get("values", {}).get("count", 0) or 0)
+        j_dur = float(jmeta.get("journey_duration_s") or 300)
+        run_summaries.append({
+            "dir": rd,
+            "run_id": rid,
+            "thresholds_passed": sum(1 for t in th if t["ok"]),
+            "thresholds_total": len(th),
+            "audit_overall": au.get("overall", "FAIL"),
+            "hold_rps": h_p1 / h_dur if h_dur > 0 else 0.0,
+            "journey_jps": j_p1 / j_dur if j_dur > 0 else 0.0,
+            "hold_p99_ms": float(hm.get("http_req_duration{name:hold}", {}).get("values", {}).get("p(99)", 0.0) or 0.0),
+            "checkout_p99_ms": float(jm.get("http_req_duration{name:checkout}", {}).get("values", {}).get("p(99)", 0.0) or 0.0),
+            "saga_p95_ms": float(jm.get("saga_latency", {}).get("values", {}).get("p(95)", 0.0) or 0.0),
+        })
+
+    if blockers:
+        return {"published": False, "reason": "; ".join(blockers)}
+
+    profile = json.load(open(profile_path)) if os.path.isfile(profile_path) else {}
+    run_meta = json.load(open(os.path.join(sustained_dirs[0], "run-meta.json"))) if os.path.isfile(os.path.join(sustained_dirs[0], "run-meta.json")) else {}
+    env = collect_environment(sustained_dirs[0], run_meta, enable_live=enable_live)
+
+    generated_at = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    lines = [
+        "# Ticketing Platform Load Test Report (Sustained Capacity)",
+        "",
+        f"- **Generated (UTC)**: `{generated_at}`",
+        f"- **Sustained Runs Verified (3/3 VALID)**: " + ", ".join(f"`{r['run_id']}`" for r in run_summaries),
+        f"- **Overall Publish Gate**: **{status_str(True)}** (all thresholds and audit items A1..A9 verified in all 3 valid runs)",
+        "",
+        "## 1. Environment",
+        "",
+        "| Property | Value |",
+        "| :--- | :--- |",
+        f"| Host OS | `{env['os']}` |",
+        f"| Host CPU | `{env['cpu_model']}` ({env['cpu_cores']} logical cores) |",
+        f"| Host Memory | `{env['host_memory']}` |",
+        f"| Docker VM CPU / Memory | `{env['docker_vm_cpus']}` CPUs / `{env['docker_vm_memory']}` |",
+        f"| k6 Image | `{env['k6_image']}` |",
+        f"| Java Version (container) | `{env['java_version']}` |",
+        f"| PostgreSQL Version | `{env['postgres_version']}` |",
+        f"| Monitored Containers | `{env['container_count']}` |",
+        "",
+        "## 2. Breakpoint Staircases & Sustainable Profile Derivation",
+        "",
+    ]
+
+    if profile:
+        h_prof = profile.get("hold", {})
+        j_prof = profile.get("journey", {})
+        lines.append(f"- **Derivation Rule**: `{profile.get('rule', '')}`")
+        lines.append(f"- **Hold Sustainable Rate**: `{h_prof.get('sustainable_rps')} req/s` from run `{h_prof.get('breakpoint_run_id')}` (`{h_prof.get('derivation')}`)")
+        lines.append(f"- **Journey Sustainable Rate**: `{j_prof.get('sustainable_jps')} journeys/s` from run `{j_prof.get('breakpoint_run_id')}` (`{j_prof.get('derivation')}`)")
+        lines.append("")
+        for bp_rid in (h_prof.get("breakpoint_run_id"), j_prof.get("breakpoint_run_id")):
+            if bp_rid:
+                bp_md = os.path.join(results_root, bp_rid, "breakpoint.md")
+                if os.path.isfile(bp_md):
+                    lines.append(open(bp_md).read().strip())
+                    lines.append("")
+
+    lines.append("## 3. Sustained Profile Verification (3 Valid Runs)")
+    lines.append("")
+    lines.append("| Run ID | Thresholds | Audit | Hold Plateau (req/s) | Journey Plateau (j/s) | Hold p99 (ms) | Checkout p99 (ms) | Saga p95 (ms) |")
+    lines.append("| :--- | :---: | :---: | ---: | ---: | ---: | ---: | ---: |")
+    for r in run_summaries:
+        lines.append(
+            f"| `{r['run_id']}` | {r['thresholds_passed']}/{r['thresholds_total']} | **{r['audit_overall']}** | "
+            f"{r['hold_rps']:.2f} | {r['journey_jps']:.2f} | {r['hold_p99_ms']:.2f} | {r['checkout_p99_ms']:.2f} | {r['saga_p95_ms']:.2f} |"
+        )
+    lines.append(
+        f"| **Median (3 runs)** | — | — | **{statistics.median(r['hold_rps'] for r in run_summaries):.2f}** | "
+        f"**{statistics.median(r['journey_jps'] for r in run_summaries):.2f}** | "
+        f"**{statistics.median(r['hold_p99_ms'] for r in run_summaries):.2f}** | "
+        f"**{statistics.median(r['checkout_p99_ms'] for r in run_summaries):.2f}** | "
+        f"**{statistics.median(r['saga_p95_ms'] for r in run_summaries):.2f}** |"
+    )
+    lines.append("")
+
+    lines.append("## 4. Behavior Beyond Capacity (Overload Profile Runs)")
+    lines.append("")
+    lines.append("The original `flash-sale.js` (400 req/s) and `checkout-journey.js` (25 journeys/s) scenarios intentionally exceed single-node laptop capacity and are **not** presented as sustainable capacity. They verify system integrity under overload:")
+    lines.append("")
+    lines.append("| Overload Run ID | Validity | Flash Plateau 2 (req/s) | Flash Hold p99 (ms) | Journey Checkout p99 (ms) | Audit Verdict | Integrity Note |")
+    lines.append("| :--- | :---: | ---: | ---: | ---: | :---: | :--- |")
+    for od in (overload_dirs or []):
+        od = os.path.abspath(od)
+        orid = os.path.basename(od)
+        oinv = os.path.isfile(os.path.join(od, "INVALID"))
+        fs = json.load(open(os.path.join(od, "flash-sale-summary.json"))) if os.path.isfile(os.path.join(od, "flash-sale-summary.json")) else {}
+        js = json.load(open(os.path.join(od, "checkout-journey-summary.json"))) if os.path.isfile(os.path.join(od, "checkout-journey-summary.json")) else {}
+        au = json.load(open(os.path.join(od, "audit.json"))) if os.path.isfile(os.path.join(od, "audit.json")) else {}
+        p2 = int(fs.get("metrics", {}).get("plateau2_reqs", {}).get("values", {}).get("count", 0) or 0)
+        p2_dur = float(fs.get("_meta", {}).get("plateau2_duration_s") or 60)
+        hp99 = float(fs.get("metrics", {}).get("http_req_duration{name:hold}", {}).get("values", {}).get("p(99)", 0.0) or 0.0)
+        cp99 = float(js.get("metrics", {}).get("http_req_duration{name:checkout}", {}).get("values", {}).get("p(99)", 0.0) or 0.0)
+        a1 = next((i["status"] for i in au.get("items", []) if i["id"] == "A1"), "n/a")
+        a5 = next((i["status"] for i in au.get("items", []) if i["id"] == "A5"), "n/a")
+        lines.append(
+            f"| `{orid}` | {'INVALID' if oinv else 'VALID'} | {p2 / p2_dur if p2_dur else 0:.2f} | {hp99:.2f} | {cp99:.2f} | "
+            f"**{au.get('overall', 'NOT RUN')}** | A1(no oversell)={a1}, A5(0 DLT)={a5} |"
+        )
+    lines.append("")
+
+    lines.append("## 5. Honest Limits")
+    lines.append("")
+    lines.append("- **Single-node Docker on a laptop**: All application services, Kafka, Redis, three PostgreSQL instances, observability containers, and k6 share one Docker VM.")
+    lines.append("- **Shared CPU contention**: k6 competes directly with the system under test for CPU and memory bandwidth.")
+    lines.append("- **Non-production scope**: Sustained rates reflect reproducible local-host capacity for regression tracking, not production sizing.")
+    lines.append("")
+
+    os.makedirs(os.path.dirname(dest), exist_ok=True)
+    with open(dest, "w") as f:
+        f.write("\n".join(lines))
+    return {"published": True, "dest": dest}
+
+
 def main():
     parser = argparse.ArgumentParser(description="Generate load test report from results directory")
-    parser.add_argument("results_dir", help="Path to loadtest/results/<ts>")
+    parser.add_argument("results_dir", nargs="?", help="Path to loadtest/results/<ts>")
     parser.add_argument("--prometheus-url", default=os.environ.get("PROMETHEUS_URL", "http://127.0.0.1:9090"))
     parser.add_argument("--publish", action="store_true", help="Copy report to docs/load-test-report.md if all checks pass")
     parser.add_argument("--publish-dest", default=None, help="Override publish destination path")
     parser.add_argument("--offline", action="store_true", help="Disable live Prometheus and docker CLI queries")
+    parser.add_argument("--publish-sustained", nargs="+", metavar="RESULTS_DIR", help="Publish docs/load-test-report.md from 3 valid sustained runs")
+    parser.add_argument("--profile", default="loadtest/sustainable-profile.json")
+    parser.add_argument("--overload", nargs="*", default=[], help="Overload run directories to summarize under Behavior beyond capacity")
     args = parser.parse_args()
+
+    if args.publish_sustained:
+        res = publish_sustained_report(
+            args.publish_sustained,
+            profile_path=args.profile,
+            overload_dirs=args.overload,
+            publish_dest=args.publish_dest,
+            enable_live=not args.offline,
+        )
+        if res["published"]:
+            print(f"[report] Published sustained capacity report to {res['dest']}")
+            sys.exit(0)
+        else:
+            print(f"[report] Skipped publishing docs/load-test-report.md: {res['reason']}")
+            sys.exit(1)
+
+    if not args.results_dir:
+        parser.error("results_dir is required unless --publish-sustained is used")
 
     publish_flag = args.publish or (os.environ.get("LOAD_PUBLISH", "false").lower() == "true")
     res = generate_report(

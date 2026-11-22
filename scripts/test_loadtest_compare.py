@@ -108,6 +108,22 @@ class TestLoadtestCompare(unittest.TestCase):
             self.assertIn("| Peak Consumer Lag (`payment-service-order-cg`) | 1478.0 | 12.0 | 12.0 .. 12.0 |", md)
             self.assertIn("| Peak HikariCP Pending (`inventory-service`) | n/a | 3.0 | 3.0 .. 3.0 |", md)
 
+    def test_excludes_invalid_after_runs_from_median_and_range(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            base = os.path.join(tmp, "base")
+            a1 = os.path.join(tmp, "a1")
+            a2_invalid = os.path.join(tmp, "a2")
+            write_synthetic_run(base, "BASE", 18000, 4200.0, 1900.0, 31000.0, 130.0, 1478.0, 179.0, 44.36, 315.0, "FAIL", 125)
+            write_synthetic_run(a1, "VALID1", 24000, 200.0, 250.0, 2000.0, 0.0, 10.0, 2.0, 1.2, 220.0, "PASS", 5)
+            write_synthetic_run(a2_invalid, "INVALID1", 1000, 480000.0, 15000.0, 45000.0, 500.0, 999.0, 200.0, 489.0, 9999.0, "FAIL", 99)
+            with open(os.path.join(a2_invalid, "INVALID"), "w") as f:
+                f.write("Host sleep gap 487s > 15s\n")
+
+            md = loadtest_compare.render_comparison_markdown(base, [a1, a2_invalid])
+            self.assertIn("Excluded INVALID Runs (NOT COUNTED)", md)
+            self.assertIn("INVALID1", md)
+            self.assertIn("| Flash Sale Hold p99 | 4200.00 ms | 200.00 ms | 200.00 ms .. 200.00 ms |", md)
+
 
 if __name__ == "__main__":
     unittest.main()

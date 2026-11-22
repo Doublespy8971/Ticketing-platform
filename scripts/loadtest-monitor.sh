@@ -111,11 +111,11 @@ case "$CMD" in
                             "$ts" "$cname" "${cpu_pct%\%}" "$mem_usage" "$mem_limit" "${mem_pct%\%}" >> "$STATS_CSV"
                     done <<< "$raw"
                 fi
-                sleep 5
+                sleep 4
             done
         ) >/dev/null 2>&1 &
         echo $! > "${RESULTS_DIR}/monitor.pid"
-        echo "[monitor] Started 5s docker stats collector (PID $(cat "${RESULTS_DIR}/monitor.pid")) -> ${STATS_CSV}"
+        echo "[monitor] Started 4s docker stats collector (PID $(cat "${RESULTS_DIR}/monitor.pid")) -> ${STATS_CSV}"
         ;;
 
     stop)
@@ -127,11 +127,11 @@ case "$CMD" in
         stop_collector
         capture_containers_csv "${RESULTS_DIR}/containers-end.csv"
         echo "[monitor] Captured end container snapshot in ${RESULTS_DIR}/containers-end.csv"
-        # Prominently report any restart or OOM kill
-        python3 - "${RESULTS_DIR}/containers-start.csv" "${RESULTS_DIR}/containers-end.csv" <<'PYEOF'
-import csv, sys
+        # Prominently report any restart/OOM kill and detect docker-stats timestamp gaps > 15s (host sleep/VM pause)
+        python3 - "${RESULTS_DIR}" "${RESULTS_DIR}/containers-start.csv" "${RESULTS_DIR}/containers-end.csv" "${RESULTS_DIR}/docker-stats.csv" <<'PYEOF'
+import csv, datetime, os, sys
 
-start_path, end_path = sys.argv[1], sys.argv[2]
+results_dir, start_path, end_path, stats_path = sys.argv[1:5]
 start = {}
 try:
     with open(start_path, newline="") as f:
@@ -163,6 +163,40 @@ if issues:
     print("==========================================================================")
 else:
     print("[monitor] Clean container health: 0 restarts and 0 OOM kills detected.")
+
+# Detect host sleep / Docker VM pause: any consecutive timestamp gap > 15s in docker-stats.csv
+MAX_GAP_SEC = 15
+gaps = []
+if os.path.isfile(stats_path):
+    timestamps = set()
+    with open(stats_path, newline="") as f:
+        for row in csv.DictReader(f):
+            ts = (row.get("timestamp_utc") or "").strip()
+            if ts:
+                timestamps.add(ts)
+    ordered = sorted(timestamps)
+    for a, b in zip(ordered, ordered[1:]):
+        try:
+            ta = datetime.datetime.fromisoformat(a.replace("Z", "+00:00"))
+            tb = datetime.datetime.fromisoformat(b.replace("Z", "+00:00"))
+            dt = (tb - ta).total_seconds()
+            if dt > MAX_GAP_SEC:
+                gaps.append((a, b, dt))
+        except ValueError:
+            continue
+
+invalid_path = os.path.join(results_dir, "INVALID")
+if gaps:
+    gap_desc = "; ".join(f"{a} -> {b} ({dt:.0f}s)" for a, b, dt in gaps)
+    reason = f"Host sleep or Docker VM pause detected: docker-stats.csv timestamp gap(s) > {MAX_GAP_SEC}s: {gap_desc}\n"
+    with open(invalid_path, "w") as f:
+        f.write(reason)
+    print("==========================================================================")
+    print(f"[ALERT] RUN MARKED INVALID ({invalid_path})")
+    print(f"  {reason.strip()}")
+    print("==========================================================================")
+else:
+    print(f"[monitor] Clean host continuity: 0 docker-stats.csv timestamp gaps > {MAX_GAP_SEC}s.")
 PYEOF
         ;;
 

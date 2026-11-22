@@ -159,9 +159,21 @@ def parse_quiescence_seconds(audit_data):
 
 def extract_run_metrics(results_dir, prom_url=None):
     results_dir = os.path.abspath(results_dir)
+    invalid_path = os.path.join(results_dir, "INVALID")
+    is_invalid = os.path.isfile(invalid_path)
+    invalid_reason = open(invalid_path).read().strip() if is_invalid else ""
+
     run_meta = load_json(os.path.join(results_dir, "run-meta.json")) or {}
-    flash = load_json(os.path.join(results_dir, "flash-sale-summary.json")) or {}
-    journey = load_json(os.path.join(results_dir, "checkout-journey-summary.json")) or {}
+    flash = (
+        load_json(os.path.join(results_dir, "flash-sale-summary.json"))
+        or load_json(os.path.join(results_dir, "sustained-hold-summary.json"))
+        or {}
+    )
+    journey = (
+        load_json(os.path.join(results_dir, "checkout-journey-summary.json"))
+        or load_json(os.path.join(results_dir, "sustained-journey-summary.json"))
+        or {}
+    )
     audit = load_json(os.path.join(results_dir, "audit.json"))
     prom = load_json(os.path.join(results_dir, "prometheus-metrics.json"))
 
@@ -192,6 +204,8 @@ def extract_run_metrics(results_dir, prom_url=None):
 
     return {
         "run_id": run_meta.get("run_id") or os.path.basename(results_dir),
+        "invalid": is_invalid,
+        "invalid_reason": invalid_reason,
         "plateau1_rps": (p1_reqs / p1_dur) if (p1_reqs is not None and p1_dur > 0) else None,
         "plateau2_rps": (p2_reqs / p2_dur) if (p2_reqs is not None and p2_dur > 0) else None,
         "journey_jps": (j_iters / j_dur) if (j_iters is not None and j_dur > 0) else None,
@@ -233,13 +247,21 @@ def fmt_median_range(vals, unit="", decimals=2):
 
 def render_comparison_markdown(baseline_dir, after_dirs, prom_url=None):
     base = extract_run_metrics(baseline_dir, prom_url=prom_url)
-    afters = [extract_run_metrics(d, prom_url=prom_url) for d in after_dirs]
+    all_afters = [extract_run_metrics(d, prom_url=prom_url) for d in after_dirs]
+    excluded = [a for a in all_afters if a.get("invalid")]
+    afters = [a for a in all_afters if not a.get("invalid")]
 
     lines = []
     lines.append("# Load Test Comparison: Baseline vs After")
     lines.append("")
-    lines.append(f"- **Baseline**: `{base['run_id']}`")
-    lines.append(f"- **After Runs ({len(afters)})**: " + ", ".join(f"`{a['run_id']}`" for a in afters))
+    base_note = " (**INVALID — NOT COUNTED**)" if base.get("invalid") else ""
+    lines.append(f"- **Baseline**: `{base['run_id']}`{base_note}")
+    lines.append(f"- **After Runs ({len(afters)} valid)**: " + (", ".join(f"`{a['run_id']}`" for a in afters) if afters else "_none_"))
+    if excluded:
+        lines.append(
+            "- **Excluded INVALID Runs (NOT COUNTED)**: "
+            + "; ".join(f"`{e['run_id']}` ({e['invalid_reason']})" for e in excluded)
+        )
     lines.append("")
     lines.append("| Metric | Baseline | After (Median) | After (Range) |")
     lines.append("| :--- | ---: | ---: | ---: |")

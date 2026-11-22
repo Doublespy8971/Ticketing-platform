@@ -25,6 +25,7 @@ import {
 } from './lib/checks.js';
 import {
   holdCreated,
+  holdUnknownOutcome,
   holdDuration,
   orderMaterializationLatency,
   checkoutDuration,
@@ -36,6 +37,7 @@ import {
   journeysTimedOut,
   unexpectedStatuses,
   initJourneyCounters,
+  isUnknownHoldOutcome,
 } from './lib/metrics.js';
 
 const BASE_URL = __ENV.BASE_URL || 'http://gateway-service:8080';
@@ -153,6 +155,10 @@ export default function (data) {
   const holdBody = safeJson(holdRes);
   holdDuration.add(holdRes.timings.duration, { name: 'hold' });
   checkJourneyHold(holdRes, holdBody);
+
+  if (isUnknownHoldOutcome(holdRes.status)) {
+    holdUnknownOutcome.add(1);
+  }
 
   if (holdRes.status !== 201 || !holdBody || !holdBody.reservationId) {
     unexpectedStatuses.add(1);

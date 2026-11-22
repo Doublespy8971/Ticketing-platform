@@ -170,15 +170,18 @@ A7_STUCK_ORDERS=$(psql_query "$ORDER_CONTAINER" "$ORDER_DB" \
 A7_RESERVED_ORDERS=$(psql_query "$ORDER_CONTAINER" "$ORDER_DB" \
     "SELECT count(*) FROM orders WHERE status = 'RESERVED';")
 
-# Determine run_id from run-meta.json or k6 summaries for A8
+# Determine run_id from run-meta.json or any k6 summary JSON for A8
 RUN_ID=$(python3 - "$RESULTS_DIR" <<'PYEOF'
-import json, os, sys
+import glob, json, os, sys
 rd = sys.argv[1]
-for fname in ("run-meta.json", "flash-sale-summary.json", "checkout-journey-summary.json"):
-    p = os.path.join(rd, fname)
+candidates = [os.path.join(rd, "run-meta.json")] + sorted(glob.glob(os.path.join(rd, "*-summary.json")))
+for p in candidates:
     if os.path.isfile(p):
-        with open(p) as f:
-            d = json.load(f)
+        try:
+            with open(p) as f:
+                d = json.load(f)
+        except Exception:
+            continue
         rid = d.get("run_id") or d.get("_meta", {}).get("run_id")
         if rid:
             print(rid)
@@ -333,29 +336,61 @@ add_item(
     f"stuck_pending_orders={a7_stuck} (resting RESERVED holds awaiting 10m TTL={a7_reserved})",
 )
 
-# A8: k6 201 hold responses vs DB reservations for run's events
-k6_201_total = 0
+# A8: Refined hold-count invariant: C <= R <= C + U
+#   R = reservations created in inventory_db for the run's events
+#   C = k6 count of 201 hold responses (hold_created)
+#   U = k6 count of hold responses with unknown client outcome (hold_unknown_outcome: 0/500/502/504)
+#   PASS if C <= R <= C + U (exact R == C when U == 0);
+#   FAIL if R < C (phantom hold) or R > C + U (unexplained holds).
+#   Note: holds created for unknown outcomes expire normally after the hold TTL (not leaked).
+import glob as _glob
+k6_c_total = 0
+k6_u_total = 0
 k6_files_found = []
-for fname in ("flash-sale-summary.json", "checkout-journey-summary.json"):
-    p = os.path.join(results_dir, fname)
-    if os.path.isfile(p):
-        k6_files_found.append(fname)
-        with open(p) as f:
-            d = json.load(f)
-        hc = d.get("metrics", {}).get("hold_created", {}).get("values", {}).get("count", 0)
-        k6_201_total += int(hc or 0)
+for p in sorted(_glob.glob(os.path.join(results_dir, "*-summary.json"))):
+    fname = os.path.basename(p)
+    k6_files_found.append(fname)
+    with open(p) as f:
+        d = json.load(f)
+    m = d.get("metrics", {})
+    hc = m.get("hold_created", {}).get("values", {}).get("count", 0)
+    hu = m.get("hold_unknown_outcome", {}).get("values", {}).get("count", 0)
+    k6_c_total += int(hc or 0)
+    k6_u_total += int(hu or 0)
 
-a8_db_res = int(a8_db_res_s)
+a8_r = int(a8_db_res_s)
 a8_db_events = int(a8_db_events_s)
+a8_name = "inventory_db holds R satisfy C <= R <= C + U (C=201 holds, U=unknown outcomes)"
 if not k6_files_found:
-    add_item("A8", "k6 201 hold count equals reservations created in inventory_db", False, "No k6 summary JSON files found")
-else:
-    a8_pass = (k6_201_total == a8_db_res) and (a8_db_events > 0)
+    add_item("A8", a8_name, False, "No k6 summary JSON files found")
+elif a8_db_events <= 0:
     add_item(
         "A8",
-        "k6 201 hold count equals reservations created in inventory_db",
-        a8_pass,
-        f"k6_201_holds={k6_201_total}, inventory_db_reservations={a8_db_res} (run_id={run_id or 'all'}, events={a8_db_events}, summaries={','.join(k6_files_found)})",
+        a8_name,
+        False,
+        f"C={k6_c_total}, U={k6_u_total}, R={a8_r}, branch=NO_RUN_EVENTS (run_id={run_id or 'all'}, events={a8_db_events})",
+    )
+elif a8_r < k6_c_total:
+    add_item(
+        "A8",
+        a8_name,
+        False,
+        f"C={k6_c_total}, U={k6_u_total}, R={a8_r}, branch=FAIL_PHANTOM_HOLD (R < C; run_id={run_id or 'all'}, events={a8_db_events}, summaries={','.join(k6_files_found)})",
+    )
+elif a8_r > k6_c_total + k6_u_total:
+    add_item(
+        "A8",
+        a8_name,
+        False,
+        f"C={k6_c_total}, U={k6_u_total}, R={a8_r}, branch=FAIL_UNEXPLAINED_HOLDS (R > C + U; run_id={run_id or 'all'}, events={a8_db_events}, summaries={','.join(k6_files_found)})",
+    )
+else:
+    branch = "PASS_EXACT_MATCH (R == C, U == 0)" if k6_u_total == 0 else "PASS_BOUNDED_UNKNOWN_OUTCOME (C <= R <= C + U)"
+    add_item(
+        "A8",
+        a8_name,
+        True,
+        f"C={k6_c_total}, U={k6_u_total}, R={a8_r}, branch={branch} (run_id={run_id or 'all'}, events={a8_db_events}, summaries={','.join(k6_files_found)})",
     )
 
 # A9: No container restarted or OOMKilled

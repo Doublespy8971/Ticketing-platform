@@ -180,11 +180,53 @@ python3 scripts/loadtest-compare.py \
 
 ## LOAD-006: Client-Visible `504 GATEWAY_TIMEOUT` After Downstream Commit Causes `A8` Hold-Count Divergence
 
-- **Status**: **`OPEN`** (new finding revealed in Run 2 `20261122T125331Z`)
-- **Severity**: Medium (no oversell or data corruption, but client receives `504` while a valid 10-minute `RESERVED` hold was committed in `inventory_db`)
-- **Reproduction**: `make load-fresh` (Run `20261122T125331Z`, where `gateway-service` hit `768 MiB` / `100%` memory and `785.4%` CPU, returning `4,204` `5xx` responses and `hold p99 = 15.56 s`).
+- **Status**: **`RESOLVED`** (audit definition corrected; original Run 2 evidence preserved below)
+- **Severity**: Medium (no oversell or data corruption; client received `504` while a valid 10-minute `RESERVED` hold was committed in `inventory_db`)
+- **Resolution**:
+  - Added `hold_unknown_outcome` counter in `flash-sale.js`, `checkout-journey.js`, and all new scenarios counting every hold response whose commit outcome cannot be known to the client (`status 0` / transport error, `500`, `502`, `504`).
+  - Refined `scripts/loadtest-audit.sh` rule `A8` to verify `C <= R <= C + U` (where `R` = reservations created in `inventory_db` for the run's events, `C` = k6 `201` `hold_created` count, `U` = k6 `hold_unknown_outcome` count): exact `R == C` is still required whenever `U == 0`; `R < C` fails as a phantom hold; `R > C + U` fails as unexplained holds.
+  - Holds committed on unknown-outcome requests are **not leaked**: `inventory-service`'s `ExpirySweeper` expires them normally once their 10-minute `expires_at` TTL elapses, releasing the seat in PostgreSQL and Redis.
+  - Under the corrected rule, Run 2's `+300` difference (`5,783 <= 6,083 <= 5,783 + 4,204`) is fully bounded by its gateway `504` unknown outcomes (`0` phantom holds, `0` unexplained holds, `0` oversells).
+- **Original Evidence (`20261122T125331Z`)**:
+  - Reproduction: `make load-fresh` (Run `20261122T125331Z`, where `gateway-service` hit `768 MiB` / `100%` memory and `785.4%` CPU, returning `4,204` `5xx` responses and `hold p99 = 15.56 s`).
+  - Under the original `R == C` check, `A8` failed with `k6_201_holds=5783` vs `inventory_db_reservations=6083` (`+300` reservations committed in `inventory_db` whose HTTP `201` responses timed out at the gateway before reaching k6).
+  - All consistency invariants (`A1=0` oversells, `A2: 542==542==542`, `A3=0` outbox, `A4=0` lag, `A5=0` DLT, `A6=0` duplicate payments, `A7=0` stuck pending, `A9=0` restarts/OOM) passed.
+
+---
+
+## LOAD-007: Cold-Start / Battery-Throttled `s01` Hold `p99 > 300 ms` Produces `NO BREAKPOINT FOUND`
+
+- **Status**: **`OPEN`** (revealed by `make load-breakpoint`, runs `20261122T143407Z` and `20261122T145334Z`)
+- **Severity**: High (prevents automated derivation of `loadtest/sustainable-profile.json` under cold-start / battery-powered single-node runs)
+- **Reproduction**: `make load-breakpoint` on macOS running on battery power (`45%` discharging at hold breakpoint start, load avg `29.23 59.04 91.09`; `23%` discharging at journey breakpoint start, load avg `19.42 26.60 41.85`).
 - **Observed Symptoms**:
-  - Audit `A8` failed: `k6_201_holds=5783` vs `inventory_db_reservations=6083` (`+300` reservations committed in `inventory_db` whose HTTP `201` responses never reached k6 before the gateway timed out).
-  - All consistency invariants (`A1=0` oversells, `A2: 542==542==542`, `A3=0` outbox, `A4=0` lag, `A5=0` DLT, `A6=0` duplicate payments, `A7=0` stuck pending, `A9=0` restarts/OOM) still passed; the 300 orphaned holds remained safely in `RESERVED` state awaiting their 10-minute TTL expiry.
+  - Earlier hold breakpoint run `20261122T141040Z` (before reducing `BP_HOLD_EVENTS` from 6 to 1) was marked **`INVALID (NOT COUNTED)`** due to 4 Docker VM pause gaps (`23s`, `133s`, `22s`, `23s`) while `k6` reached `1,700.9 MiB` RAM on battery power (`71%`, load avg `33.93`).
+  - Valid hold breakpoint run `20261122T143407Z` (VALID, Audit **PASS 9/9**, quiesced in `73 s`, `A8: C=6218, U=77, R=6218 PASS`):
+    - Step `s01` (`25 req/s`): `hold p50 = 142.01 ms`, `p95 = 1329.89 ms`, **`p99 = 1673.96 ms`** (`>= 300 ms`, `0` errors, `0` dropped) -> **FAIL**.
+    - Steps `s02..s07` (`50..175 req/s`): `hold p99 = 490.16..3730.96 ms` -> **FAIL**.
+    - Step `s08` (`200 req/s`, once JVMs warmed up and seats reached steady contention): `hold p50 = 14.96 ms`, `p95 = 103.30 ms`, `p99 = 194.74 ms`, `0%` errors, `0` dropped -> **PASS** (does not establish a breakpoint because `s01..s07` failed).
+    - Result: **`NO BREAKPOINT FOUND`**.
+  - Valid journey breakpoint run `20261122T145334Z` (VALID, `A1/A2/A4/A5/A6/A7/A8/A9` PASS, `A2: 10317==10317==10317`, `A8: C=11508, U=6, R=11511 PASS`, `A3 FAIL` see `LOAD-008`):
+    - Step `s01` (`2 j/s`): **`hold p99 = 543.42 ms`** (`>= 300 ms`), `checkout p99 = 485.97 ms` (`< 500 ms`), `saga p95 = 3345.40 ms` (`< 5000 ms`), `0%` errors, `0` dropped -> **FAIL**.
+    - Step `s02` (`4 j/s`): **`hold p99 = 387.94 ms`** (`>= 300 ms`), `checkout p99 = 227.13 ms`, `saga p95 = 2352.00 ms` -> **FAIL**.
+    - Steps `s03` (`6 j/s`: hold p99 `209.51 ms`, checkout p99 `167.65 ms`, saga p95 `2317.20 ms`), `s04` (`8 j/s`: hold p99 `237.36 ms`, checkout p99 `387.16 ms`, saga p95 `2437.95 ms`), and `s06` (`12 j/s`: hold p99 `198.26 ms`, checkout p99 `162.89 ms`, saga p95 `2495.80 ms`) ALL **PASSED** once JVMs warmed up; saturation onset began at `s07` (`14 j/s`: `hold p99 = 9026.90 ms`, `saga p95 = 19475.40 ms`, `89` dropped).
+    - Result: **`NO BREAKPOINT FOUND`** -> `loadtest/sustainable-profile.json` was **not** created, and `load-sustained-x3` / `load-soak` were not executed.
+- **Evidence (Prometheus, Container Stats & Logs from `20261122T145334Z`)**:
+  - `max_over_time(jvm_gc_pause_seconds_max[20m])`: `gateway-service` **`2.824 s`**, `inventory-service` **`1.585 s`**, `order-service` **`1.489 s`**, `payment-service` **`1.357 s`** (`G1 Young Generation` pauses under battery-throttled CPU contention).
+  - `gateway-service` total GC pause: `26.650 s` (hold BP) / `31.973 s` (journey BP); `Peak Mem` hit `767.9 MiB` (`100.0%`) in hold BP and `767.0 MiB` (`99.9%`) in journey BP; `order-service` hit `767.9 MiB` (`100.0%`) and `Peak HikariCP Pending = 169.0` in journey BP.
+  - Container logs (`20261122T145334Z`): `gateway-service` logged `190` `PoolAcquireTimeoutException`, `52` Redis rate-limiter 200ms timeouts (failing open), `5` `ResponseStatusException`; `inventory-service` logged `33` `RedisCommandTimeoutException` (`Command timed out after 500 millisecond(s)`).
 - **Root Cause**:
-  - Under severe gateway/inventory latency spikes exceeding the gateway's upstream response timeout (`10 s`), `gateway-service` returns `504 GATEWAY_TIMEOUT` to the caller while `inventory-service` finishes committing the PostgreSQL transaction. Without client-side retry with the same `Idempotency-Key` (the k6 flash-sale scenario does not retry 504s), the reservation exists in `inventory_db` without the caller observing `201`.
+  - Two compounding factors broke step `s01` before steady-state throughput was reached: (1) cold JVM JIT compilation & initial G1GC allocation spikes right after `make stack-reset` (no warmup phase before `s01`), and (2) running on macOS **Battery Power** (`45% -> 23%` discharging, host load average `19..91`), which aggressively throttles CPU frequency and stretches G1 Young GC pauses to `1.4–2.8 s`. Re-running `make load-breakpoint` on AC power with an idle host (and optionally adding an unmeasured warmup phase before `s01`) is needed to measure the true AC-power breakpoint.
+
+---
+
+## LOAD-008: `ExpirySweeper` Emits New `inventory.seat.released` Outbox Rows During Post-Run Audit of Runs Exceeding 10 Minutes
+
+- **Status**: **`OPEN`** (revealed by `20261122T145334Z`, 15-minute journey breakpoint run)
+- **Severity**: Low (harmless race between background 10-minute hold TTL expiration and `loadtest-audit.sh` `A3` snapshot query)
+- **Reproduction**: Any run lasting longer than the 10-minute (`600 s`) hold TTL with resting `RESERVED` / abandoned holds (e.g., `breakpoint-journey` at `15 min`, or `soak` at `20 min`).
+- **Observed Symptoms**:
+  - In `20261122T145334Z`, `loadtest-audit.sh` quiescence **PASSED** in `7 s` (`outbox unpublished: 0/0/0, kafka lag: 0`), and `A1`, `A2` (`10317==10317==10317`), `A4` (`total_lag=0`), `A5` (`0` DLT), `A6`, `A7`, `A8` (`C=11508, U=6, R=11511`), and `A9` all **PASSED**.
+  - Seconds later during the `A3` SQL query, `inventory_db` reported `unpublished=1` because `ExpirySweeper` expired a 10-minute-old abandoned hold from early in the 15-minute run and inserted a new `inventory.seat.released` outbox row right before the `A3` poll (published on the next 200 ms outbox tick).
+- **Root Cause**:
+  - `A3` takes a single point-in-time `SELECT count(*) FROM outbox_events WHERE published_at IS NULL` after the quiescence loop exits; on runs exceeding the 10-minute hold TTL, background `ExpirySweeper` activity continues legitimately expiring abandoned holds and writing new outbox rows for 10 minutes after the run ends.

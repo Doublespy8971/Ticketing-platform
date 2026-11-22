@@ -214,12 +214,58 @@ export function setupTwoEvents(baseUrl, adminToken, runId, seatsPerEvent = 5000)
 }
 
 /**
+ * Setup helper: creates `eventCount` events of `seatsPerEvent` (default 5000) unique seats each,
+ * bulk-creating in chunks of 2500 (within the documented 5000-seat bulk limit), puts each ON_SALE,
+ * waits until visible, and fails clearly if fewer than expected seats are created.
+ */
+export function setupMultipleEvents(baseUrl, adminToken, runId, labelPrefix, eventCount, seatsPerEvent = 5000) {
+  if (eventCount < 1 || seatsPerEvent < 1) {
+    throw new Error(`Invalid setupMultipleEvents arguments: eventCount=${eventCount}, seatsPerEvent=${seatsPerEvent}`);
+  }
+  const nowMs = Date.now();
+  const dropTimeIso = new Date(nowMs - 60 * 1000).toISOString().replace(/\.\d{3}Z$/, 'Z');
+  const eventTimeIso = new Date(nowMs + 24 * 3600 * 1000).toISOString().replace(/\.\d{3}Z$/, 'Z');
+
+  const events = [];
+  let totalSeatsCreated = 0;
+
+  for (let i = 0; i < eventCount; i++) {
+    const suffix = String(i + 1).padStart(2, '0');
+    const evName = `loadtest-${runId}-${labelPrefix}-${suffix}`;
+    const created = createEvent(baseUrl, adminToken, evName, 'LoadTest Arena', dropTimeIso, eventTimeIso);
+    const seatIds = bulkCreateSeats(baseUrl, adminToken, created.eventId, seatsPerEvent);
+    if (seatIds.length !== seatsPerEvent) {
+      throw new Error(
+        `Unable to create required seats for ${evName}: expected ${seatsPerEvent}, got ${seatIds.length}`
+      );
+    }
+    setEventOnSale(baseUrl, adminToken, created.eventId);
+    waitEventVisible(baseUrl, created.eventId);
+    events.push({
+      eventId: created.eventId,
+      name: evName,
+      seatIds: seatIds,
+    });
+    totalSeatsCreated += seatIds.length;
+    if (i + 1 < eventCount) {
+      sleep(0.2);
+    }
+  }
+
+  console.log(
+    `[setupMultipleEvents] Created ${events.length} events (${totalSeatsCreated} total seats, ${seatsPerEvent}/event) for run ${runId}`
+  );
+  return events;
+}
+
+/**
  * POST /api/v1/reservations (Create Seat Hold)
  */
-export function postHold(baseUrl, userToken, eventId, seatId, idempotencyKey, expectedStatusesCallback) {
+export function postHold(baseUrl, userToken, eventId, seatId, idempotencyKey, expectedStatusesCallback, extraTags = null) {
+  const tags = extraTags ? Object.assign({ name: 'hold' }, extraTags) : { name: 'hold' };
   const params = {
     headers: buildHeaders(userToken, idempotencyKey, true),
-    tags: { name: 'hold' },
+    tags: tags,
     timeout: '15s',
   };
   if (expectedStatusesCallback) {
@@ -235,10 +281,11 @@ export function postHold(baseUrl, userToken, eventId, seatId, idempotencyKey, ex
 /**
  * POST /api/v1/orders/{orderId}/checkout (Checkout Order)
  */
-export function postCheckout(baseUrl, userToken, orderId, paymentMethodToken, idempotencyKey, expectedStatusesCallback) {
+export function postCheckout(baseUrl, userToken, orderId, paymentMethodToken, idempotencyKey, expectedStatusesCallback, extraTags = null) {
+  const tags = extraTags ? Object.assign({ name: 'checkout' }, extraTags) : { name: 'checkout' };
   const params = {
     headers: buildHeaders(userToken, idempotencyKey, true),
-    tags: { name: 'checkout' },
+    tags: tags,
     timeout: '15s',
   };
   if (expectedStatusesCallback) {
@@ -254,10 +301,11 @@ export function postCheckout(baseUrl, userToken, orderId, paymentMethodToken, id
 /**
  * GET /api/v1/orders/{orderId} (Poll Order Status — strictly no body per gateway rules)
  */
-export function getOrder(baseUrl, userToken, orderId, expectedStatusesCallback) {
+export function getOrder(baseUrl, userToken, orderId, expectedStatusesCallback, extraTags = null) {
+  const tags = extraTags ? Object.assign({ name: 'get_order' }, extraTags) : { name: 'get_order' };
   const params = {
     headers: buildHeaders(userToken, null, false),
-    tags: { name: 'get_order' },
+    tags: tags,
     timeout: '15s',
   };
   if (expectedStatusesCallback) {

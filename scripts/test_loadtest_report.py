@@ -63,6 +63,7 @@ def make_flash_summary(p99_ms=42.5, p99_ok=True, unexp=0, unexp_ok=True):
                 "values": {"count": unexp},
                 "thresholds": {"count==0": {"ok": unexp_ok}},
             },
+            "hold_unknown_outcome": {"type": "counter", "values": {"count": 0}},
             "hold_5xx": {
                 "type": "rate",
                 "values": {"rate": 0.0},
@@ -118,6 +119,7 @@ def make_journey_summary(chk_p99=110.0, chk_ok=True):
                 "thresholds": {"p(95)<5000": {"ok": True}},
             },
             "hold_created": {"type": "counter", "values": {"count": 4500}},
+            "hold_unknown_outcome": {"type": "counter", "values": {"count": 0}},
             "journey_confirmed": {"type": "counter", "values": {"count": 4050}},
             "journey_payment_failed": {"type": "counter", "values": {"count": 225}},
             "journey_abandoned": {"type": "counter", "values": {"count": 225}},
@@ -277,6 +279,62 @@ class TestLoadtestReport(unittest.TestCase):
             src = f.read()
         self.assertNotIn("**PASS**", src)
         self.assertNotIn("| PASS |", src)
+
+    def test_invalid_run_marked_not_counted_and_blocks_publish(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            rdir = os.path.join(tmp, "20261121T190000Z")
+            os.makedirs(rdir)
+            write_common_files(rdir)
+            with open(os.path.join(rdir, "flash-sale-summary.json"), "w") as f:
+                json.dump(make_flash_summary(), f)
+            with open(os.path.join(rdir, "checkout-journey-summary.json"), "w") as f:
+                json.dump(make_journey_summary(), f)
+            with open(os.path.join(rdir, "audit.json"), "w") as f:
+                json.dump(make_audit(all_pass=True), f)
+            with open(os.path.join(rdir, "INVALID"), "w") as f:
+                f.write("Host sleep detected: gap 120s > 15s\n")
+
+            pub_dest = os.path.join(tmp, "docs", "load-test-report.md")
+            res = loadtest_report.generate_report(rdir, publish=True, publish_dest=pub_dest, enable_live=False)
+
+            self.assertFalse(res["overall_ok"])
+            self.assertTrue(res["invalid"])
+            self.assertEqual(res["overall_status"], "INVALID (NOT COUNTED)")
+            self.assertFalse(res["published"])
+            self.assertFalse(os.path.exists(pub_dest))
+            content = open(res["report_path"]).read()
+            self.assertIn("RUN INVALID — NOT COUNTED", content)
+            self.assertIn("Host sleep detected: gap 120s > 15s", content)
+
+    def test_publish_sustained_requires_three_valid_passing_runs(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            dirs = []
+            for idx in range(3):
+                rd = os.path.join(tmp, f"20261122T10000{idx}Z")
+                os.makedirs(rd)
+                write_common_files(rd)
+                with open(os.path.join(rd, "sustained-hold-summary.json"), "w") as f:
+                    json.dump(make_flash_summary(), f)
+                with open(os.path.join(rd, "sustained-journey-summary.json"), "w") as f:
+                    json.dump(make_journey_summary(), f)
+                with open(os.path.join(rd, "audit.json"), "w") as f:
+                    json.dump(make_audit(all_pass=True), f)
+                dirs.append(rd)
+
+            pub_dest = os.path.join(tmp, "docs", "load-test-report.md")
+            res_ok = loadtest_report.publish_sustained_report(dirs, profile_path="/nonexistent", publish_dest=pub_dest, enable_live=False)
+            self.assertTrue(res_ok["published"])
+            self.assertTrue(os.path.isfile(pub_dest))
+            content = open(pub_dest).read()
+            self.assertIn("Behavior Beyond Capacity", content)
+
+            # Marking one run INVALID must block publishing
+            os.remove(pub_dest)
+            with open(os.path.join(dirs[1], "INVALID"), "w") as f:
+                f.write("VM pause detected\n")
+            res_bad = loadtest_report.publish_sustained_report(dirs, profile_path="/nonexistent", publish_dest=pub_dest, enable_live=False)
+            self.assertFalse(res_bad["published"])
+            self.assertFalse(os.path.exists(pub_dest))
 
 
 if __name__ == "__main__":

@@ -4,6 +4,7 @@ COMPOSE_OBS := docker compose -f infra/docker-compose.yml -f infra/docker-compos
 HEALTHY_SERVICES := kafka postgres-inventory postgres-order postgres-payment redis
 APP_SERVICES := gateway-service inventory-service order-service payment-service notification-service
 OBS_SERVICES := prometheus grafana kafka-exporter redis-exporter postgres-inventory-exporter postgres-order-exporter postgres-payment-exporter
+CAFFEINATE := $(shell command -v caffeinate >/dev/null 2>&1 && echo "caffeinate -is" || true)
 
 .PHONY: infra-up infra-down infra-reset infra-topics infra-psql-inventory infra-psql-order infra-psql-payment infra-redis-cli \
         smoke-inventory smoke-order smoke-payment smoke-gateway run-gateway smoke-notification run-notification \
@@ -11,7 +12,9 @@ OBS_SERVICES := prometheus grafana kafka-exporter redis-exporter postgres-invent
         e2e e2e-fast e2e-chaos e2e-full \
         obs-up obs-down obs-reset obs-urls obs-rules-check obs-targets-check metrics-check \
         dashboards-gen dashboards-check traffic traffic-long \
-        load-flash load-journey load-all load-fresh load-report load-audit jvm-check
+        load-flash load-journey load-all load-fresh load-report load-audit jvm-check \
+        load-breakpoint-hold load-breakpoint-journey load-breakpoint \
+        load-sustained load-sustained-x3 load-soak
 
 infra-up:
 	@test -f infra/.env || cp infra/.env.example infra/.env
@@ -215,18 +218,34 @@ traffic-long:
 	python3 scripts/traffic.py --duration 900 --rate 5 --force-expiry
 
 load-flash:
-	bash scripts/loadtest-run.sh flash
+	$(CAFFEINATE) bash scripts/loadtest-run.sh flash
 
 load-journey:
-	bash scripts/loadtest-run.sh journey
+	$(CAFFEINATE) bash scripts/loadtest-run.sh journey
 
 load-all:
-	bash scripts/loadtest-run.sh all
+	$(CAFFEINATE) bash scripts/loadtest-run.sh all
 
 load-fresh:
-	$(MAKE) stack-reset
-	$(MAKE) obs-up
-	$(MAKE) load-all
+	$(CAFFEINATE) sh -c '$(MAKE) stack-reset && $(MAKE) obs-up && $(MAKE) load-all'
+
+load-breakpoint-hold:
+	$(CAFFEINATE) bash scripts/loadtest-run.sh breakpoint-hold
+
+load-breakpoint-journey:
+	$(CAFFEINATE) bash scripts/loadtest-run.sh breakpoint-journey
+
+load-breakpoint:
+	$(CAFFEINATE) bash scripts/loadtest-run.sh breakpoint
+
+load-sustained:
+	$(CAFFEINATE) bash scripts/loadtest-run.sh sustained
+
+load-sustained-x3:
+	$(CAFFEINATE) bash scripts/loadtest-run.sh sustained-x3
+
+load-soak:
+	$(CAFFEINATE) bash scripts/loadtest-run.sh soak
 
 load-report:
 	bash scripts/loadtest-run.sh report

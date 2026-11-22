@@ -14,11 +14,13 @@ import {
   holdRateLimited,
   holdRateLimitedRate,
   holdUnexpected,
+  holdUnknownOutcome,
   hold5xx,
   holdDuration,
   plateau1Reqs,
   plateau2Reqs,
   initFlashSaleCounters,
+  isUnknownHoldOutcome,
 } from './lib/metrics.js';
 
 const BASE_URL = __ENV.BASE_URL || 'http://gateway-service:8080';
@@ -128,6 +130,9 @@ export default function (data) {
   const is5xxOrTimeout = status === 0 || status >= 500;
   hold5xx.add(is5xxOrTimeout);
   holdRateLimitedRate.add(status === 429);
+  if (isUnknownHoldOutcome(status)) {
+    holdUnknownOutcome.add(1);
+  }
 
   if (status === 201) {
     holdCreated.add(1);

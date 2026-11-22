@@ -6,6 +6,7 @@ export const holdConflict = new Counter('hold_conflict');
 export const holdRateLimited = new Counter('hold_rate_limited');
 export const holdRateLimitedRate = new Rate('hold_rate_limited_rate');
 export const holdUnexpected = new Counter('hold_unexpected');
+export const holdUnknownOutcome = new Counter('hold_unknown_outcome');
 export const hold5xx = new Rate('hold_5xx');
 export const holdDuration = new Trend('hold_duration', true);
 
@@ -34,16 +35,26 @@ export function initFlashSaleCounters() {
   holdConflict.add(0);
   holdRateLimited.add(0);
   holdUnexpected.add(0);
+  holdUnknownOutcome.add(0);
   plateau1Reqs.add(0);
   plateau2Reqs.add(0);
 }
 
 export function initJourneyCounters() {
   holdCreated.add(0);
+  holdUnknownOutcome.add(0);
   orderNotReadyRetries.add(0);
   journeyConfirmed.add(0);
   journeyPaymentFailed.add(0);
   journeyAbandoned.add(0);
   journeysTimedOut.add(0);
   unexpectedStatuses.add(0);
+}
+
+/**
+ * True when a POST /api/v1/reservations response leaves the client unable to know
+ * whether inventory_db committed the hold (transport error/timeout status 0, or 500/502/504).
+ */
+export function isUnknownHoldOutcome(status) {
+  return status === 0 || status === 500 || status === 502 || status === 504;
 }

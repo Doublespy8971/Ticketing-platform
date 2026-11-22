@@ -1,31 +1,40 @@
 # Ticketing Platform k6 Load-Test Harness
 
-Reproducible, containerized k6 load-test suite for the flash-sale ticketing platform with independent post-run database/Kafka/container auditing and automated Markdown reporting.
+Reproducible, containerized k6 load-test suite for the flash-sale ticketing platform with breakpoint discovery, derived sustained capacity verification, 20-minute soak drift detection, host-noise invalidation, independent post-run database/Kafka/container auditing, and automated Markdown reporting.
 
 ## 1. Structure
 
 ```text
 loadtest/
 ├── lib/
-│   ├── jwt.js                 # Local HS256 JWT minting (matches gateway JwtTokenService) + 5000-user SharedArray pool
-│   ├── api.js                 # Admin setup (2 events x 5000 seats) and customer HTTP helpers
+│   ├── jwt.js                 # Local HS256 JWT minting + 5000-user SharedArray pool
+│   ├── api.js                 # Admin setup (chunked 5000-seat events) and customer HTTP helpers
 │   ├── checks.js              # Response validation checks and Retry-After parser
-│   └── metrics.js             # Custom k6 Counters, Rates, and Trends
-├── flash-sale.js              # Scenario A: ramping-arrival-rate flash-sale contention on POST /api/v1/reservations
-├── checkout-journey.js        # Scenario B: constant-arrival-rate end-to-end hold -> checkout -> poll saga
+│   ├── metrics.js             # Custom k6 Counters (incl. hold_unknown_outcome), Rates, and Trends
+│   └── thresholds.js          # Shared threshold definitions (verified identical to overload scenarios)
+├── flash-sale.js              # Overload profile A: 150 -> 400 req/s flash-sale contention (untouched)
+├── checkout-journey.js        # Overload profile B: 25 journeys/s end-to-end saga (untouched)
+├── breakpoint-hold.js         # Staircase hold breakpoint (25..600 req/s, 30s/step, bounded step tags)
+├── breakpoint-journey.js      # Staircase journey breakpoint (2..40 j/s, 45s/step, unique seats)
+├── sustained-hold.js          # 5-minute sustained hold plateau at derived sustainable_rps
+├── sustained-journey.js       # 5-minute sustained journey plateau at derived sustainable_jps
+├── soak.js                    # 20-minute soak at derived sustainable_jps (SOAK_MINUTES configurable)
+├── sustainable-profile.json   # Script-generated sustainable rates + derivation (never hand-edited)
 ├── results/
-│   └── .gitkeep               # Per-run artifacts stored in loadtest/results/<UTC timestamp>/ (git-ignored)
+│   └── .gitkeep               # Per-run artifacts in loadtest/results/<UTC timestamp>/ (git-ignored)
+├── FINDINGS.md                # Honest record of measured bottlenecks, mitigations, and outcomes
 └── README.md
 ```
 
 Supporting scripts in `scripts/`:
 
-- `scripts/loadtest-run.sh`: Orchestrates pinned `grafana/k6` Docker container on `ticketing-net`, reads `JWT_SECRET` from `infra/.env` at runtime without logging/writing it, manages monitoring, audit, and reporting.
-- `scripts/loadtest-monitor.sh`: Captures container restart/OOM baselines, Kafka DLT offset baselines, and 5-second `docker stats --no-stream` CSV time series.
-- `scripts/loadtest-audit.sh`: Waits up to 120s for quiescence (outbox published + Kafka lag zero), then independently verifies invariants `A1..A9` against all 3 PostgreSQL databases, Kafka broker tools, container inspect snapshots, and k6 summary JSONs.
-- `scripts/test-loadtest-audit.sh`: Self-test using isolated scratch databases proving clean state passes and corrupted state (duplicate active seat item) fails `A1`.
-- `scripts/loadtest-report.py`: Standard-library-only Markdown report generator (`results/<ts>/report.md`) with Prometheus run-window queries and publish gating.
-- `scripts/test_loadtest_report.py`: Unit tests (`python3 -m unittest scripts/test_loadtest_report.py`).
+- `scripts/loadtest-run.sh`: Orchestrates pinned `grafana/k6` Docker container on `ticketing-net`, prints host preflight state (power source + battery warning, Docker VM CPU/RAM, running containers, load average), manages monitoring, audit, breakpoint analysis, soak drift analysis, and reporting.
+- `scripts/loadtest-monitor.sh`: Captures container restart/OOM baselines, Kafka DLT offset baselines, 4-second `docker stats --no-stream` CSV time series, and flags any timestamp gap `> 15s` as `results/<ts>/INVALID`.
+- `scripts/loadtest-audit.sh`: Waits up to 120s for quiescence (outbox published + Kafka lag zero), then independently verifies invariants `A1..A9` against all 3 PostgreSQL databases, Kafka broker tools, container snapshots, and k6 summary JSONs.
+- `scripts/loadtest-breakpoint.py`: Computes per-step metrics, breakpoint (highest step where this step and all lower steps pass SLO/error/unknown/drop criteria), and derived sustainable rate (`70%` rounded down to step multiple, `>= 1 step`), writing `results/<ts>/breakpoint.json` and `loadtest/sustainable-profile.json`.
+- `scripts/loadtest-soak-report.py`: Computes 2-minute windowed Prometheus + `docker-stats.csv` time series over a soak run and detects latency (`>1.3x`), old-gen heap (`>20%` positive OLS growth), and monotonic queue/lag/Hikari drift over the last 10 minutes.
+- `scripts/loadtest-report.py`: Generates per-run `results/<ts>/report.md` and enforces the strict publish gate for `docs/load-test-report.md` (only from 3 valid, fully passing sustained runs).
+- `scripts/loadtest-compare.py`: Compares baseline vs valid after runs (median & min..max range), automatically excluding `INVALID` runs.
 
 ---
 
@@ -33,138 +42,105 @@ Supporting scripts in `scripts/`:
 
 ### Prerequisites
 
-- Docker Desktop / Docker Engine running.
-- No host installation of `k6` is required; k6 runs from the pinned Docker image:
-  `grafana/k6:0.54.0@sha256:1f40432b1cbe7234e977f96c362c9bc550a2d2b583d014dd8669fe40d3e9e755`.
+- Docker Desktop / Docker Engine running. No host `k6` installation required (`grafana/k6:0.54.0@sha256:1f40432b1cbe7234e977f96c362c9bc550a2d2b583d014dd8669fe40d3e9e755`).
+- All long-running load targets automatically wrap execution in `caffeinate -is` when available on macOS to prevent idle sleep.
 
-### Common Commands
+### Commands
 
 ```bash
-# Quick smoke load test (20% scale) on a fresh stack + observability
-LOAD_SCALE=0.2 make load-fresh
+# 1. Breakpoint discovery (resets stack between hold and journey, derives loadtest/sustainable-profile.json)
+make load-breakpoint
+make load-breakpoint-hold       # single hold staircase against running stack
+make load-breakpoint-journey    # single journey staircase against running stack
 
-# Full-scale run on a fresh stack (stack-reset -> obs-up -> flash -> journey -> audit -> report)
-make load-fresh
+# 2. Sustained profile verification (reads loadtest/sustainable-profile.json)
+make load-sustained             # single run against running stack
+make load-sustained-x3          # 3 VALID runs (stack-reset + obs-up between, up to 6 attempts if INVALID)
+LOAD_PUBLISH=true make load-sustained-x3  # publishes docs/load-test-report.md iff all 3 valid runs pass 100%
 
-# Run full suite against an already-running stack
-make load-all
+# 3. 20-minute soak stability & drift check (SOAK_MINUTES configurable)
+make load-soak
+SOAK_MINUTES=30 make load-soak
 
-# Run individual scenarios
-make load-flash
-make load-journey
+# 4. Overload profile (original scenarios — intentionally beyond single-node laptop capacity)
+LOAD_SCALE=0.2 make load-fresh  # 20% smoke run
+make load-fresh                 # full-scale overload run (400 req/s flash + 25 j/s journey)
+make load-all / make load-flash / make load-journey
 
-# Re-run audit or regenerate report for latest (or explicit RESULTS_DIR) run
+# 5. Audit, reporting, JVM check & self-tests
 make load-audit
 make load-report
-RESULTS_DIR=loadtest/results/<ts> make load-report
-
-# Publish docs/load-test-report.md ONLY if every threshold and every audit item A1..A9 passed
-LOAD_PUBLISH=true RESULTS_DIR=loadtest/results/<ts> make load-report
-
-# Self-tests (audit script, report generator & comparison tool)
-bash scripts/test-loadtest-audit.sh
-python3 -m unittest scripts/test_loadtest_report.py
-python3 -m unittest scripts/test_loadtest_compare.py
-
-# Verify G1GC and Docker VM memory headroom across all Java services
 make jvm-check
-
-# Compare baseline vs after result directories (median and range)
-python3 scripts/loadtest-compare.py --baseline loadtest/results/20261121T190134Z --after loadtest/results/<ts1> loadtest/results/<ts2> loadtest/results/<ts3>
+bash scripts/test-loadtest-audit.sh
+python3 -m unittest -v scripts/test_loadtest_report.py scripts/test_loadtest_compare.py scripts/test_loadtest_thresholds.py scripts/test_loadtest_breakpoint.py scripts/test_loadtest_soak_report.py
 ```
 
 ### Environment Variables
 
 | Variable | Default | Purpose |
 | :--- | :--- | :--- |
-| `LOAD_SCALE` | `1.0` | Scales scenario rates, durations, and VU allocations (e.g. `0.2` for a quick smoke run). |
-| `USER_POOL_SIZE` | `5000` | Number of distinct pre-minted USER JWTs in `SharedArray`. |
-| `SEATS_PER_EVENT` | `5000` | Unique seats bulk-created per event during `setup()`. |
-| `FLASH_STAGE1_RATE` / `FLASH_STAGE2_RATE` | `150` / `400` | Plateau target arrival rates (req/s) for Scenario A (scaled by `LOAD_SCALE` if unset). |
-| `FLASH_PRE_ALLOCATED_VUS` / `FLASH_MAX_VUS` | `150` / `500` | VU pool sizing for Scenario A. |
-| `JOURNEY_RATE` / `JOURNEY_DURATION_SEC` | `25` / `180` | Constant arrival rate (journeys/s) and duration for Scenario B. |
-| `JOURNEY_PRE_ALLOCATED_VUS` / `JOURNEY_MAX_VUS` | `100` / `300` | VU pool sizing for Scenario B. |
-| `LOAD_PUBLISH` | `false` | When `true`, copies `report.md` to `docs/load-test-report.md` iff all thresholds and all audit items pass. |
+| `LOAD_SCALE` | `1.0` | Scales overload and breakpoint scenario rates (`START`/`STEP`/`MAX` when unset). |
+| `START` / `STEP` / `MAX` / `STEP_SECONDS` | Hold `25/25/600/30`; Journey `2/2/40/45` | Override staircase parameters for `breakpoint-hold.js` / `breakpoint-journey.js` (bounded to `<= 40` steps). |
+| `SOAK_MINUTES` | `20` | Plateau duration (minutes) for `soak.js`. |
+| `USER_POOL_SIZE` / `SEATS_PER_EVENT` | `5000` / `5000` | Pre-minted user JWT pool size and seats per event (chunked at `2500 <= 5000` bulk limit). |
+| `LOAD_PUBLISH` | `false` | Enables publishing `docs/load-test-report.md` from `load-sustained-x3` iff all 3 valid runs pass every threshold and audit item. |
 | `RESULTS_DIR` | `loadtest/results/<UTC ts>` | Override results output directory. |
 
 ---
 
-## 3. How It Works
+## 3. Reading Results
 
-### Local HS256 JWT Minting
+### Overload Profile (`flash-sale.js` & `checkout-journey.js`)
 
-`POST /api/v1/auth/token` is IP rate-limited (10 burst, 1 req/s refill). To avoid bottlenecking setup or runtime on token issuance, `loadtest/lib/jwt.js` mints HS256 JWTs locally using `k6/crypto` and `k6/encoding` with `JWT_SECRET` passed securely via environment variable from `infra/.env` (never written to disk or printed). Claims match `gateway-service`'s `JwtTokenService`: canonical UUID `sub`, allowlisted `roles`, integral epoch-second `iat`/`exp` (7200s TTL, compatible with the 30s clock skew).
+The original scenarios (`400 req/s` flash sale and `25 journeys/s` checkout) intentionally exceed single-node 8-logical-core laptop capacity. They remain completely unchanged as the **overload profile** to prove data integrity under saturation (`A1` zero oversell, `A5` zero DLT, `A6` payment integrity, `A8` bounded holds, `A9` zero OOM/restarts) and are summarized separately under **"Behavior beyond capacity"** — never presented as sustainable capacity.
 
-A pool of 5,000 distinct user tokens is pre-generated once in the init stage via `SharedArray`. In `setup()`, the harness computes expected per-user rate against the gateway's documented token bucket (`5 req/s` sustained, `10` burst per user in `docs/arch/08-redis.md`) and aborts if the configuration would breach it:
+### Breakpoint & Sustainable Profile Derivation (`scripts/loadtest-breakpoint.py`)
 
-- **Scenario A**: peak `400 req/s / 5000 users = 0.08 req/s` per user (`<< 5 req/s`).
-- **Scenario B**: unique user per journey, polling every `250 ms` (`4.0 req/s` active `< 5 req/s` sustained).
+- **Per-step metrics**: Every request carries a bounded `step` tag (`s01..s40`) computed from elapsed time, exported via non-aborting k6 sub-metric thresholds (`max>=0`, `count>=0`, `rate>=0`).
+- **Breakpoint criterion**: The highest step such that **this step and every lower step** satisfy:
+  - Hold `p99 < 300 ms` (journey also requires checkout `p99 < 500 ms` and saga `p95 < 5000 ms`),
+  - Error rate `< 0.1%` (`< 0.001`),
+  - `hold_unknown_outcome == 0`,
+  - `dropped_iterations == 0` (per-step delta from Prometheus `k6_dropped_iterations_total` when reachable, or `0` when global `dropped_iterations == 0`).
+- **Sustainable rate formula**: `max(step_size, floor((0.70 * breakpoint) / step_size) * step_size)`. If step `s01` fails, the script prints `NO BREAKPOINT FOUND` and does not create `loadtest/sustainable-profile.json`.
 
-### Setup
+### Sustained Capacity (`sustained-hold.js` & `sustained-journey.js`)
 
-`setupTwoEvents` creates two events (`loadtest-<run_id>-flash` and `loadtest-<run_id>-journey`) with 5,000 unique seats each via `POST /api/v1/admin/events/{eventId}/seats/bulk`, past `dropTime`, transitions both to `ON_SALE`, and waits until seats are visible on `GET /api/v1/events/{eventId}/seats`. In `make load-all`, Scenario A creates both events and Scenario B reuses the second event via `REUSE_EVENT_ID`.
+- Runs `20s ramp -> 5m plateau -> 10s ramp down` at the derived sustainable rates from `loadtest/sustainable-profile.json` using the exact same thresholds as the overload scenarios (shared in `loadtest/lib/thresholds.js` and verified byte-identical by `scripts/test_loadtest_thresholds.py`).
+- `make load-sustained-x3` executes up to 6 attempts with `stack-reset` + `obs-up` between attempts until 3 **VALID** runs are collected. Valid failing runs are **never** retried silently — they count as one of the 3 valid runs and block publishing.
 
-### Scenario A — Flash Sale (`flash-sale.js`)
+### Soak Stability & Drift (`soak.js` & `scripts/loadtest-soak-report.py`)
 
-- `ramping-arrival-rate`: `10s -> 150 req/s`, `60s @ 150`, `15s -> 400 req/s`, `60s @ 400`, `10s -> 0`.
-- Random user from 5,000 pool + uniform random seat over 5,000 seats -> real seat contention.
-- Expected statuses: `201`, `409`, `429`. Any other status (including any `5xx` or timeout) increments `hold_unexpected`.
-- Thresholds:
-  - `http_req_duration{name:hold} p(99)<300` (documented SLO)
-  - `hold_unexpected count==0`
-  - `hold_5xx rate<0.001` (99.9% availability SLO)
-  - `hold_rate_limited_rate rate<0.01` (<1% rate-limited ratio; tracked alongside `hold_rate_limited` counter because k6 Counter `rate` is events/sec rather than ratio)
+- Runs the derived sustainable journey rate for `SOAK_MINUTES` (default 20 min) and slices the plateau into 2-minute windows from Prometheus + `docker-stats.csv`.
+- Uses `min_over_time(jvm_memory_used_bytes{area="heap",id="G1 Old Gen"}[2m:10s])` as the post-GC old-generation heap proxy (falling back to total heap if the pool label is absent).
+- Flags **`DRIFT`** if:
+  1. Last window hold or checkout `p99 > 1.3 × first full window p99`,
+  2. Linear regression slope of old-gen heap is positive with fitted total growth `> 20%`, or
+  3. Consumer lag, outbox oldest pending age, or HikariCP pending grows strictly monotonically over the last 10 minutes (last 5 consecutive 2-minute windows).
+- Soak verdict is **`PASS`** only with no `INVALID` marker, no `DRIFT`, all k6 thresholds passing, and audit `A1..A9` passing.
 
-### Scenario B — Checkout Journey (`checkout-journey.js`)
+### Refined Audit Rule `A8` & Unknown-Outcome Holds
 
-- `constant-arrival-rate`: `25 journeys/s` for `180s` (`4,500` journeys total, each assigned a unique seat index `exec.scenario.iterationInTest` and unique user).
-- Mix (deterministic mod 20): 90% `tok_success`, 5% `tok_decline`, 5% abandoned holds (no checkout, no forced expiry, no polling).
-- Handles the documented early-checkout race (`409 ORDER_NOT_READY` with `Retry-After`) by sleeping `Retry-After` seconds, counting `order_not_ready_retries`, and retrying checkout with the same `Idempotency-Key`.
-- Polls `GET /api/v1/orders/{id}` every `250 ms` up to `30 s` until `CONFIRMED` or `CANCELLED_PAYMENT_FAILED`.
-- Thresholds:
-  - `http_req_duration{name:checkout} p(99)<500` (documented SLO)
-  - `http_req_duration{name:hold} p(99)<300` (documented SLO)
-  - `saga_latency p(95)<5000` (**chosen target**, not a formal SLO in `docs/arch/09-conventions.md`; accounts for `MockPaymentProvider` 50–300ms latency, outbox 200ms polling hops, and 250ms client poll interval)
-  - `journeys_timed_out count==0`
-  - `unexpected_statuses count==0`
+- Let `R` = reservations created in `inventory_db` for the run's events, `C` = k6 count of `201` responses (`hold_created`), and `U` = k6 count of hold responses with unknown client outcome (`hold_unknown_outcome`: status `0`/transport error, `500`, `502`, `504`).
+- **PASS** iff `C <= R <= C + U` (exact `R == C` when `U == 0`).
+- **FAIL** if `R < C` (`FAIL_PHANTOM_HOLD`: client told a hold exists that does not) or `R > C + U` (`FAIL_UNEXPLAINED_HOLDS`: holds nobody could have requested).
+- Holds committed on unknown-outcome requests are **not leaked**: `inventory-service`'s `ExpirySweeper` expires them normally after their 10-minute `expires_at` TTL, releasing both PostgreSQL and Redis locks.
 
-### Observability Integration
+### Handling `INVALID` Runs (Host Noise Protection)
 
-- Prometheus runs with `--web.enable-remote-write-receiver` in `infra/docker-compose.observability.yml`.
-- k6 pushes live metrics via `-o experimental-prometheus-rw` (`K6_PROMETHEUS_RW_SERVER_URL=http://prometheus:9090/api/v1/write`, `K6_PROMETHEUS_RW_TREND_STATS=p(50),p(95),p(99),avg,max`).
-
----
-
-## 4. How to Read the Report
-
-Every figure in `loadtest/results/<ts>/report.md` is computed programmatically from k6 JSON summaries, Prometheus HTTP API queries, `docker-stats.csv`, container snapshots, and `audit.json`:
-
-1. **Overall & Thresholds Verdicts**: Computed strictly from k6 threshold `ok` booleans and `audit.json`. A single failing threshold or audit item turns the overall verdict to `FAIL` and blocks publishing `docs/load-test-report.md`.
-2. **Throughput Achieved**: Computed from actual requests counted during each plateau stage divided by plateau duration (Scenario A) and completed iterations divided by target duration (Scenario B) — never copied from target rates.
-3. **Audit (`A1..A9`)**: Independently verified after quiescence (all outbox published & all Kafka consumer group lags zero):
-   - `A1`: Zero seats with >1 active (`HELD`/`CONFIRMED`) reservation item.
-   - `A2`: `SOLD` seats == `CONFIRMED` reservation items == `CONFIRMED` order items <= created seats.
-   - `A3`: Zero unpublished outbox rows across `inventory_db`, `order_db`, `payment_db`.
-   - `A4`: Zero Kafka consumer group lag across all groups.
-   - `A5`: Zero growth in `*-dlt` end offsets compared to pre-run snapshot.
-   - `A6`: At most one payment per order and zero `SUCCEEDED` payments on `CANCELLED_*` orders.
-   - `A7`: Zero orders remaining in `PAYMENT_PENDING` or `REFUND_PENDING` after quiescence (`RESERVED` holds from Scenario A and the 5% abandoned holds in Scenario B are valid resting states awaiting their 10-minute TTL).
-   - `A8`: Sum of k6 `201` holds (`hold_created`) equals reservations inserted in `inventory_db` for the run's events.
-   - `A9`: Zero container restarts and zero OOM kills during the run.
+- `scripts/loadtest-monitor.sh` inspects `docker-stats.csv` at the end of every run. Any consecutive timestamp gap `> 15s` (indicating host sleep or Docker VM pause) writes `results/<ts>/INVALID` with the exact gap timestamps.
+- `scripts/loadtest-report.py` renders `INVALID` runs prominently as **`RUN INVALID — NOT COUNTED`**.
+- `scripts/loadtest-compare.py` excludes `INVALID` runs from medians and ranges (listing them explicitly as excluded).
+- The publish gate (`docs/load-test-report.md`) and `load-sustained-x3` never count or publish an `INVALID` run.
 
 ---
 
-## 5. Assumptions & Limits
+## 4. Assumptions & Limits
 
-1. **Single-node Docker on a laptop**: All services, infrastructure (Kafka, Redis, 3 PostgreSQL instances), observability stack, and k6 share one Docker VM and host CPU/RAM. Results are **not** production capacity estimates and are only meaningful relative to each other across identical local runs.
-2. **Threshold metric naming (`hold_rate_limited_rate`)**: Because k6 `Counter` metrics report `rate` as count/second rather than ratio `[0, 1]`, Scenario A defines both `hold_rate_limited` (`Counter`) for exact 429 counts and `hold_rate_limited_rate` (`Rate`) for the `< 0.01` (1%) ratio threshold.
-3. **`saga_latency p(95)<5000` is a chosen target**, not an architecture SLO; formal SLOs in `docs/arch/09-conventions.md` cover hold and checkout HTTP latency/availability and order materialization lag.
-4. **Resting `RESERVED` orders**: Un-checked-out holds from Scenario A (up to 5,000) and the 5% abandoned holds from Scenario B remain in `RESERVED` state until their 10-minute `expires_at` TTL is swept by `ExpirySweeper`; `A7` treats `RESERVED` as a documented valid resting state and strictly forbids `PAYMENT_PENDING` / `REFUND_PENDING`.
-5. **Bulk seat creation chunking**: `setupTwoEvents` chunks bulk inserts at 2,500 seats per request (2 requests per 5,000-seat event) with a 250ms pause to remain well under both the gateway's 2MB payload limit and 10s response timeout.
-6. **JVM G1GC & Memory Limit Trade-off (`512m` -> `768m`)**: Raising the 4 Java service containers (`gateway-service`, `inventory-service`, `order-service`, `payment-service`) from `512m` to `768m` with `-XX:+UseG1GC -XX:MaxGCPauseMillis=100 -XX:MaxRAMPercentage=75 -XX:+ExitOnOutOfMemoryError` (overridable via `JAVA_OPTS_EXTRA`) eliminates OpenJDK 21's automatic Serial GC fallback and reduces GC pause duration/frequency, at the cost of `+1,024 MiB` (`+1 GiB`) higher configured memory commitment on the local Docker VM (`4 × 768 MiB + 256 MiB notification-service = 3,328 MiB`, or `41.9%` of a `7,937 MiB` Docker Desktop VM, leaving ~4.5 GiB for Kafka, PostgreSQL x3, Redis, Prometheus, Grafana, exporters, and k6).
-7. **Consumer Concurrency & Per-Key Ordering**: `ticketing.consumer.concurrency` defaults to `1` (validated `1..12` matching the 12 topic partitions) and is configured to `6` for `payment-service`, `3` for `order-service`, and `3` for `inventory-service`. Per-key ordering is preserved because Kafka never assigns a partition to more than one consumer thread within a consumer group and all events for an order share key `orderId`; parallel consumption is safe because `payment-service` passes deterministic idempotency keys (`orderId` / `paymentId`) to the payment provider and guards persistence with `processed_events` + `payments(order_id)` unique constraints.
-8. **PostgreSQL `max_connections` Arithmetic**: Compose PostgreSQL 16 containers run with default `max_connections = 100`. With `HIKARI_MAX_POOL_SIZE` defaults (`20` inventory, `15` order, `15` payment) and unchanged HikariCP connection timeout (`30000ms`), worst-case connection usage per database is:
-   - `postgres-inventory` (`inventory_db`): `20` (Hikari pool) + `1` (outbox unpooled advisory-lock leader) + `2` (`postgres-inventory-exporter`) + `3` (PostgreSQL `superuser_reserved_connections`) = **`26 / 100`** (`74` headroom).
-   - `postgres-order` (`order_db`): `15` (Hikari pool) + `1` (outbox leader) + `2` (`postgres-order-exporter`) + `3` (superuser reserved) = **`21 / 100`** (`79` headroom).
-   - `postgres-payment` (`payment_db`): `15` (Hikari pool) + `1` (outbox leader) + `2` (`postgres-payment-exporter`) + `3` (superuser reserved) = **`21 / 100`** (`79` headroom).
-9. **macOS Idle Sleep Prevention**: Unattended full-scale runs (~7 minutes each) on macOS should be wrapped with `caffeinate -is` so the host does not enter idle sleep mid-run (which causes multi-minute clock jumps in `docker-stats.csv`, k6 latencies, and GC wall-clock counters). Two earlier unattended runs (`20261122T121906Z` with a `487s` sleep gap and `20261122T123747Z` with an `85s` sleep gap) were retained in `loadtest/results/` for transparency and replaced by clean `caffeinate -is` runs (`20261122T125331Z` and `20261122T130512Z`) alongside `20261122T120819Z` for the 3-run median/range comparison.
+1. **Single-node Docker on a laptop**: All application services, Kafka, Redis, 3 PostgreSQL instances, Prometheus, Grafana, exporters, and k6 share one Docker VM (8 logical CPUs, 7.75 GiB RAM). Results are reproducible local-host baselines for regression tracking, **not** production capacity estimates.
+2. **Hold breakpoint event sizing**: `breakpoint-hold.js` uses a 5,000-seat event (matching `flash-sale.js`; configurable via `BP_HOLD_EVENTS`, chunked at 2,500 seats within the 5,000 bulk limit) so early/mid steps sustain real `201 Created` Postgres+Redis+Outbox writes plus `409` contention while keeping k6 VU memory and outbox quiescence bounded. `breakpoint-journey.js`, `sustained-journey.js`, and `soak.js` create `ceil(max_possible_journeys * 1.05..1.15 / 5000)` 5,000-seat events so every journey has a unique seat.
+3. **Threshold metric naming (`hold_rate_limited_rate`)**: Because k6 `Counter` reports `rate` as count/second rather than ratio `[0, 1]`, hold scenarios track both `hold_rate_limited` (`Counter`) and `hold_rate_limited_rate` (`Rate`, threshold `< 0.01`).
+4. **`saga_latency p(95)<5000` is a chosen target**, not a formal architecture SLO in `docs/arch/09-conventions.md`.
+5. **JVM G1GC & Memory Limits (`768m`)**: Java services run G1GC (`-XX:+UseG1GC -XX:MaxGCPauseMillis=100 -XX:MaxRAMPercentage=75 -XX:+ExitOnOutOfMemoryError`, overridable via `JAVA_OPTS_EXTRA`) at `768 MiB` each (`3,328 MiB` / `41.9%` of Docker VM across all 5 limited app containers).
+6. **Consumer Concurrency & PostgreSQL `max_connections`**: `ticketing.consumer.concurrency` (`1..12`, default `1`) is configured to `6` (`payment`), `3` (`order`), `3` (`inventory`) preserving per-key partition ordering. `HIKARI_MAX_POOL_SIZE` defaults (`20/15/15`) stay within `max_connections=100` (`26/100` inventory, `21/100` order, `21/100` payment worst-case).
+7. **macOS Idle Sleep Prevention**: Long-running targets wrap execution in `caffeinate -is` when installed. Two earlier unattended overload runs (`20261122T121906Z` and `20261122T123747Z`) hit macOS sleep before this safeguard and remain archived in `loadtest/results/`.
