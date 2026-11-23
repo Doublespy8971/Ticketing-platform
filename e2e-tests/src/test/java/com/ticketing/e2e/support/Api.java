@@ -3,9 +3,12 @@ package com.ticketing.e2e.support;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fasterxml.jackson.datatype.jsr310.JavaTimeModule;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
 import javax.crypto.Mac;
 import javax.crypto.spec.SecretKeySpec;
+import java.io.IOException;
 import java.net.URI;
 import java.net.http.HttpClient;
 import java.net.http.HttpHeaders;
@@ -17,6 +20,7 @@ import java.time.Instant;
 import java.util.Base64;
 import java.util.LinkedHashMap;
 import java.util.List;
+import java.util.Locale;
 import java.util.Map;
 import java.util.Optional;
 import java.util.UUID;
@@ -28,6 +32,8 @@ import java.util.UUID;
  * {@code transportError=true}.
  */
 public final class Api {
+
+    private static final Logger log = LoggerFactory.getLogger(Api.class);
 
     private final E2EConfig config;
     private final HttpClient httpClient;
@@ -278,23 +284,76 @@ public final class Api {
             builder.method(method, HttpRequest.BodyPublishers.noBody());
         }
 
+        HttpRequest request = builder.build();
         try {
-            HttpResponse<String> resp = httpClient.send(builder.build(), HttpResponse.BodyHandlers.ofString(StandardCharsets.UTF_8));
-            String respBody = resp.body() != null ? resp.body() : "";
-            JsonNode parsed = null;
-            if (!respBody.isBlank()) {
-                try {
-                    parsed = objectMapper.readTree(respBody);
-                } catch (Exception ignored) {
-                }
-            }
-            return new ApiResponse(resp.statusCode(), resp.headers(), respBody, parsed, false, null);
+            return executeRequest(request);
         } catch (InterruptedException e) {
             Thread.currentThread().interrupt();
             return new ApiResponse(0, null, "", null, true, e.getClass().getSimpleName() + ": " + e.getMessage());
         } catch (Exception e) {
+            if (shouldRetry(method, headers, e)) {
+                log.info("Retrying idempotent request {} {} after connection reset: {}", method, pathAndQuery, e.getMessage());
+                try {
+                    return executeRequest(request);
+                } catch (InterruptedException ie) {
+                    Thread.currentThread().interrupt();
+                    return new ApiResponse(0, null, "", null, true, ie.getClass().getSimpleName() + ": " + ie.getMessage());
+                } catch (Exception retryEx) {
+                    return new ApiResponse(0, null, "", null, true, retryEx.getClass().getSimpleName() + ": " + retryEx.getMessage());
+                }
+            }
             return new ApiResponse(0, null, "", null, true, e.getClass().getSimpleName() + ": " + e.getMessage());
         }
+    }
+
+    private ApiResponse executeRequest(HttpRequest request) throws IOException, InterruptedException {
+        HttpResponse<String> resp = httpClient.send(request, HttpResponse.BodyHandlers.ofString(StandardCharsets.UTF_8));
+        String respBody = resp.body() != null ? resp.body() : "";
+        JsonNode parsed = null;
+        if (!respBody.isBlank()) {
+            try {
+                parsed = objectMapper.readTree(respBody);
+            } catch (Exception ignored) {
+            }
+        }
+        return new ApiResponse(resp.statusCode(), resp.headers(), respBody, parsed, false, null);
+    }
+
+    public static boolean shouldRetry(String method, Map<String, String> headers, Throwable error) {
+        if (!isConnectionClosedOrReset(error)) {
+            return false;
+        }
+        return isIdempotentSafe(method, headers);
+    }
+
+    public static boolean isIdempotentSafe(String method, Map<String, String> headers) {
+        if ("GET".equalsIgnoreCase(method)) {
+            return true;
+        }
+        if (headers != null) {
+            for (Map.Entry<String, String> entry : headers.entrySet()) {
+                if (entry.getKey() != null && "Idempotency-Key".equalsIgnoreCase(entry.getKey())) {
+                    return entry.getValue() != null && !entry.getValue().isBlank();
+                }
+            }
+        }
+        return false;
+    }
+
+    public static boolean isConnectionClosedOrReset(Throwable error) {
+        if (!(error instanceof IOException)) {
+            return false;
+        }
+        String msg = error.getMessage();
+        if (msg == null) {
+            return false;
+        }
+        String lower = msg.toLowerCase(Locale.ROOT);
+        return lower.contains("no bytes received")
+                || lower.contains("header parser received no bytes")
+                || lower.contains("connection reset")
+                || lower.contains("connection_reset")
+                || lower.contains("eof");
     }
 
     private static Map<String, String> authHeaders(String bearerToken, UUID idempotencyKey, Map<String, String> extra) {

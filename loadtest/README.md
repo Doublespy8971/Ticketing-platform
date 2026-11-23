@@ -94,7 +94,7 @@ python3 -m unittest discover -s scripts -p 'test_loadtest_*.py' -v
 | `RATE` / `MINUTES` | `100` / `5` | Target req/s and plateau duration (minutes) for `steady-hold.js` (`make load-steady`). |
 | `START` / `STEP` / `MAX` / `STEP_SECONDS` | Hold `25/25/600/30`; Journey `2/2/40/45` | Override staircase parameters (bounded to `<= 40` steps; in ample mode `MAX` is auto-lowered if planned seats exceed `150,000`, e.g., `600 -> 450`). |
 | `ALLOW_BATTERY` | `0` | Must be `0` for publishable runs. Setting `ALLOW_BATTERY=1` bypasses battery refusal and writes `results/<ts>/NOT_PUBLISHABLE`. |
-| `PREFLIGHT_LOAD_SECONDS` / `PREFLIGHT_MAX_LOAD` | `60` / `3.0` | Duration (s) to sample 1-minute host load average and maximum allowed idle 1-min load average before refusing to start. |
+| `PREFLIGHT_SETTLE_TIMEOUT_SECONDS` / `PREFLIGHT_MAX_LOAD` | `360` / `3.0` | Maximum duration (s) to wait for 1-minute host load average to settle and maximum allowed idle 1-min load average. |
 | `LOAD_SCALE` | `1.0` | Scales overload scenario rates (`flash-sale.js`, `checkout-journey.js`). |
 | `SOAK_MINUTES` | `20` | Plateau duration (minutes) for `soak.js`. |
 | `USER_POOL_SIZE` / `SEATS_PER_EVENT` | `5000` / `5000` | Pre-minted user JWT pool size and seats per event (bulk-created in 2,500 chunks). |
@@ -110,7 +110,7 @@ python3 -m unittest discover -s scripts -p 'test_loadtest_*.py' -v
 Before any measured run (`breakpoint-*`, `steady`, `sustained`, `soak`), the runner inspects the host (macOS & Linux aware) and writes `results/<ts>/host-state.txt` (embedded in `report.md` Section 1):
 
 1. **Power source**: Refuses to start (exit `2`) on battery power unless `ALLOW_BATTERY=1` is set (which creates `results/<ts>/NOT_PUBLISHABLE` and blocks publishing).
-2. **Host idle load**: Samples 1-minute load average over 60 seconds after the stack is up; refuses to start (exit `2`) if it remains `> 3.0`, printing the top 5 CPU processes by name.
+2. **Host idle load settle phase**: Samples 1-minute load average every 15 seconds for up to 6 minutes after the stack is up; passes as soon as three consecutive samples are `<= 3.0`; refuses to start (exit `2`) if the limit is not reached within 6 minutes, printing the load trend and top 5 CPU processes by name.
 3. **Docker VM capacity**: Prints Docker VM CPUs and memory, sum of configured container memory limits, and sum of actual idle container memory (warns if actual idle memory exceeds `70%` of VM memory).
 
 ### External Seat Seeding, Warm-up & `outcome` Tag

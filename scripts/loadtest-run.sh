@@ -32,7 +32,8 @@ PROM_RW_URL="${K6_PROMETHEUS_RW_SERVER_URL:-http://prometheus:9090/api/v1/write}
 LOAD_SCALE="${LOAD_SCALE:-1.0}"
 LOAD_PUBLISH="${LOAD_PUBLISH:-false}"
 ALLOW_BATTERY="${ALLOW_BATTERY:-0}"
-PREFLIGHT_LOAD_SECONDS="${PREFLIGHT_LOAD_SECONDS:-60}"
+PREFLIGHT_SETTLE_TIMEOUT_SECONDS="${PREFLIGHT_SETTLE_TIMEOUT_SECONDS:-360}"
+PREFLIGHT_SETTLE_INTERVAL_SECONDS="${PREFLIGHT_SETTLE_INTERVAL_SECONDS:-15}"
 PREFLIGHT_MAX_LOAD="${PREFLIGHT_MAX_LOAD:-3.0}"
 
 load_jwt_secret() {
@@ -54,18 +55,21 @@ load_jwt_secret() {
 
 # Quiet-host preflight gate (macOS & Linux aware):
 #  1) Power source check: refuse on battery unless ALLOW_BATTERY=1 (marks NOT_PUBLISHABLE)
-#  2) Measure 1-minute load average over 60 seconds; refuse if it stays > 3.0 (print top 5 CPU procs)
+#  2) Settle phase: poll 1-minute load average every 15s for up to 6 minutes; gate passes
+#     as soon as three consecutive samples are <= 3.0; refuse (exit non-zero, printing top 5 CPU)
+#     if limit not reached within 6 minutes.
 #  3) Print Docker VM CPU/RAM, sum of container memory limits, and sum of actual idle memory;
 #     warn if actual idle memory > 70% of Docker VM memory
 #  4) Save everything to results/<ts>/host-state.txt if rdir is given
 run_preflight() {
     local rdir="${1:-}"
-    python3 - "$rdir" "$ALLOW_BATTERY" "$PREFLIGHT_LOAD_SECONDS" "$PREFLIGHT_MAX_LOAD" <<'PYEOF'
+    python3 - "$rdir" "$ALLOW_BATTERY" "$PREFLIGHT_SETTLE_TIMEOUT_SECONDS" "$PREFLIGHT_SETTLE_INTERVAL_SECONDS" "$PREFLIGHT_MAX_LOAD" <<'PYEOF'
 import os, platform, re, subprocess, sys, time
 
-rdir, allow_batt_s, wait_sec_s, max_load_s = sys.argv[1:5]
+rdir, allow_batt_s, max_wait_sec_s, interval_sec_s, max_load_s = sys.argv[1:6]
 allow_batt = allow_batt_s == "1"
-wait_sec = max(0, int(wait_sec_s))
+max_wait_sec = max(15, int(max_wait_sec_s))
+interval_sec = max(1, int(interval_sec_s))
 max_load = float(max_load_s)
 sys_name = platform.system()
 
@@ -140,7 +144,8 @@ vm_mem_mib = vm_mem_bytes / (1024.0 * 1024.0) if vm_mem_bytes > 0 else 0.0
 limits_sum_mib = limits_sum_bytes / (1024.0 * 1024.0)
 idle_mem_pct = (actual_idle_mib / vm_mem_mib * 100.0) if vm_mem_mib > 0 else 0.0
 
-# 3. Sample 1-minute host load average over wait_sec (default 60s)
+# 3. Settle phase: poll 1-minute load average every interval_sec (default 15s) for up to max_wait_sec (default 360s = 6 min)
+# Pass as soon as three consecutive samples are <= max_load (default 3.0).
 def get_load1():
     try:
         l1, l5, l15 = os.getloadavg()
@@ -149,18 +154,34 @@ def get_load1():
         return 0.0, 0.0, 0.0
 
 samples = []
+consecutive_ok = 0
+settled = False
 t_start = time.monotonic()
+print(f"[preflight] Entering quiet-host settle phase (polling every {interval_sec}s up to {max_wait_sec}s for 3 consecutive samples <= {max_load:.1f})...", flush=True)
+
 while True:
     l1, l5, l15 = get_load1()
     elapsed = int(round(time.monotonic() - t_start))
-    samples.append((elapsed, round(l1, 2), round(l5, 2), round(l15, 2)))
-    if elapsed >= wait_sec:
+    sample_item = (elapsed, round(l1, 2), round(l5, 2), round(l15, 2))
+    samples.append(sample_item)
+    print(f"  [preflight] sample #{len(samples):02d} (t={elapsed:03d}s): load1={l1:.2f}, load5={l5:.2f}, load15={l15:.2f}", flush=True)
+
+    if l1 <= max_load:
+        consecutive_ok += 1
+        if consecutive_ok >= 3:
+            settled = True
+            print(f"[preflight] Quiet host reached after {elapsed}s: 3 consecutive samples <= {max_load:.1f} (samples: {samples[-3][1]:.2f}, {samples[-2][1]:.2f}, {samples[-1][1]:.2f}).", flush=True)
+            break
+    else:
+        consecutive_ok = 0
+
+    if elapsed >= max_wait_sec:
         break
-    sleep_for = min(10, max(1, wait_sec - elapsed))
-    time.sleep(sleep_for)
+    time.sleep(interval_sec)
 
 final_l1, final_l5, final_l15 = samples[-1][1], samples[-1][2], samples[-1][3]
 sample_str = ", ".join(f"t={e}s:{a:.2f}" for e, a, _, _ in samples)
+trend_str = " -> ".join(f"{a:.2f}" for _, a, _, _ in samples)
 
 top5_procs = ""
 if sys_name == "Darwin":
@@ -176,7 +197,9 @@ lines = [
     f"  Running Containers:      {running_cnt}",
     f"  Sum Container Mem Limit: {limits_sum_mib:.0f} MiB ({(limits_sum_mib / vm_mem_mib * 100.0) if vm_mem_mib else 0:.1f}% of VM)",
     f"  Sum Actual Idle Mem:     {actual_idle_mib:.1f} MiB ({idle_mem_pct:.1f}% of VM)",
-    f"  Host Load Avg (60s):     {final_l1:.2f} {final_l5:.2f} {final_l15:.2f} [samples: {sample_str}]",
+    f"  Settle Samples (count):  {len(samples)} ({'SETTLED (3 consecutive <= ' + str(max_load) + ')' if settled else 'TIMEOUT EXCEEDED'})",
+    f"  Load Avg Trend:          {trend_str}",
+    f"  Host Load Avg (final):   {final_l1:.2f} {final_l5:.2f} {final_l15:.2f} [samples: {sample_str}]",
     "=================================",
 ]
 
@@ -196,9 +219,9 @@ if on_battery:
             f"REFUSED: Host is running on Battery Power ({power_source}). Plug into AC power or set ALLOW_BATTERY=1 (marks run NOT_PUBLISHABLE)."
         )
 
-if final_l1 > max_load:
+if not settled:
     refusals.append(
-        f"REFUSED: Host 1-minute load average remained above {max_load:.1f} after {wait_sec}s ({final_l1:.2f} > {max_load:.1f})."
+        f"REFUSED: Host 1-minute load average did not settle at or below {max_load:.1f} (3 consecutive samples) within {max_wait_sec}s. Final load1={final_l1:.2f}, trend: {trend_str}."
     )
 
 report_text = "\n".join(lines) + "\n"

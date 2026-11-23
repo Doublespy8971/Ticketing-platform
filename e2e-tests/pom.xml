@@ -70,6 +70,7 @@
                 <configuration>
                     <forkCount>1</forkCount>
                     <reuseForks>true</reuseForks>
+                    <argLine>-Djdk.httpclient.keepalive.timeout=5</argLine>
                     <includes>
                         <include>**/*Test.java</include>
                         <include>**/*E2ETest.java</include>
