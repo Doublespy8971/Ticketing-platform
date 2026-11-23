@@ -26,6 +26,7 @@ This document records product and capacity bottlenecks observed during acceptanc
 ## Before vs After Comparison (`scripts/loadtest-compare.py`)
 
 Generated directly by:
+
 ```bash
 python3 scripts/loadtest-compare.py \
   --baseline loadtest/results/20261121T190134Z \
