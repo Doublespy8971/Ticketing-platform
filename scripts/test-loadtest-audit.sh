@@ -141,7 +141,7 @@ run_audit() {
     set -e
 }
 
-echo "--- Case 1: A8 Exact match (R=7 == C=7 with U=0) must PASS ---"
+echo "--- Case 1: A8 Exact match (R=7 == C=7 with U=0) & A3 all published must PASS ---"
 write_summary 7 0
 run_audit
 if [ "$LAST_RC" -ne 0 ]; then
@@ -149,6 +149,49 @@ if [ "$LAST_RC" -ne 0 ]; then
     exit 1
 fi
 assert_item_status A8 PASS "PASS_EXACT_MATCH"
+assert_item_status A3 PASS "PASS_ZERO_OBSERVED_NO_STUCK_ROWS"
+
+echo "--- Case 1b: A3 fresh unpublished row published after 5s must PASS ---"
+FRESH_EVT_ID="88888888-8888-4888-8888-888888888801"
+docker exec -i postgres-inventory psql -U "$POSTGRES_USER" -d "$SCRATCH_INV" -v ON_ERROR_STOP=1 <<SQL >/dev/null
+INSERT INTO outbox_events (event_id, aggregate_type, aggregate_id, topic, event_type, correlation_id, schema_version, payload, created_at, published_at)
+VALUES ('${FRESH_EVT_ID}', 'RESERVATION', '${EV_ID}', 'inventory.events', 'inventory.seat.released', '${FRESH_EVT_ID}', 1, '{}'::jsonb, NOW(), NULL);
+SQL
+(
+    sleep 5
+    docker exec postgres-inventory psql -U "$POSTGRES_USER" -d "$SCRATCH_INV" -c \
+        "UPDATE outbox_events SET published_at = NOW() WHERE event_id = '${FRESH_EVT_ID}';" >/dev/null 2>&1 || true
+) &
+BG_PUB_PID=$!
+run_audit
+wait "$BG_PUB_PID" 2>/dev/null || true
+if [ "$LAST_RC" -ne 0 ]; then
+    echo "[FAIL] Case 1b (fresh row published after 5s) expected exit 0, got ${LAST_RC}"
+    exit 1
+fi
+assert_item_status A3 PASS "PASS_ZERO_OBSERVED_NO_STUCK_ROWS"
+
+echo "--- Case 1c: A3 stuck unpublished row older than 30s must FAIL A3 ---"
+STUCK_EVT_ID="88888888-8888-4888-8888-888888888802"
+docker exec -i postgres-inventory psql -U "$POSTGRES_USER" -d "$SCRATCH_INV" -v ON_ERROR_STOP=1 <<SQL >/dev/null
+INSERT INTO outbox_events (event_id, aggregate_type, aggregate_id, topic, event_type, correlation_id, schema_version, payload, created_at, published_at)
+VALUES ('${STUCK_EVT_ID}', 'RESERVATION', '${EV_ID}', 'inventory.events', 'inventory.seat.reserved', '${STUCK_EVT_ID}', 1, '{}'::jsonb, NOW() - INTERVAL '45 seconds', NULL);
+SQL
+set +e
+INVENTORY_DB="$SCRATCH_INV" ORDER_DB="$SCRATCH_ORD" PAYMENT_DB="$SCRATCH_PAY" \
+QUIESCENCE_TIMEOUT_SEC=2 A3_POLL_TIMEOUT_SEC=5 \
+bash "${SCRIPT_DIR}/loadtest-audit.sh" "$TMP_RESULTS"
+LAST_RC=$?
+set -e
+if [ "$LAST_RC" -eq 0 ]; then
+    echo "[FAIL] Case 1c (stuck row >30s) expected non-zero exit, got 0"
+    exit 1
+fi
+assert_item_status A3 FAIL "FAIL_STUCK_ROWS_OLDER_THAN_30S"
+assert_item_status A3 FAIL "inventory_db:inventory.seat.reserved"
+# Clean up stuck row before continuing A8 & A1 cases
+docker exec postgres-inventory psql -U "$POSTGRES_USER" -d "$SCRATCH_INV" -c \
+    "DELETE FROM outbox_events WHERE event_id = '${STUCK_EVT_ID}';" >/dev/null
 
 echo "--- Case 2: A8 Bounded unknown outcome (R=7 == C=2 + 5 with U=5) must PASS ---"
 write_summary 2 5

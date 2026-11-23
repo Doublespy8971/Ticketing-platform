@@ -89,12 +89,64 @@ class TestLoadtestBreakpoint(unittest.TestCase):
             jdir = os.path.join(tmp, "j")
             os.makedirs(hdir)
             os.makedirs(jdir)
-            json.dump(res, open(os.path.join(hdir, "breakpoint.json"), "w"))
-            json.dump(res, open(os.path.join(jdir, "breakpoint.json"), "w"))
+            with open(os.path.join(hdir, "breakpoint.json"), "w") as f:
+                json.dump(res, f)
+            with open(os.path.join(jdir, "breakpoint.json"), "w") as f:
+                json.dump(res, f)
             prof = os.path.join(tmp, "sustainable-profile.json")
             ok = bp.combine_sustainable_profile(hdir, jdir, prof)
             self.assertFalse(ok)
             self.assertFalse(os.path.exists(prof))
+
+    def test_knee_detected_on_achieved_below_95pct_and_warmup_shown_separately(self):
+        s = make_hold_bp_summary([
+            (25, 750, 40.0, 0.0, 0),
+            (50, 1500, 90.0, 0.0, 0),
+            (75, 2250, 150.0, 0.0, 0),
+            (100, 2700, 220.0, 0.0, 0),  # 90.0 req/s < 95.0 (95% of 100) -> knee at s04 (100 req/s)
+            (125, 3100, 420.0, 0.0, 0),
+        ])
+        s["_meta"]["warmup_seconds"] = 90
+        s["_meta"]["warmup_rate"] = 50
+        s["_meta"]["seat_supply"] = "ample"
+        s["metrics"]["warmup_reqs"] = {"type": "counter", "values": {"count": 4500}}
+        s["metrics"]["warmup_hold_created"] = {"type": "counter", "values": {"count": 4500}}
+        s["metrics"]["http_req_duration{step:warmup,name:warmup_hold}"] = {
+            "type": "trend",
+            "values": {"med": 12.0, "p(95)": 45.0, "p(99)": 210.0, "max": 480.0},
+        }
+        s["metrics"]["hold_duration{step:s01,outcome:created}"] = {
+            "type": "trend",
+            "values": {"med": 8.0, "p(95)": 25.0, "p(99)": 38.0, "max": 50.0},
+        }
+        s["metrics"]["hold_duration{outcome:created}"] = {
+            "type": "trend",
+            "values": {"med": 15.0, "p(95)": 90.0, "p(99)": 245.0, "max": 510.0},
+        }
+
+        res = bp.analyze_breakpoint_summary(s, enable_live=False)
+        self.assertTrue(res["knee_found"])
+        self.assertEqual(res["knee_step"], "s04")
+        self.assertEqual(res["knee_rate"], 100)
+        self.assertIn("< 95%", res["knee_derivation"])
+        self.assertEqual(res["overall_created_p99_ms"], 245.0)
+        self.assertEqual(res["warmup"]["requests"], 4500)
+        md = bp.render_breakpoint_markdown(res)
+        self.assertIn("**Knee**:", md)
+        self.assertIn("Warm-up (informational, excluded from breakpoint/knee)", md)
+        self.assertIn("245.00 ms", md)
+
+    def test_knee_detected_on_dropped_iterations_above_1pct(self):
+        s = make_hold_bp_summary([
+            (25, 750, 40.0, 0.0, 0),
+            (50, 1480, 90.0, 0.0, 0),  # 49.33 req/s >= 95% of 50, but 20 dropped > 1% of 1500 (15)
+        ], global_dropped=20)
+        s["metrics"]["dropped_iterations{scenario:step_s02}"] = {"type": "counter", "values": {"count": 20}}
+        res = bp.analyze_breakpoint_summary(s, enable_live=False)
+        self.assertTrue(res["knee_found"])
+        self.assertEqual(res["knee_step"], "s02")
+        self.assertEqual(res["knee_rate"], 50)
+        self.assertIn("dropped 20", res["knee_derivation"])
 
 
 if __name__ == "__main__":

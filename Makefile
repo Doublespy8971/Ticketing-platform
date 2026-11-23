@@ -13,8 +13,8 @@ CAFFEINATE := $(shell command -v caffeinate >/dev/null 2>&1 && echo "caffeinate 
         obs-up obs-down obs-reset obs-urls obs-rules-check obs-targets-check metrics-check \
         dashboards-gen dashboards-check traffic traffic-long \
         load-flash load-journey load-all load-fresh load-report load-audit jvm-check \
-        load-breakpoint-hold load-breakpoint-journey load-breakpoint \
-        load-sustained load-sustained-x3 load-soak
+        load-preflight load-breakpoint-hold load-breakpoint-journey load-breakpoint \
+        load-steady load-sustained load-sustained-x3 load-soak
 
 infra-up:
 	@test -f infra/.env || cp infra/.env.example infra/.env
@@ -229,6 +229,9 @@ load-all:
 load-fresh:
 	$(CAFFEINATE) sh -c '$(MAKE) stack-reset && $(MAKE) obs-up && $(MAKE) load-all'
 
+load-preflight:
+	bash scripts/loadtest-run.sh preflight
+
 load-breakpoint-hold:
 	$(CAFFEINATE) bash scripts/loadtest-run.sh breakpoint-hold
 
@@ -237,6 +240,9 @@ load-breakpoint-journey:
 
 load-breakpoint:
 	$(CAFFEINATE) bash scripts/loadtest-run.sh breakpoint
+
+load-steady:
+	$(CAFFEINATE) bash scripts/loadtest-run.sh steady
 
 load-sustained:
 	$(CAFFEINATE) bash scripts/loadtest-run.sh sustained

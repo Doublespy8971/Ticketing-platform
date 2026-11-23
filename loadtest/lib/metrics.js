@@ -10,6 +10,13 @@ export const holdUnknownOutcome = new Counter('hold_unknown_outcome');
 export const hold5xx = new Rate('hold_5xx');
 export const holdDuration = new Trend('hold_duration', true);
 
+// Dedicated warm-up counters (excluded from measured thresholds & report tables;
+// reconciled in A8 since warm-up creates real reservations in inventory_db)
+export const warmupReqs = new Counter('warmup_reqs');
+export const warmupHoldCreated = new Counter('warmup_hold_created');
+export const warmupHoldUnknownOutcome = new Counter('warmup_hold_unknown_outcome');
+export const warmupErrors = new Counter('warmup_errors');
+
 // Plateau throughput accounting counters for Scenario A (exact achieved RPS during plateaus)
 export const plateau1Reqs = new Counter('plateau1_reqs');
 export const plateau2Reqs = new Counter('plateau2_reqs');
@@ -51,10 +58,27 @@ export function initJourneyCounters() {
   unexpectedStatuses.add(0);
 }
 
+export function initWarmupCounters() {
+  warmupReqs.add(0);
+  warmupHoldCreated.add(0);
+  warmupHoldUnknownOutcome.add(0);
+  warmupErrors.add(0);
+}
+
 /**
  * True when a POST /api/v1/reservations response leaves the client unable to know
  * whether inventory_db committed the hold (transport error/timeout status 0, or 500/502/504).
  */
 export function isUnknownHoldOutcome(status) {
   return status === 0 || status === 500 || status === 502 || status === 504;
+}
+
+/**
+ * Maps an HTTP hold status code to the bounded outcome tag value.
+ */
+export function classifyHoldOutcome(status) {
+  if (status === 201) return 'created';
+  if (status === 409) return 'conflict';
+  if (status === 429) return 'rate_limited';
+  return 'error';
 }

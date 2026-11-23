@@ -33,6 +33,8 @@ PAYMENT_DB="${PAYMENT_DB:-payment_db}"
 KAFKA_CONTAINER="${KAFKA_CONTAINER:-kafka}"
 PROMETHEUS_URL="${PROMETHEUS_URL:-http://127.0.0.1:9090}"
 QUIESCENCE_TIMEOUT_SEC="${QUIESCENCE_TIMEOUT_SEC:-120}"
+A3_POLL_TIMEOUT_SEC="${A3_POLL_TIMEOUT_SEC:-60}"
+A3_STUCK_AGE_SEC="${A3_STUCK_AGE_SEC:-30}"
 
 psql_query() {
     local container="$1"
@@ -137,9 +139,115 @@ A2_CONFIRMED_RES_ITEMS=$(psql_query "$INVENTORY_CONTAINER" "$INVENTORY_DB" "SELE
 A2_CONFIRMED_ORD_ITEMS=$(psql_query "$ORDER_CONTAINER" "$ORDER_DB" \
     "SELECT count(*) FROM order_items oi JOIN orders o ON o.order_id = oi.order_id WHERE o.status = 'CONFIRMED';")
 
-A3_INV_UNPUB=$(psql_query "$INVENTORY_CONTAINER" "$INVENTORY_DB" "SELECT count(*) FROM outbox_events WHERE published_at IS NULL;")
-A3_ORD_UNPUB=$(psql_query "$ORDER_CONTAINER" "$ORDER_DB" "SELECT count(*) FROM outbox_events WHERE published_at IS NULL;")
-A3_PAY_UNPUB=$(psql_query "$PAYMENT_CONTAINER" "$PAYMENT_DB" "SELECT count(*) FROM outbox_events WHERE published_at IS NULL;")
+# A3 stuck-row check: poll up to A3_POLL_TIMEOUT_SEC (default 60s), every 1s, until
+# unpublished outbox rows across all 3 DBs reach 0 at one poll AND no unpublished row
+# older than A3_STUCK_AGE_SEC (default 30s) exists at any poll.
+A3_RESULT_JSON=$(mktemp)
+TMP_PAY_SUCC=$(mktemp)
+TMP_ORD_CANC=$(mktemp)
+trap 'rm -f "$TMP_PAY_SUCC" "$TMP_ORD_CANC" "$A3_RESULT_JSON"' EXIT
+
+python3 - "$POSTGRES_USER" \
+    "$INVENTORY_CONTAINER" "$INVENTORY_DB" \
+    "$ORDER_CONTAINER" "$ORDER_DB" \
+    "$PAYMENT_CONTAINER" "$PAYMENT_DB" \
+    "$A3_POLL_TIMEOUT_SEC" "$A3_STUCK_AGE_SEC" "$A3_RESULT_JSON" <<'PYEOF'
+import json, subprocess, sys, time
+
+(
+    pg_user,
+    inv_c, inv_db,
+    ord_c, ord_db,
+    pay_c, pay_db,
+    timeout_s, stuck_age_s, out_path,
+) = sys.argv[1:]
+timeout_s = int(timeout_s)
+stuck_age_s = float(stuck_age_s)
+
+dbs = [
+    ("inventory_db", inv_c, inv_db),
+    ("order_db", ord_c, ord_db),
+    ("payment_db", pay_c, pay_db),
+]
+
+sql = (
+    "SELECT event_type || '|' || ROUND(EXTRACT(EPOCH FROM (NOW() - created_at))::numeric, 2) "
+    "FROM outbox_events WHERE published_at IS NULL ORDER BY created_at ASC;"
+)
+
+def query_unpub(container, db):
+    out = subprocess.check_output(
+        ["docker", "exec", container, "psql", "-U", pg_user, "-d", db, "-t", "-A", "-c", sql],
+        stderr=subprocess.DEVNULL,
+    ).decode("utf-8", errors="replace").strip()
+    rows = []
+    for line in out.splitlines():
+        line = line.strip()
+        if not line or "|" not in line:
+            continue
+        etype, age_str = line.rsplit("|", 1)
+        try:
+            age = float(age_str)
+        except ValueError:
+            age = 0.0
+        rows.append({"event_type": etype, "age_s": age})
+    return rows
+
+start = time.monotonic()
+zero_observed = False
+zero_observed_at_s = None
+polls = 0
+stuck_rows = []
+last_unpub = []
+
+while True:
+    polls += 1
+    current_unpub = []
+    for label, container, db in dbs:
+        for r in query_unpub(container, db):
+            entry = {"database": label, "event_type": r["event_type"], "age_s": r["age_s"]}
+            current_unpub.append(entry)
+            if r["age_s"] > stuck_age_s:
+                stuck_rows.append(entry)
+
+    last_unpub = current_unpub
+    if len(current_unpub) == 0:
+        zero_observed = True
+        zero_observed_at_s = round(time.monotonic() - start, 1)
+        break
+
+    if stuck_rows:
+        # Stuck row (>30s) already detected; no need to wait the full 60s
+        break
+
+    if (time.monotonic() - start) >= timeout_s:
+        break
+    time.sleep(1.0)
+
+passed = zero_observed and len(stuck_rows) == 0
+if passed:
+    condition = f"PASS_ZERO_OBSERVED_NO_STUCK_ROWS (zero observed at poll #{polls} / {zero_observed_at_s}s; 0 rows > {stuck_age_s:.0f}s)"
+elif stuck_rows:
+    sample = "; ".join(
+        f"{r['database']}:{r['event_type']} (age={r['age_s']:.1f}s)" for r in stuck_rows[:10]
+    )
+    condition = f"FAIL_STUCK_ROWS_OLDER_THAN_{stuck_age_s:.0f}S ({len(stuck_rows)} stuck row(s): {sample})"
+else:
+    sample = "; ".join(
+        f"{r['database']}:{r['event_type']} (age={r['age_s']:.1f}s)" for r in last_unpub[:10]
+    )
+    condition = f"FAIL_ZERO_NOT_OBSERVED_WITHIN_{timeout_s}S ({len(last_unpub)} unpublished remaining: {sample})"
+
+with open(out_path, "w") as f:
+    json.dump({
+        "passed": passed,
+        "zero_observed": zero_observed,
+        "polls": polls,
+        "stuck_rows": stuck_rows[:20],
+        "last_unpub": last_unpub[:20],
+        "condition": condition,
+    }, f)
+PYEOF
 
 A4_LAG_INFO=$(compute_kafka_lag)
 A4_TOTAL_LAG="${A4_LAG_INFO%%|*}"
@@ -159,9 +267,6 @@ A6_DUP_PAYMENTS=$(psql_query "$PAYMENT_CONTAINER" "$PAYMENT_DB" \
     "SELECT count(*) FROM (SELECT order_id FROM payments GROUP BY order_id HAVING count(*) > 1) t;")
 
 # Fetch SUCCEEDED payment order_ids and CANCELLED_% order_ids to intersect safely in Python (handles 5000+ rows cleanly)
-TMP_PAY_SUCC=$(mktemp)
-TMP_ORD_CANC=$(mktemp)
-trap 'rm -f "$TMP_PAY_SUCC" "$TMP_ORD_CANC"' EXIT
 psql_query "$PAYMENT_CONTAINER" "$PAYMENT_DB" "SELECT order_id FROM payments WHERE status = 'SUCCEEDED';" > "$TMP_PAY_SUCC"
 psql_query "$ORDER_CONTAINER" "$ORDER_DB" "SELECT order_id FROM orders WHERE status LIKE 'CANCELLED_%';" > "$TMP_ORD_CANC"
 
@@ -205,7 +310,7 @@ python3 - "$RESULTS_DIR" \
     "$QUIESCENCE_OK" "$QUIESCENCE_DETAIL" \
     "$A1_DUP_ACTIVE" \
     "$A2_SOLD_SEATS" "$A2_TOTAL_SEATS" "$A2_CONFIRMED_RES_ITEMS" "$A2_CONFIRMED_ORD_ITEMS" \
-    "$A3_INV_UNPUB" "$A3_ORD_UNPUB" "$A3_PAY_UNPUB" \
+    "$A3_RESULT_JSON" \
     "$A4_TOTAL_LAG" "$A4_LAG_DETAIL" "$PROM_LAG_NOTE" \
     "$A6_DUP_PAYMENTS" "$TMP_PAY_SUCC" "$TMP_ORD_CANC" \
     "$A7_STUCK_ORDERS" "$A7_RESERVED_ORDERS" \
@@ -220,7 +325,7 @@ import sys
     quiescence_ok_s, quiescence_detail,
     a1_dup_s,
     a2_sold_s, a2_total_s, a2_conf_res_s, a2_conf_ord_s,
-    a3_inv_s, a3_ord_s, a3_pay_s,
+    a3_result_json_path,
     a4_lag_s, a4_lag_detail, prom_lag_note,
     a6_dup_pay_s, tmp_pay_succ, tmp_ord_canc,
     a7_stuck_s, a7_reserved_s,
@@ -260,13 +365,14 @@ add_item(
     f"sold_seats={a2_sold}, confirmed_res_items={a2_conf_res}, confirmed_order_items={a2_conf_ord}, total_seats={a2_total}",
 )
 
-# A3
-a3_inv, a3_ord, a3_pay = int(a3_inv_s), int(a3_ord_s), int(a3_pay_s)
+# A3 (stuck-row check: zero unpublished observed within 60s AND no unpublished row > 30s at any poll)
+with open(a3_result_json_path) as f:
+    a3_info = json.load(f)
 add_item(
     "A3",
-    "All outbox rows published across all 3 databases",
-    a3_inv == 0 and a3_ord == 0 and a3_pay == 0,
-    f"unpublished: inventory_db={a3_inv}, order_db={a3_ord}, payment_db={a3_pay}",
+    "No stuck outbox rows (zero unpublished within 60s and none > 30s)",
+    bool(a3_info.get("passed", False)),
+    a3_info.get("condition", "unknown"),
 )
 
 # A4
@@ -346,6 +452,8 @@ add_item(
 import glob as _glob
 k6_c_total = 0
 k6_u_total = 0
+k6_warmup_c = 0
+k6_warmup_u = 0
 k6_files_found = []
 for p in sorted(_glob.glob(os.path.join(results_dir, "*-summary.json"))):
     fname = os.path.basename(p)
@@ -353,10 +461,16 @@ for p in sorted(_glob.glob(os.path.join(results_dir, "*-summary.json"))):
     with open(p) as f:
         d = json.load(f)
     m = d.get("metrics", {})
-    hc = m.get("hold_created", {}).get("values", {}).get("count", 0)
-    hu = m.get("hold_unknown_outcome", {}).get("values", {}).get("count", 0)
-    k6_c_total += int(hc or 0)
-    k6_u_total += int(hu or 0)
+    hc = int(m.get("hold_created", {}).get("values", {}).get("count", 0) or 0)
+    hu = int(m.get("hold_unknown_outcome", {}).get("values", {}).get("count", 0) or 0)
+    wc = int(m.get("warmup_hold_created", {}).get("values", {}).get("count", 0) or 0)
+    wu = int(m.get("warmup_hold_unknown_outcome", {}).get("values", {}).get("count", 0) or 0)
+    k6_c_total += hc + wc
+    k6_u_total += hu + wu
+    k6_warmup_c += wc
+    k6_warmup_u += wu
+
+warmup_note = f", warmup_C={k6_warmup_c}, warmup_U={k6_warmup_u}" if (k6_warmup_c or k6_warmup_u) else ""
 
 a8_r = int(a8_db_res_s)
 a8_db_events = int(a8_db_events_s)
@@ -368,21 +482,21 @@ elif a8_db_events <= 0:
         "A8",
         a8_name,
         False,
-        f"C={k6_c_total}, U={k6_u_total}, R={a8_r}, branch=NO_RUN_EVENTS (run_id={run_id or 'all'}, events={a8_db_events})",
+        f"C={k6_c_total}, U={k6_u_total}, R={a8_r}{warmup_note}, branch=NO_RUN_EVENTS (run_id={run_id or 'all'}, events={a8_db_events})",
     )
 elif a8_r < k6_c_total:
     add_item(
         "A8",
         a8_name,
         False,
-        f"C={k6_c_total}, U={k6_u_total}, R={a8_r}, branch=FAIL_PHANTOM_HOLD (R < C; run_id={run_id or 'all'}, events={a8_db_events}, summaries={','.join(k6_files_found)})",
+        f"C={k6_c_total}, U={k6_u_total}, R={a8_r}{warmup_note}, branch=FAIL_PHANTOM_HOLD (R < C; run_id={run_id or 'all'}, events={a8_db_events}, summaries={','.join(k6_files_found)})",
     )
 elif a8_r > k6_c_total + k6_u_total:
     add_item(
         "A8",
         a8_name,
         False,
-        f"C={k6_c_total}, U={k6_u_total}, R={a8_r}, branch=FAIL_UNEXPLAINED_HOLDS (R > C + U; run_id={run_id or 'all'}, events={a8_db_events}, summaries={','.join(k6_files_found)})",
+        f"C={k6_c_total}, U={k6_u_total}, R={a8_r}{warmup_note}, branch=FAIL_UNEXPLAINED_HOLDS (R > C + U; run_id={run_id or 'all'}, events={a8_db_events}, summaries={','.join(k6_files_found)})",
     )
 else:
     branch = "PASS_EXACT_MATCH (R == C, U == 0)" if k6_u_total == 0 else "PASS_BOUNDED_UNKNOWN_OUTCOME (C <= R <= C + U)"
@@ -390,7 +504,7 @@ else:
         "A8",
         a8_name,
         True,
-        f"C={k6_c_total}, U={k6_u_total}, R={a8_r}, branch={branch} (run_id={run_id or 'all'}, events={a8_db_events}, summaries={','.join(k6_files_found)})",
+        f"C={k6_c_total}, U={k6_u_total}, R={a8_r}{warmup_note}, branch={branch} (run_id={run_id or 'all'}, events={a8_db_events}, summaries={','.join(k6_files_found)})",
     )
 
 # A9: No container restarted or OOMKilled

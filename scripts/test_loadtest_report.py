@@ -200,12 +200,14 @@ class TestLoadtestReport(unittest.TestCase):
 
             with open(res["report_path"]) as f:
                 content = f.read()
+            self.assertIn("**SLO Verdict**: **SLO MET**", content)
+            self.assertIn("**Post-Run Audit Verdict**: **PASS**", content)
             self.assertIn("**Overall Verdict**: **PASS**", content)
             self.assertIn("**399.00**", content)  # 23940 / 60s computed plateau2 throughput
             self.assertIn("Single-node Docker on a laptop", content)
             self.assertIn("`gateway-service`", content)
 
-    def test_failing_threshold_renders_fail_and_does_not_publish(self):
+    def test_failing_threshold_renders_slo_not_met_and_publishes_when_audit_passes(self):
         with tempfile.TemporaryDirectory() as tmp:
             rdir = os.path.join(tmp, "20261121T190000Z")
             os.makedirs(rdir)
@@ -222,13 +224,45 @@ class TestLoadtestReport(unittest.TestCase):
 
             self.assertFalse(res["overall_ok"])
             self.assertEqual(res["overall_status"], "FAIL")
-            self.assertFalse(res["published"])
-            self.assertFalse(os.path.exists(pub_dest))
+            self.assertEqual(res["audit_status"], "PASS")
+            # New publishing rule: valid + publishable + full audit PASS publishes even when SLO NOT MET
+            self.assertTrue(res["publish_eligible"])
+            self.assertTrue(res["published"])
+            self.assertTrue(os.path.isfile(pub_dest))
 
-            with open(res["report_path"]) as f:
+            with open(pub_dest) as f:
                 content = f.read()
+            self.assertIn("**SLO Verdict**: **SLO NOT MET", content)
+            self.assertIn("http_req_duration{name:hold}", content)
+            self.assertIn("**Post-Run Audit Verdict**: **PASS**", content)
             self.assertIn("**Overall Verdict**: **FAIL**", content)
             self.assertIn("| `http_req_duration{name:hold}` | `p(99)<300` | `412.70 ms` | **FAIL** |", content)
+
+    def test_not_publishable_blocks_publish(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            rdir = os.path.join(tmp, "20261121T190000Z")
+            os.makedirs(rdir)
+            write_common_files(rdir)
+            with open(os.path.join(rdir, "flash-sale-summary.json"), "w") as f:
+                json.dump(make_flash_summary(), f)
+            with open(os.path.join(rdir, "checkout-journey-summary.json"), "w") as f:
+                json.dump(make_journey_summary(), f)
+            with open(os.path.join(rdir, "audit.json"), "w") as f:
+                json.dump(make_audit(all_pass=True), f)
+            with open(os.path.join(rdir, "NOT_PUBLISHABLE"), "w") as f:
+                f.write("Battery power override (ALLOW_BATTERY=1)\n")
+
+            pub_dest = os.path.join(tmp, "docs", "load-test-report.md")
+            res = loadtest_report.generate_report(rdir, publish=True, publish_dest=pub_dest, enable_live=False)
+
+            self.assertTrue(res["not_publishable"])
+            self.assertFalse(res["publish_eligible"])
+            self.assertFalse(res["published"])
+            self.assertFalse(os.path.exists(pub_dest))
+            with open(res["report_path"]) as f:
+                content = f.read()
+            self.assertIn("NOT PUBLISHABLE", content)
+            self.assertIn("Battery power override", content)
 
     def test_missing_audit_renders_not_run_and_does_not_publish(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -274,11 +308,12 @@ class TestLoadtestReport(unittest.TestCase):
             self.assertIn("| `A1` | **FAIL** |", content)
 
     def test_no_hardcoded_pass_in_markdown_templates(self):
-        """Ensure report generator never hardcodes '**PASS**' in template strings."""
+        """Ensure report generator never hardcodes verdicts in template strings."""
         with open(SCRIPT_PATH) as f:
             src = f.read()
         self.assertNotIn("**PASS**", src)
         self.assertNotIn("| PASS |", src)
+        self.assertNotIn("**SLO MET**", src)
 
     def test_invalid_run_marked_not_counted_and_blocks_publish(self):
         with tempfile.TemporaryDirectory() as tmp:

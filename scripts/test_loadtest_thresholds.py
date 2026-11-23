@@ -62,9 +62,12 @@ class TestLoadtestThresholds(unittest.TestCase):
         sh = open(os.path.join(REPO_ROOT, "loadtest", "sustained-hold.js")).read()
         sj = open(os.path.join(REPO_ROOT, "loadtest", "sustained-journey.js")).read()
         soak = open(os.path.join(REPO_ROOT, "loadtest", "soak.js")).read()
+        steady = open(os.path.join(REPO_ROOT, "loadtest", "steady-hold.js")).read()
 
         self.assertIn("import { FLASH_SALE_THRESHOLDS } from './lib/thresholds.js';", sh)
         self.assertIn("thresholds: FLASH_SALE_THRESHOLDS", sh)
+        self.assertIn("import { FLASH_SALE_THRESHOLDS } from './lib/thresholds.js';", steady)
+        self.assertIn("Object.assign({}, FLASH_SALE_THRESHOLDS", steady)
         self.assertIn("import { CHECKOUT_JOURNEY_THRESHOLDS } from './lib/thresholds.js';", sj)
         self.assertIn("thresholds: CHECKOUT_JOURNEY_THRESHOLDS", sj)
         self.assertIn("import { CHECKOUT_JOURNEY_THRESHOLDS } from './lib/thresholds.js';", soak)

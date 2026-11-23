@@ -416,10 +416,21 @@ def generate_report(results_dir, prom_url="http://127.0.0.1:9090", publish=False
 
     invalid_path = os.path.join(results_dir, "INVALID")
     is_invalid = os.path.isfile(invalid_path)
-    invalid_reason = open(invalid_path).read().strip() if is_invalid else ""
+    invalid_reason = ""
+    if is_invalid:
+        with open(invalid_path) as f:
+            invalid_reason = f.read().strip()
+
+    not_pub_path = os.path.join(results_dir, "NOT_PUBLISHABLE")
+    is_not_publishable = os.path.isfile(not_pub_path)
+    not_publishable_reason = ""
+    if is_not_publishable:
+        with open(not_pub_path) as f:
+            not_publishable_reason = f.read().strip()
 
     flash_path = os.path.join(results_dir, "flash-sale-summary.json")
     sust_hold_path = os.path.join(results_dir, "sustained-hold-summary.json")
+    steady_hold_path = os.path.join(results_dir, "steady-hold-summary.json")
     bp_hold_path = os.path.join(results_dir, "breakpoint-hold-summary.json")
 
     journey_path = os.path.join(results_dir, "checkout-journey-summary.json")
@@ -429,15 +440,22 @@ def generate_report(results_dir, prom_url="http://127.0.0.1:9090", publish=False
 
     audit_path = os.path.join(results_dir, "audit.json")
     breakpoint_md_path = os.path.join(results_dir, "breakpoint.md")
+    tail_md_path = os.path.join(results_dir, "tail-analysis.md")
+    host_state_path = os.path.join(results_dir, "host-state.txt")
     soak_md_path = os.path.join(results_dir, "soak-report.md")
     soak_json_path = os.path.join(results_dir, "soak-report.json")
 
-    flash_data = load_json_if_exists(flash_path) or load_json_if_exists(sust_hold_path)
-    hold_scenario_label = (
-        "Sustained Hold (`loadtest/sustained-hold.js`)"
-        if (not os.path.isfile(flash_path) and os.path.isfile(sust_hold_path))
-        else "Flash Sale (`loadtest/flash-sale.js`)"
+    flash_data = (
+        load_json_if_exists(flash_path)
+        or load_json_if_exists(sust_hold_path)
+        or load_json_if_exists(steady_hold_path)
     )
+    if not os.path.isfile(flash_path) and os.path.isfile(sust_hold_path):
+        hold_scenario_label = "Sustained Hold (`loadtest/sustained-hold.js`)"
+    elif not os.path.isfile(flash_path) and os.path.isfile(steady_hold_path):
+        hold_scenario_label = "Steady Hold (`loadtest/steady-hold.js`)"
+    else:
+        hold_scenario_label = "Flash Sale (`loadtest/flash-sale.js`)"
 
     journey_data = (
         load_json_if_exists(journey_path)
@@ -464,10 +482,15 @@ def generate_report(results_dir, prom_url="http://127.0.0.1:9090", publish=False
     docker_stats = parse_docker_stats(os.path.join(results_dir, "docker-stats.csv"))
     container_health = summarize_container_health(results_dir)
 
-    flash_thresholds = extract_thresholds(flash_data) if flash_data else []
-    journey_thresholds = extract_thresholds(journey_data) if journey_data else []
+    # Filter out non-aborting export-only thresholds (max>=0 / count>=0 / rate>=0) from SLO evaluation
+    def is_real_slo_threshold(t):
+        return t["expr"].strip() not in ("max>=0", "count>=0", "rate>=0")
+
+    flash_thresholds = [t for t in (extract_thresholds(flash_data) if flash_data else []) if is_real_slo_threshold(t)]
+    journey_thresholds = [t for t in (extract_thresholds(journey_data) if journey_data else []) if is_real_slo_threshold(t)]
 
     all_thresholds = flash_thresholds + journey_thresholds
+    failed_thresholds = [t for t in all_thresholds if not t["ok"]]
     is_breakpoint_only = (bp_hold_data is not None or bp_journey_data is not None) and not (flash_data or journey_data)
     scenarios_present = bool(flash_data or journey_data or bp_hold_data or bp_journey_data)
     thresholds_ok = scenarios_present and (True if is_breakpoint_only else all(t["ok"] for t in all_thresholds))
@@ -482,6 +505,20 @@ def generate_report(results_dir, prom_url="http://127.0.0.1:9090", publish=False
         audit_status = status_str(audit_ok)
 
     soak_ok = True if soak_report_data is None else bool(soak_report_data.get("passed", False))
+
+    # Computed SLO verdict (never hardcoded)
+    if not scenarios_present:
+        slo_verdict = "NOT RUN"
+    elif is_breakpoint_only:
+        slo_verdict = "BREAKPOINT STAIRCASE (see per-step table)"
+    elif thresholds_ok:
+        slo_verdict = "SLO " + ("MET" if thresholds_ok else "NOT MET")
+    else:
+        failed_list = ", ".join(f"{t['metric']} [{t['expr']}={t['measured']}]" for t in failed_thresholds)
+        slo_verdict = f"SLO NOT MET (failed: {failed_list})"
+
+    # Publishable iff VALID, NOT marked NOT_PUBLISHABLE, scenarios present, and full audit passed (even if SLO NOT MET)
+    publish_eligible = scenarios_present and audit_ok and (not is_invalid) and (not is_not_publishable)
 
     if is_invalid:
         overall_ok = False
@@ -500,13 +537,18 @@ def generate_report(results_dir, prom_url="http://127.0.0.1:9090", publish=False
         lines.append("> [!CAUTION]")
         lines.append(f"> **RUN INVALID — NOT COUNTED**: {invalid_reason}")
         lines.append("")
+    if is_not_publishable:
+        lines.append("> [!WARNING]")
+        lines.append(f"> **NOT PUBLISHABLE**: {not_publishable_reason}")
+        lines.append("")
+    lines.append(f"- **SLO Verdict**: **{slo_verdict}**")
+    lines.append(f"- **Post-Run Audit Verdict**: **{audit_status}**")
     lines.append(f"- **Generated (UTC)**: `{generated_at}`")
     lines.append(f"- **Results Directory**: `{results_dir}`")
     lines.append(f"- **Load Scale**: `{run_meta.get('load_scale', 'unknown')}`")
-    lines.append(f"- **Run Validity**: **{'INVALID — NOT COUNTED' if is_invalid else 'VALID'}**")
+    lines.append(f"- **Run Validity**: **{'INVALID — NOT COUNTED' if is_invalid else ('VALID (NOT_PUBLISHABLE)' if is_not_publishable else 'VALID')}**")
     lines.append(f"- **Overall Verdict**: **{overall_status}**")
     lines.append(f"- **Thresholds Verdict**: **{status_str(thresholds_ok) if scenarios_present else 'NOT RUN'}** ({sum(1 for t in all_thresholds if t['ok'])}/{len(all_thresholds)} passed)")
-    lines.append(f"- **Post-Run Audit Verdict**: **{audit_status}**")
     lines.append("")
 
     # 1. Environment
@@ -531,6 +573,15 @@ def generate_report(results_dir, prom_url="http://127.0.0.1:9090", publish=False
         lines.append("| :--- | :--- |")
         for cname, lim in sorted(env["service_memory_limits"].items()):
             lines.append(f"| `{cname}` | `{lim}` |")
+        lines.append("")
+
+    if os.path.isfile(host_state_path):
+        lines.append("### Host Preflight State (`host-state.txt`)")
+        lines.append("")
+        lines.append("```text")
+        with open(host_state_path) as hf:
+            lines.append(hf.read().strip())
+        lines.append("```")
         lines.append("")
 
     # 2. Scenario A: Hold / Flash Sale
@@ -612,7 +663,23 @@ def generate_report(results_dir, prom_url="http://127.0.0.1:9090", publish=False
         lines.append("| :--- | ---: | ---: | ---: | ---: | ---: |")
         lines.append(trend_row("`http_req_duration{name:hold}`", fm, "http_req_duration{name:hold}"))
         lines.append(trend_row("`hold_duration`", fm, "hold_duration"))
+        if "hold_duration{outcome:created}" in fm:
+            lines.append(trend_row("`hold_duration{outcome:created}` (created-only)", fm, "hold_duration{outcome:created}"))
         lines.append("")
+
+        if fmeta.get("warmup_seconds", 0) > 0:
+            w_reqs = cnt(fm, "warmup_reqs")
+            w_cr = cnt(fm, "warmup_hold_created")
+            w_er = cnt(fm, "warmup_errors")
+            w_v = fm.get("http_req_duration{step:warmup,name:warmup_hold}", {}).get("values", {})
+            w_p99 = f"{float(w_v['p(99)']):.2f} ms" if w_v.get("p(99)") is not None else "n/a"
+            lines.append(f"### Warm-up (Informational — Excluded from Thresholds & Measured Tables)")
+            lines.append("")
+            lines.append(
+                f"- `{fmeta.get('warmup_seconds')}s @ {fmeta.get('warmup_rate')} req/s`: "
+                f"`{w_reqs}` reqs, `{w_cr}` holds created, `{w_er}` errors, warm-up hold p99=`{w_p99}`."
+            )
+            lines.append("")
 
     # 3. Scenario B: Checkout Journey
     lines.append(f"## 3. Scenario B — {journey_scenario_label}")
@@ -773,12 +840,19 @@ def generate_report(results_dir, prom_url="http://127.0.0.1:9090", publish=False
             lines.append(f"| `{it['id']}` | **{it['status']}** | {it['name']} | {it['detail']} |")
         lines.append("")
 
-    # Optional Breakpoint / Soak embedded sections
+    # Optional Breakpoint / Tail-Latency / Soak embedded sections
     if os.path.isfile(breakpoint_md_path):
         lines.append("## Breakpoint Analysis")
         lines.append("")
         with open(breakpoint_md_path) as bf:
             lines.append(bf.read().strip())
+        lines.append("")
+
+    if os.path.isfile(tail_md_path):
+        lines.append("## Tail-Latency Analysis")
+        lines.append("")
+        with open(tail_md_path) as tf:
+            lines.append(tf.read().strip())
         lines.append("")
 
     if os.path.isfile(soak_md_path):
@@ -804,36 +878,40 @@ def generate_report(results_dir, prom_url="http://127.0.0.1:9090", publish=False
     published = False
     publish_message = ""
     if publish:
-        if overall_ok and not is_invalid:
+        if publish_eligible:
             dest = publish_dest or os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "docs", "load-test-report.md"))
             os.makedirs(os.path.dirname(dest), exist_ok=True)
             shutil.copyfile(report_path, dest)
             published = True
-            publish_message = f"Published passing report to {dest}"
+            publish_message = f"Published report to {dest} (slo_verdict={slo_verdict}, audit={audit_status})"
         else:
             reasons = []
             if is_invalid:
                 reasons.append(f"run is INVALID ({invalid_reason})")
+            if is_not_publishable:
+                reasons.append(f"run is NOT_PUBLISHABLE ({not_publishable_reason})")
             if not scenarios_present:
                 reasons.append("no k6 scenario summaries present")
-            elif not thresholds_ok:
-                reasons.append("one or more k6 thresholds failed")
             if audit_data is None:
                 reasons.append("audit was NOT RUN")
             elif not audit_ok:
                 reasons.append("one or more audit items failed")
-            if not soak_ok:
-                reasons.append("soak drift or soak gate failed")
             publish_message = f"Skipped publishing docs/load-test-report.md because: {'; '.join(reasons)}"
     else:
-        publish_message = "LOAD_PUBLISH is not enabled; report kept in results directory only."
+        publish_message = (
+            f"LOAD_PUBLISH is not enabled; report kept in results directory only "
+            f"(publish_eligible={publish_eligible}, slo_verdict={slo_verdict}, audit={audit_status})."
+        )
 
     return {
         "report_path": report_path,
         "overall_ok": overall_ok,
         "overall_status": overall_status,
+        "slo_verdict": slo_verdict,
         "audit_status": audit_status,
         "invalid": is_invalid,
+        "not_publishable": is_not_publishable,
+        "publish_eligible": publish_eligible,
         "published": published,
         "publish_message": publish_message,
     }
@@ -862,6 +940,9 @@ def publish_sustained_report(sustained_dirs, profile_path="loadtest/sustainable-
         rid = os.path.basename(rd)
         if os.path.isfile(os.path.join(rd, "INVALID")):
             blockers.append(f"{rid}: INVALID")
+            continue
+        if os.path.isfile(os.path.join(rd, "NOT_PUBLISHABLE")):
+            blockers.append(f"{rid}: NOT_PUBLISHABLE")
             continue
         sh_p = os.path.join(rd, "sustained-hold-summary.json")
         sj_p = os.path.join(rd, "sustained-journey-summary.json")

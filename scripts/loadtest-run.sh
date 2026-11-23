@@ -1,17 +1,20 @@
 #!/usr/bin/env bash
 # =============================================================================
-# scripts/loadtest-run.sh — Orchestrator for k6 Docker runs, monitoring, audit, report
+# scripts/loadtest-run.sh — Orchestrator for quiet-host preflight, external seat
+# seeding, k6 Docker runs, monitoring, audit, breakpoint, tail analysis & report
 #
 # Subcommands:
-#   flash               Run Scenario A (flash-sale.js — overload profile)
-#   journey             Run Scenario B (checkout-journey.js — overload profile)
-#   all                 Run flash -> journey -> audit -> report in one results dir
-#   breakpoint-hold     Run breakpoint-hold.js -> audit -> breakpoint.py -> report
-#   breakpoint-journey  Run breakpoint-journey.js -> audit -> breakpoint.py -> report
-#   breakpoint          Run both breakpoints (stack-reset between) & derive sustainable-profile.json
-#   sustained           Run sustained-hold.js -> sustained-journey.js -> audit -> report
-#   sustained-x3        Run 3 VALID sustained runs (max 6 attempts, stack-reset + obs-up between)
-#   soak                Run stack-reset + obs-up -> soak.js -> audit -> soak-report.py -> report
+#   preflight           Run quiet-host preflight gate (power, 60s load avg, Docker RAM)
+#   flash               Run overload Scenario A (flash-sale.js)
+#   journey             Run overload Scenario B (checkout-journey.js)
+#   all                 Run flash -> journey -> audit -> report
+#   breakpoint-hold     Preflight -> seed -> breakpoint-hold.js -> audit -> bp -> tail -> report
+#   breakpoint-journey  Preflight -> seed -> breakpoint-journey.js -> audit -> bp -> tail -> report
+#   breakpoint          Run both breakpoints (stack-reset between) & derive profile
+#   steady              Preflight -> seed -> steady-hold.js -> audit -> tail -> report
+#   sustained           Preflight -> seed -> sustained-hold -> sustained-journey -> audit -> report
+#   sustained-x3        Run 3 VALID sustained runs (max 6 attempts)
+#   soak                Preflight -> seed -> soak.js -> audit -> soak-report -> report
 #   audit               Run scripts/loadtest-audit.sh against RESULTS_DIR (or latest)
 #   report              Run scripts/loadtest-report.py against RESULTS_DIR (or latest)
 # =============================================================================
@@ -24,9 +27,13 @@ REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 K6_IMAGE="${K6_IMAGE:-grafana/k6:0.54.0@sha256:1f40432b1cbe7234e977f96c362c9bc550a2d2b583d014dd8669fe40d3e9e755}"
 DOCKER_NETWORK="${DOCKER_NETWORK:-ticketing-net}"
 BASE_URL="${BASE_URL:-http://gateway-service:8080}"
+SEED_BASE_URL="${SEED_BASE_URL:-http://127.0.0.1:8080}"
 PROM_RW_URL="${K6_PROMETHEUS_RW_SERVER_URL:-http://prometheus:9090/api/v1/write}"
 LOAD_SCALE="${LOAD_SCALE:-1.0}"
 LOAD_PUBLISH="${LOAD_PUBLISH:-false}"
+ALLOW_BATTERY="${ALLOW_BATTERY:-0}"
+PREFLIGHT_LOAD_SECONDS="${PREFLIGHT_LOAD_SECONDS:-60}"
+PREFLIGHT_MAX_LOAD="${PREFLIGHT_MAX_LOAD:-3.0}"
 
 load_jwt_secret() {
     if [ -n "${JWT_SECRET:-}" ]; then
@@ -45,62 +52,169 @@ load_jwt_secret() {
     export JWT_SECRET
 }
 
-print_host_state() {
+# Quiet-host preflight gate (macOS & Linux aware):
+#  1) Power source check: refuse on battery unless ALLOW_BATTERY=1 (marks NOT_PUBLISHABLE)
+#  2) Measure 1-minute load average over 60 seconds; refuse if it stays > 3.0 (print top 5 CPU procs)
+#  3) Print Docker VM CPU/RAM, sum of container memory limits, and sum of actual idle memory;
+#     warn if actual idle memory > 70% of Docker VM memory
+#  4) Save everything to results/<ts>/host-state.txt if rdir is given
+run_preflight() {
     local rdir="${1:-}"
-    local power_src="unknown"
-    local on_battery=0
+    python3 - "$rdir" "$ALLOW_BATTERY" "$PREFLIGHT_LOAD_SECONDS" "$PREFLIGHT_MAX_LOAD" <<'PYEOF'
+import os, platform, re, subprocess, sys, time
 
-    if command -v pmset >/dev/null 2>&1; then
-        local batt_line
-        batt_line=$(pmset -g batt 2>/dev/null | head -n 2 | tr '\n' ' ' || true)
-        power_src="${batt_line:-unknown}"
-        if echo "$batt_line" | grep -qi "Battery Power"; then
-            on_battery=1
-        fi
-    elif [ -d /sys/class/power_supply ]; then
-        local ac_online
-        ac_online=$(cat /sys/class/power_supply/AC*/online /sys/class/power_supply/ADP*/online 2>/dev/null | head -n 1 || true)
-        if [ "$ac_online" = "1" ]; then
-            power_src="AC Power"
-        elif [ "$ac_online" = "0" ]; then
-            power_src="Battery Power"
-            on_battery=1
-        fi
-    fi
+rdir, allow_batt_s, wait_sec_s, max_load_s = sys.argv[1:5]
+allow_batt = allow_batt_s == "1"
+wait_sec = max(0, int(wait_sec_s))
+max_load = float(max_load_s)
+sys_name = platform.system()
 
-    local docker_vm="unavailable"
-    local dinfo
-    dinfo=$(docker info --format '{{.NCPU}}|{{.MemTotal}}' 2>/dev/null || true)
-    if [[ "$dinfo" == *"|"* ]]; then
-        local ncpu="${dinfo%%|*}"
-        local mem_b="${dinfo#*|}"
-        local mem_gib
-        mem_gib=$(python3 -c "print(f'{int(${mem_b}) / (1024**3):.2f} GiB')" 2>/dev/null || echo "${mem_b} B")
-        docker_vm="${ncpu} CPUs, ${mem_gib}"
-    fi
+def cmd(args, timeout=10):
+    try:
+        return subprocess.check_output(args, stderr=subprocess.STDOUT, timeout=timeout).decode("utf-8", errors="replace").strip()
+    except Exception:
+        return ""
 
-    local running_cnt
-    running_cnt=$(docker ps -q 2>/dev/null | wc -l | tr -d ' ')
-    local load_avg
-    load_avg=$(uptime 2>/dev/null | sed -E 's/.*load averages?: //' || echo "unknown")
+# 1. Power source
+power_source = "unknown"
+on_battery = False
+if sys_name == "Darwin":
+    batt = cmd(["pmset", "-g", "batt"])
+    if batt:
+        power_source = " | ".join(ln.strip() for ln in batt.splitlines()[:2])
+        if "Battery Power" in batt:
+            on_battery = True
+else:
+    ps_dir = "/sys/class/power_supply"
+    if os.path.isdir(ps_dir):
+        for entry in sorted(os.listdir(ps_dir)):
+            online_p = os.path.join(ps_dir, entry, "online")
+            if os.path.isfile(online_p) and entry.startswith(("AC", "ADP", "ACAD")):
+                val = open(online_p).read().strip()
+                power_source = "AC Power" if val == "1" else "Battery Power"
+                on_battery = (val == "0")
+                break
 
-    local banner
-    banner=$(cat <<EOF
-=== Host State Preflight ===
-  Power Source:       ${power_src}
-  Docker VM:          ${docker_vm}
-  Running Containers: ${running_cnt}
-  Host Load Average:  ${load_avg}
-============================
-EOF
-)
-    echo "$banner"
-    if [ "$on_battery" -eq 1 ]; then
-        echo "[WARN] Host is running on BATTERY power! CPU throttling or sleep may skew or invalidate measurements."
-    fi
-    if [ -n "$rdir" ] && [ -d "$rdir" ]; then
-        printf '%s\n' "$banner" > "${rdir}/host-state.txt"
-    fi
+# 2. Docker VM CPU, memory, configured limits sum, actual idle memory sum
+dinfo = cmd(["docker", "info", "--format", "{{.NCPU}}|{{.MemTotal}}"])
+vm_cpus = "unavailable"
+vm_mem_bytes = 0
+vm_mem_gib = 0.0
+if "|" in dinfo:
+    nc, mb = dinfo.split("|", 1)
+    vm_cpus = nc.strip()
+    if mb.strip().isdigit():
+        vm_mem_bytes = int(mb.strip())
+        vm_mem_gib = vm_mem_bytes / (1024 ** 3)
+
+cids = [x for x in cmd(["docker", "ps", "-q"]).splitlines() if x.strip()]
+running_cnt = len(cids)
+limits_sum_bytes = 0
+if cids:
+    insp = cmd(["docker", "inspect", "--format", "{{.HostConfig.Memory}}"] + cids)
+    for ln in insp.splitlines():
+        if ln.strip().isdigit():
+            limits_sum_bytes += int(ln.strip())
+
+def parse_mem_mib(s):
+    m = re.match(r"^\s*([0-9]+(?:\.[0-9]+)?)\s*([a-zA-Z]+)\s*$", s.strip())
+    if not m:
+        return 0.0
+    v, u = float(m.group(1)), m.group(2).lower()
+    if u == "b": return v / (1024.0 * 1024.0)
+    if u in ("kib", "kb", "k"): return v / 1024.0
+    if u in ("mib", "mb", "m"): return v
+    if u in ("gib", "gb", "g"): return v * 1024.0
+    return v
+
+actual_idle_mib = 0.0
+stats_raw = cmd(["docker", "stats", "--no-stream", "--format", "{{.Name}},{{.MemUsage}}"], timeout=15)
+for ln in stats_raw.splitlines():
+    if "," not in ln:
+        continue
+    mem_field = ln.split(",", 1)[1]
+    usage_str = mem_field.split("/")[0].strip()
+    actual_idle_mib += parse_mem_mib(usage_str)
+
+vm_mem_mib = vm_mem_bytes / (1024.0 * 1024.0) if vm_mem_bytes > 0 else 0.0
+limits_sum_mib = limits_sum_bytes / (1024.0 * 1024.0)
+idle_mem_pct = (actual_idle_mib / vm_mem_mib * 100.0) if vm_mem_mib > 0 else 0.0
+
+# 3. Sample 1-minute host load average over wait_sec (default 60s)
+def get_load1():
+    try:
+        l1, l5, l15 = os.getloadavg()
+        return l1, l5, l15
+    except Exception:
+        return 0.0, 0.0, 0.0
+
+samples = []
+t_start = time.monotonic()
+while True:
+    l1, l5, l15 = get_load1()
+    elapsed = int(round(time.monotonic() - t_start))
+    samples.append((elapsed, round(l1, 2), round(l5, 2), round(l15, 2)))
+    if elapsed >= wait_sec:
+        break
+    sleep_for = min(10, max(1, wait_sec - elapsed))
+    time.sleep(sleep_for)
+
+final_l1, final_l5, final_l15 = samples[-1][1], samples[-1][2], samples[-1][3]
+sample_str = ", ".join(f"t={e}s:{a:.2f}" for e, a, _, _ in samples)
+
+top5_procs = ""
+if sys_name == "Darwin":
+    top5_procs = cmd(["ps", "-Arco", "%cpu,comm"])
+else:
+    top5_procs = cmd(["ps", "-eo", "%cpu,comm", "--sort=-%cpu"])
+top5_lines = top5_procs.splitlines()[:6] if top5_procs else ["(unavailable)"]
+
+lines = [
+    "=== Quiet-Host Preflight Gate ===",
+    f"  Power Source:            {power_source}",
+    f"  Docker VM:               {vm_cpus} CPUs, {vm_mem_gib:.2f} GiB ({vm_mem_mib:.0f} MiB)",
+    f"  Running Containers:      {running_cnt}",
+    f"  Sum Container Mem Limit: {limits_sum_mib:.0f} MiB ({(limits_sum_mib / vm_mem_mib * 100.0) if vm_mem_mib else 0:.1f}% of VM)",
+    f"  Sum Actual Idle Mem:     {actual_idle_mib:.1f} MiB ({idle_mem_pct:.1f}% of VM)",
+    f"  Host Load Avg (60s):     {final_l1:.2f} {final_l5:.2f} {final_l15:.2f} [samples: {sample_str}]",
+    "=================================",
+]
+
+warnings = []
+if idle_mem_pct > 70.0:
+    warnings.append(f"[WARN] Actual idle container memory ({actual_idle_mib:.1f} MiB = {idle_mem_pct:.1f}%) exceeds 70% of Docker VM memory ({vm_mem_mib:.0f} MiB)!")
+
+refusals = []
+if on_battery:
+    if allow_batt:
+        warnings.append("[WARN] Host is on BATTERY power (ALLOW_BATTERY=1 set); marking run NOT_PUBLISHABLE.")
+        if rdir and os.path.isdir(rdir):
+            with open(os.path.join(rdir, "NOT_PUBLISHABLE"), "w") as f:
+                f.write(f"Run executed on Battery Power with ALLOW_BATTERY=1 ({power_source})\n")
+    else:
+        refusals.append(
+            f"REFUSED: Host is running on Battery Power ({power_source}). Plug into AC power or set ALLOW_BATTERY=1 (marks run NOT_PUBLISHABLE)."
+        )
+
+if final_l1 > max_load:
+    refusals.append(
+        f"REFUSED: Host 1-minute load average remained above {max_load:.1f} after {wait_sec}s ({final_l1:.2f} > {max_load:.1f})."
+    )
+
+report_text = "\n".join(lines) + "\n"
+if warnings:
+    report_text += "\n".join(warnings) + "\n"
+if refusals:
+    report_text += "\n".join(refusals) + "\nTop 5 CPU processes:\n" + "\n".join("  " + ln for ln in top5_lines) + "\n"
+
+print(report_text, end="")
+if rdir and os.path.isdir(rdir):
+    with open(os.path.join(rdir, "host-state.txt"), "w") as f:
+        f.write(report_text)
+
+if refusals:
+    sys.exit(2)
+PYEOF
 }
 
 latest_results_dir() {
@@ -154,13 +268,18 @@ run_k6_scenario() {
     if [ -n "${REUSE_EVENT_ID:-}" ]; then
         extra_env_args+=("-e" "REUSE_EVENT_ID=${REUSE_EVENT_ID}")
     fi
+    if [ -f "${rdir}/seats.json" ]; then
+        extra_env_args+=("-e" "SEATS_MANIFEST=/results/seats.json")
+    fi
 
-    for var in USER_POOL_SIZE SEATS_PER_EVENT \
+    for var in USER_POOL_SIZE SEATS_PER_EVENT SEAT_SUPPLY \
+               WARMUP_SECONDS WARMUP_RATE \
                FLASH_RAMP1_SEC FLASH_STAGE1_RATE FLASH_STAGE1_SEC \
                FLASH_RAMP2_SEC FLASH_STAGE2_RATE FLASH_STAGE2_SEC FLASH_RAMPDOWN_SEC \
                FLASH_PRE_ALLOCATED_VUS FLASH_MAX_VUS \
                JOURNEY_RATE JOURNEY_DURATION_SEC JOURNEY_PRE_ALLOCATED_VUS JOURNEY_MAX_VUS \
-               START STEP MAX STEP_SECONDS BP_PRE_ALLOCATED_VUS BP_MAX_VUS BP_HOLD_EVENTS \
+               START STEP MAX STEP_SECONDS BP_PRE_ALLOCATED_VUS BP_MAX_VUS \
+               RATE MINUTES STEADY_RAMP_SEC STEADY_RAMPDOWN_SEC \
                SUSTAINED_RAMP_SEC SUSTAINED_PLATEAU_SEC SUSTAINED_RAMPDOWN_SEC \
                SOAK_MINUTES; do
         if [ -n "${!var:-}" ]; then
@@ -202,7 +321,41 @@ run_single_breakpoint() {
     rdir=$(init_results_dir)
     local run_id
     run_id=$(basename "$rdir")
-    print_host_state "$rdir"
+
+    run_preflight "$rdir"
+
+    local def_start def_step def_max def_step_s def_w_rate def_supply
+    if [ "$kind" = "hold" ]; then
+        def_start="${START:-25}"
+        def_step="${STEP:-25}"
+        def_max="${MAX:-600}"
+        def_step_s="${STEP_SECONDS:-30}"
+        def_w_rate="${WARMUP_RATE:-50}"
+        def_supply="${SEAT_SUPPLY:-ample}"
+    else
+        def_start="${START:-2}"
+        def_step="${STEP:-2}"
+        def_max="${MAX:-40}"
+        def_step_s="${STEP_SECONDS:-45}"
+        def_w_rate="${WARMUP_RATE:-4}"
+        def_supply="ample"
+    fi
+    local def_w_sec="${WARMUP_SECONDS:-90}"
+
+    python3 "${SCRIPT_DIR}/loadtest-seed.py" \
+        --mode staircase \
+        --base-url "${SEED_BASE_URL}" \
+        --run-id "${run_id}" \
+        --label "bp${kind}" \
+        --output "${rdir}/seats.json" \
+        --seat-supply "${def_supply}" \
+        --start "${def_start}" \
+        --step "${def_step}" \
+        --max-rate "${def_max}" \
+        --step-seconds "${def_step_s}" \
+        --warmup-rate "${def_w_rate}" \
+        --warmup-seconds "${def_w_sec}"
+
     local start_epoch
     start_epoch=$(date +%s)
 
@@ -211,7 +364,7 @@ run_single_breakpoint() {
     trap 'bash "${SCRIPT_DIR}/loadtest-monitor.sh" snapshot-end "'"$rdir"'" || true' EXIT INT TERM
 
     local k6_rc=0
-    run_k6_scenario "$script_name" "$rdir" "$run_id" "$summary_name" || k6_rc=$?
+    SEAT_SUPPLY="${def_supply}" run_k6_scenario "$script_name" "$rdir" "$run_id" "$summary_name" || k6_rc=$?
 
     trap - EXIT INT TERM
     bash "${SCRIPT_DIR}/loadtest-monitor.sh" snapshot-end "$rdir"
@@ -223,6 +376,7 @@ run_single_breakpoint() {
     bash "${SCRIPT_DIR}/loadtest-audit.sh" "$rdir" || audit_rc=$?
 
     python3 "${SCRIPT_DIR}/loadtest-breakpoint.py" "$rdir"
+    python3 "${SCRIPT_DIR}/loadtest-tail-analysis.py" "$rdir"
     python3 "${SCRIPT_DIR}/loadtest-report.py" "$rdir"
 
     echo "=========================================================================="
@@ -230,9 +384,77 @@ run_single_breakpoint() {
     echo "  k6 exit:     ${k6_rc}"
     echo "  audit exit:  ${audit_rc}"
     echo "  breakpoint:  ${rdir}/breakpoint.json"
+    echo "  tail:        ${rdir}/tail-analysis.md"
     echo "  report:      ${rdir}/report.md"
     echo "=========================================================================="
     LAST_BP_DIR="$rdir"
+    if [ "$k6_rc" -ne 0 ] || [ "$audit_rc" -ne 0 ] || [ -f "${rdir}/INVALID" ]; then
+        return 1
+    fi
+    return 0
+}
+
+run_steady_hold() {
+    load_jwt_secret
+    local rdir
+    rdir=$(init_results_dir)
+    local run_id
+    run_id=$(basename "$rdir")
+
+    run_preflight "$rdir"
+
+    local rate="${RATE:-100}"
+    local mins="${MINUTES:-5}"
+    local dur_s
+    dur_s=$(python3 -c "print(max(30, round(float('${mins}') * 60)))")
+    local w_sec="${WARMUP_SECONDS:-90}"
+    local w_rate="${WARMUP_RATE:-50}"
+    local supply="${SEAT_SUPPLY:-ample}"
+
+    python3 "${SCRIPT_DIR}/loadtest-seed.py" \
+        --mode steady \
+        --base-url "${SEED_BASE_URL}" \
+        --run-id "${run_id}" \
+        --label "steadyhold" \
+        --output "${rdir}/seats.json" \
+        --seat-supply "${supply}" \
+        --rate "${rate}" \
+        --duration-seconds "${dur_s}" \
+        --ramp-seconds 30 \
+        --warmup-rate "${w_rate}" \
+        --warmup-seconds "${w_sec}"
+
+    local start_epoch
+    start_epoch=$(date +%s)
+
+    bash "${SCRIPT_DIR}/loadtest-monitor.sh" snapshot-start "$rdir"
+    bash "${SCRIPT_DIR}/loadtest-monitor.sh" start "$rdir"
+    trap 'bash "${SCRIPT_DIR}/loadtest-monitor.sh" snapshot-end "'"$rdir"'" || true' EXIT INT TERM
+
+    local k6_rc=0
+    RATE="${rate}" MINUTES="${mins}" SEAT_SUPPLY="${supply}" run_k6_scenario "steady-hold.js" "$rdir" "$run_id" "steady-hold-summary.json" || k6_rc=$?
+
+    trap - EXIT INT TERM
+    bash "${SCRIPT_DIR}/loadtest-monitor.sh" snapshot-end "$rdir"
+    local end_epoch
+    end_epoch=$(date +%s)
+    write_run_meta "$rdir" "$run_id" "$start_epoch" "$end_epoch" "steady-hold"
+
+    local audit_rc=0
+    bash "${SCRIPT_DIR}/loadtest-audit.sh" "$rdir" || audit_rc=$?
+
+    python3 "${SCRIPT_DIR}/loadtest-tail-analysis.py" "$rdir"
+    python3 "${SCRIPT_DIR}/loadtest-report.py" "$rdir"
+
+    echo "=========================================================================="
+    echo "Steady Hold Run Complete: ${rdir}"
+    echo "  rate / mins: ${rate} req/s x ${mins} min (supply=${supply})"
+    echo "  k6 exit:     ${k6_rc}"
+    echo "  audit exit:  ${audit_rc}"
+    echo "  invalid:     $([ -f "${rdir}/INVALID" ] && echo YES || echo NO)"
+    echo "  tail:        ${rdir}/tail-analysis.md"
+    echo "  report:      ${rdir}/report.md"
+    echo "=========================================================================="
     if [ "$k6_rc" -ne 0 ] || [ "$audit_rc" -ne 0 ] || [ -f "${rdir}/INVALID" ]; then
         return 1
     fi
@@ -249,7 +471,12 @@ run_single_sustained() {
     rdir=$(init_results_dir)
     local run_id
     run_id=$(basename "$rdir")
-    print_host_state "$rdir"
+    run_preflight "$rdir"
+
+    local h_rate j_rate
+    h_rate=$(python3 -c "import json; print(json.load(open('${REPO_ROOT}/loadtest/sustainable-profile.json'))['hold']['sustainable_rps'])")
+    j_rate=$(python3 -c "import json; print(json.load(open('${REPO_ROOT}/loadtest/sustainable-profile.json'))['journey']['sustainable_jps'])")
+
     local start_epoch
     start_epoch=$(date +%s)
 
@@ -257,8 +484,19 @@ run_single_sustained() {
     bash "${SCRIPT_DIR}/loadtest-monitor.sh" start "$rdir"
     trap 'bash "${SCRIPT_DIR}/loadtest-monitor.sh" snapshot-end "'"$rdir"'" || true' EXIT INT TERM
 
+    python3 "${SCRIPT_DIR}/loadtest-seed.py" \
+        --mode steady --base-url "${SEED_BASE_URL}" --run-id "${run_id}" --label "susthold" \
+        --output "${rdir}/seats.json" --seat-supply "${SEAT_SUPPLY:-ample}" \
+        --rate "${h_rate}" --duration-seconds "${SUSTAINED_PLATEAU_SEC:-300}" --ramp-seconds 30 \
+        --warmup-rate "${WARMUP_RATE:-50}" --warmup-seconds "${WARMUP_SECONDS:-90}"
     local hold_rc=0
     run_k6_scenario "sustained-hold.js" "$rdir" "$run_id" "sustained-hold-summary.json" || hold_rc=$?
+
+    python3 "${SCRIPT_DIR}/loadtest-seed.py" \
+        --mode steady --base-url "${SEED_BASE_URL}" --run-id "${run_id}" --label "sustjourney" \
+        --output "${rdir}/seats.json" --seat-supply ample \
+        --rate "${j_rate}" --duration-seconds "${SUSTAINED_PLATEAU_SEC:-300}" --ramp-seconds 30 \
+        --warmup-rate "${WARMUP_RATE:-4}" --warmup-seconds "${WARMUP_SECONDS:-90}"
     local journey_rc=0
     run_k6_scenario "sustained-journey.js" "$rdir" "$run_id" "sustained-journey-summary.json" || journey_rc=$?
 
@@ -270,17 +508,7 @@ run_single_sustained() {
 
     local audit_rc=0
     bash "${SCRIPT_DIR}/loadtest-audit.sh" "$rdir" || audit_rc=$?
-
     python3 "${SCRIPT_DIR}/loadtest-report.py" "$rdir"
-
-    echo "=========================================================================="
-    echo "Sustained Run Complete: ${rdir}"
-    echo "  sustained-hold exit:    ${hold_rc}"
-    echo "  sustained-journey exit: ${journey_rc}"
-    echo "  audit exit:             ${audit_rc}"
-    echo "  invalid:                $([ -f "${rdir}/INVALID" ] && echo YES || echo NO)"
-    echo "  report:                 ${rdir}/report.md"
-    echo "=========================================================================="
 
     LAST_SUSTAINED_DIR="$rdir"
     if [ -f "${rdir}/INVALID" ] || [ "$hold_rc" -ne 0 ] || [ "$journey_rc" -ne 0 ] || [ "$audit_rc" -ne 0 ]; then
@@ -290,19 +518,21 @@ run_single_sustained() {
 }
 
 case "$CMD" in
+    preflight)
+        run_preflight "${RESULTS_DIR:-}"
+        ;;
+
     flash)
         load_jwt_secret
         RDIR=$(init_results_dir)
         RUN_ID=$(basename "$RDIR")
-        print_host_state "$RDIR"
+        run_preflight "$RDIR"
         START_EPOCH=$(date +%s)
         bash "${SCRIPT_DIR}/loadtest-monitor.sh" snapshot-start "$RDIR"
         bash "${SCRIPT_DIR}/loadtest-monitor.sh" start "$RDIR"
         trap 'bash "${SCRIPT_DIR}/loadtest-monitor.sh" snapshot-end "$RDIR" || true' EXIT INT TERM
-        set +e
-        run_k6_scenario "flash-sale.js" "$RDIR" "$RUN_ID" "flash-sale-summary.json"
-        K6_RC=$?
-        set -e
+        K6_RC=0
+        run_k6_scenario "flash-sale.js" "$RDIR" "$RUN_ID" "flash-sale-summary.json" || K6_RC=$?
         trap - EXIT INT TERM
         bash "${SCRIPT_DIR}/loadtest-monitor.sh" snapshot-end "$RDIR"
         END_EPOCH=$(date +%s)
@@ -315,15 +545,13 @@ case "$CMD" in
         load_jwt_secret
         RDIR=$(init_results_dir)
         RUN_ID=$(basename "$RDIR")
-        print_host_state "$RDIR"
+        run_preflight "$RDIR"
         START_EPOCH=$(date +%s)
         bash "${SCRIPT_DIR}/loadtest-monitor.sh" snapshot-start "$RDIR"
         bash "${SCRIPT_DIR}/loadtest-monitor.sh" start "$RDIR"
         trap 'bash "${SCRIPT_DIR}/loadtest-monitor.sh" snapshot-end "$RDIR" || true' EXIT INT TERM
-        set +e
-        run_k6_scenario "checkout-journey.js" "$RDIR" "$RUN_ID" "checkout-journey-summary.json"
-        K6_RC=$?
-        set -e
+        K6_RC=0
+        run_k6_scenario "checkout-journey.js" "$RDIR" "$RUN_ID" "checkout-journey-summary.json" || K6_RC=$?
         trap - EXIT INT TERM
         bash "${SCRIPT_DIR}/loadtest-monitor.sh" snapshot-end "$RDIR"
         END_EPOCH=$(date +%s)
@@ -336,27 +564,23 @@ case "$CMD" in
         load_jwt_secret
         RDIR=$(init_results_dir)
         RUN_ID=$(basename "$RDIR")
-        print_host_state "$RDIR"
+        run_preflight "$RDIR"
         START_EPOCH=$(date +%s)
 
         bash "${SCRIPT_DIR}/loadtest-monitor.sh" snapshot-start "$RDIR"
         bash "${SCRIPT_DIR}/loadtest-monitor.sh" start "$RDIR"
         trap 'bash "${SCRIPT_DIR}/loadtest-monitor.sh" snapshot-end "$RDIR" || true' EXIT INT TERM
 
-        set +e
-        run_k6_scenario "flash-sale.js" "$RDIR" "$RUN_ID" "flash-sale-summary.json"
-        FLASH_RC=$?
-        set -e
+        FLASH_RC=0
+        run_k6_scenario "flash-sale.js" "$RDIR" "$RUN_ID" "flash-sale-summary.json" || FLASH_RC=$?
 
         JOURNEY_EV=$(grep -Eo 'LOADTEST_JOURNEY_EVENT_ID=[0-9a-fA-F-]+' "${RDIR}/flash-sale.log" | head -n 1 | cut -d= -f2 || true)
         if [ -n "$JOURNEY_EV" ]; then
             export REUSE_EVENT_ID="$JOURNEY_EV"
         fi
 
-        set +e
-        run_k6_scenario "checkout-journey.js" "$RDIR" "$RUN_ID" "checkout-journey-summary.json"
-        JOURNEY_RC=$?
-        set -e
+        JOURNEY_RC=0
+        run_k6_scenario "checkout-journey.js" "$RDIR" "$RUN_ID" "checkout-journey-summary.json" || JOURNEY_RC=$?
         unset REUSE_EVENT_ID
 
         trap - EXIT INT TERM
@@ -364,12 +588,8 @@ case "$CMD" in
         END_EPOCH=$(date +%s)
         write_run_meta "$RDIR" "$RUN_ID" "$START_EPOCH" "$END_EPOCH" "flash-sale,checkout-journey"
 
-        set +e
-        bash "${SCRIPT_DIR}/loadtest-audit.sh" "$RDIR"
-        AUDIT_RC=$?
-        set -e
-
-        # Overload runs never publish docs/load-test-report.md (publish gate is reserved for sustained runs)
+        AUDIT_RC=0
+        bash "${SCRIPT_DIR}/loadtest-audit.sh" "$RDIR" || AUDIT_RC=$?
         python3 "${SCRIPT_DIR}/loadtest-report.py" "$RDIR"
 
         echo "=========================================================================="
@@ -401,29 +621,37 @@ case "$CMD" in
         make -C "$REPO_ROOT" obs-up
         HOLD_BP_RC=0
         run_single_breakpoint "hold" || HOLD_BP_RC=$?
-        HOLD_BP_DIR="$LAST_BP_DIR"
+        HOLD_BP_DIR="${LAST_BP_DIR:-}"
 
         make -C "$REPO_ROOT" stack-reset
         make -C "$REPO_ROOT" obs-up
         JOURNEY_BP_RC=0
         run_single_breakpoint "journey" || JOURNEY_BP_RC=$?
-        JOURNEY_BP_DIR="$LAST_BP_DIR"
+        JOURNEY_BP_DIR="${LAST_BP_DIR:-}"
 
         COMBINE_RC=0
-        python3 "${SCRIPT_DIR}/loadtest-breakpoint.py" \
-            --combine-profile "$HOLD_BP_DIR" "$JOURNEY_BP_DIR" \
-            --profile-out "${REPO_ROOT}/loadtest/sustainable-profile.json" || COMBINE_RC=$?
+        if [ -n "$HOLD_BP_DIR" ] && [ -n "$JOURNEY_BP_DIR" ]; then
+            python3 "${SCRIPT_DIR}/loadtest-breakpoint.py" \
+                --combine-profile "$HOLD_BP_DIR" "$JOURNEY_BP_DIR" \
+                --profile-out "${REPO_ROOT}/loadtest/sustainable-profile.json" || COMBINE_RC=$?
+        else
+            COMBINE_RC=2
+        fi
 
         echo "=========================================================================="
         echo "Breakpoint Suite Complete"
-        echo "  hold breakpoint dir:    ${HOLD_BP_DIR} (rc=${HOLD_BP_RC})"
-        echo "  journey breakpoint dir: ${JOURNEY_BP_DIR} (rc=${JOURNEY_BP_RC})"
+        echo "  hold breakpoint dir:    ${HOLD_BP_DIR:-none} (rc=${HOLD_BP_RC})"
+        echo "  journey breakpoint dir: ${JOURNEY_BP_DIR:-none} (rc=${JOURNEY_BP_RC})"
         echo "  profile combine exit:   ${COMBINE_RC}"
         echo "=========================================================================="
         if [ "$HOLD_BP_RC" -ne 0 ] || [ "$JOURNEY_BP_RC" -ne 0 ] || [ "$COMBINE_RC" -ne 0 ]; then
             exit 1
         fi
         exit 0
+        ;;
+
+    steady)
+        run_steady_hold
         ;;
 
     sustained)
@@ -440,30 +668,18 @@ case "$CMD" in
 
         while [ "${#VALID_DIRS[@]}" -lt 3 ] && [ "$ATTEMPT" -lt "$MAX_ATTEMPTS" ]; do
             ATTEMPT=$((ATTEMPT + 1))
-            echo "=========================================================================="
-            echo "Sustained Run Attempt ${ATTEMPT}/${MAX_ATTEMPTS} (valid collected so far: ${#VALID_DIRS[@]}/3)"
-            echo "=========================================================================="
             make -C "$REPO_ROOT" stack-reset
             make -C "$REPO_ROOT" obs-up
             S_RC=0
             run_single_sustained || S_RC=$?
-            ALL_DIRS+=("$LAST_SUSTAINED_DIR")
-            if [ -f "${LAST_SUSTAINED_DIR}/INVALID" ]; then
-                echo "[sustained-x3] Attempt ${ATTEMPT} (${LAST_SUSTAINED_DIR}) was INVALID — excluded and not counted."
-            else
+            ALL_DIRS+=("${LAST_SUSTAINED_DIR:-}")
+            if [ -n "${LAST_SUSTAINED_DIR:-}" ] && [ ! -f "${LAST_SUSTAINED_DIR}/INVALID" ]; then
                 VALID_DIRS+=("$LAST_SUSTAINED_DIR")
                 if [ "$S_RC" -eq 0 ]; then
                     PASS_COUNT=$((PASS_COUNT + 1))
                 fi
             fi
         done
-
-        echo "=========================================================================="
-        echo "Sustained x3 Summary: ${#VALID_DIRS[@]} valid run(s) across ${ATTEMPT} attempt(s); ${PASS_COUNT}/${#VALID_DIRS[@]} passed all checks"
-        for d in "${ALL_DIRS[@]}"; do
-            echo "  - ${d} ($([ -f "${d}/INVALID" ] && echo INVALID || echo VALID))"
-        done
-        echo "=========================================================================="
 
         if [ "${LOAD_PUBLISH}" = "true" ] && [ "${#VALID_DIRS[@]}" -eq 3 ]; then
             OVERLOAD_ARGS=()
@@ -494,40 +710,34 @@ case "$CMD" in
         make -C "$REPO_ROOT" obs-up
         RDIR=$(init_results_dir)
         RUN_ID=$(basename "$RDIR")
-        print_host_state "$RDIR"
-        START_EPOCH=$(date +%s)
+        run_preflight "$RDIR"
 
+        J_RATE=$(python3 -c "import json; print(json.load(open('${REPO_ROOT}/loadtest/sustainable-profile.json'))['journey']['sustainable_jps'])")
+        SOAK_DUR_S=$(python3 -c "print(max(60, round(float('${SOAK_MINUTES:-20}') * 60)))")
+        python3 "${SCRIPT_DIR}/loadtest-seed.py" \
+            --mode steady --base-url "${SEED_BASE_URL}" --run-id "${RUN_ID}" --label "soak" \
+            --output "${RDIR}/seats.json" --seat-supply ample \
+            --rate "${J_RATE}" --duration-seconds "${SOAK_DUR_S}" --ramp-seconds 30 \
+            --warmup-rate "${WARMUP_RATE:-4}" --warmup-seconds "${WARMUP_SECONDS:-90}"
+
+        START_EPOCH=$(date +%s)
         bash "${SCRIPT_DIR}/loadtest-monitor.sh" snapshot-start "$RDIR"
         bash "${SCRIPT_DIR}/loadtest-monitor.sh" start "$RDIR"
         trap 'bash "${SCRIPT_DIR}/loadtest-monitor.sh" snapshot-end "$RDIR" || true' EXIT INT TERM
 
-        set +e
-        run_k6_scenario "soak.js" "$RDIR" "$RUN_ID" "soak-summary.json"
-        SOAK_K6_RC=$?
-        set -e
+        SOAK_K6_RC=0
+        run_k6_scenario "soak.js" "$RDIR" "$RUN_ID" "soak-summary.json" || SOAK_K6_RC=$?
 
         trap - EXIT INT TERM
         bash "${SCRIPT_DIR}/loadtest-monitor.sh" snapshot-end "$RDIR"
         END_EPOCH=$(date +%s)
         write_run_meta "$RDIR" "$RUN_ID" "$START_EPOCH" "$END_EPOCH" "soak"
 
-        set +e
-        bash "${SCRIPT_DIR}/loadtest-audit.sh" "$RDIR"
-        AUDIT_RC=$?
-        python3 "${SCRIPT_DIR}/loadtest-soak-report.py" "$RDIR"
-        SOAK_REPORT_RC=$?
-        set -e
-
+        AUDIT_RC=0
+        bash "${SCRIPT_DIR}/loadtest-audit.sh" "$RDIR" || AUDIT_RC=$?
+        SOAK_REPORT_RC=0
+        python3 "${SCRIPT_DIR}/loadtest-soak-report.py" "$RDIR" || SOAK_REPORT_RC=$?
         python3 "${SCRIPT_DIR}/loadtest-report.py" "$RDIR"
-
-        echo "=========================================================================="
-        echo "Soak Run Complete: ${RDIR}"
-        echo "  soak k6 exit:     ${SOAK_K6_RC}"
-        echo "  audit exit:       ${AUDIT_RC}"
-        echo "  soak drift exit:  ${SOAK_REPORT_RC}"
-        echo "  invalid:          $([ -f "${RDIR}/INVALID" ] && echo YES || echo NO)"
-        echo "  report:           ${RDIR}/report.md"
-        echo "=========================================================================="
 
         if [ "$SOAK_K6_RC" -ne 0 ] || [ "$AUDIT_RC" -ne 0 ] || [ "$SOAK_REPORT_RC" -ne 0 ] || [ -f "${RDIR}/INVALID" ]; then
             exit 1
@@ -550,7 +760,7 @@ case "$CMD" in
         ;;
 
     *)
-        echo "Usage: $0 <flash|journey|all|breakpoint-hold|breakpoint-journey|breakpoint|sustained|sustained-x3|soak|audit|report>" >&2
+        echo "Usage: $0 <preflight|flash|journey|all|breakpoint-hold|breakpoint-journey|breakpoint|steady|sustained|sustained-x3|soak|audit|report>" >&2
         exit 1
         ;;
 esac

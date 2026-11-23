@@ -196,7 +196,13 @@ python3 scripts/loadtest-compare.py \
 
 ## LOAD-007: Cold-Start / Battery-Throttled `s01` Hold `p99 > 300 ms` Produces `NO BREAKPOINT FOUND`
 
-- **Status**: **`OPEN`** (revealed by `make load-breakpoint`, runs `20261122T143407Z` and `20261122T145334Z`)
+- **Status**: **`OPEN` — UNCONFIRMED (preflight refused on busy host)** (originally revealed by `20261122T143407Z` and `20261122T145334Z`; controlled warm-up verification blocked on `2026-11-23` by quiet-host preflight gate)
+- **Preflight Gate Verification (`2026-11-23T11:02Z`)**:
+  - After adding the dedicated 90 s @ 50 req/s warm-up phase, external `SharedArray` seat seeding (`SEAT_SUPPLY=ample`), and quiet-host preflight gate, `make stack-reset && make obs-up && make load-preflight` reported:
+    - Power Source: `AC Power (43%; charging)` (passed battery gate).
+    - Docker VM: `8 CPUs, 9.71 GiB (9941 MiB)`, `17` running containers, `Sum Container Mem Limit: 3328 MiB (33.5% of VM)`, `Sum Actual Idle Mem: 1935.4 MiB (19.5% of VM)`.
+    - Host Load Avg (60 s): `4.54 7.27 15.89` (`samples: t=0s:7.89, t=10s:7.28, t=20s:6.62, t=30s:5.67, t=40s:5.42, t=50s:4.66, t=60s:4.54`), top CPU processes: `252.4% com.apple.Virtualization.VirtualMachine`, `13.6% Antigravity IDE Helper (GPU)`, `12.8% agy`, `12.3% WindowServer`, `9.2% Antigravity IDE Helper (Renderer)`.
+  - Preflight refused (`REFUSED: Host 1-minute load average remained above 3.0 after 60s (4.54 > 3.0)`), so no measured runs were executed and `LOAD-007` cannot yet be classified as `COLD START CONFIRMED` or `NOT COLD START` until re-run on an idle host (`load1 <= 3.0`).
 - **Severity**: High (prevents automated derivation of `loadtest/sustainable-profile.json` under cold-start / battery-powered single-node runs)
 - **Reproduction**: `make load-breakpoint` on macOS running on battery power (`45%` discharging at hold breakpoint start, load avg `29.23 59.04 91.09`; `23%` discharging at journey breakpoint start, load avg `19.42 26.60 41.85`).
 - **Observed Symptoms**:
@@ -222,11 +228,13 @@ python3 scripts/loadtest-compare.py \
 
 ## LOAD-008: `ExpirySweeper` Emits New `inventory.seat.released` Outbox Rows During Post-Run Audit of Runs Exceeding 10 Minutes
 
-- **Status**: **`OPEN`** (revealed by `20261122T145334Z`, 15-minute journey breakpoint run)
+- **Status**: **`RESOLVED`** (A3 replaced with 1s-polling stuck-row check; original `20261122T145334Z` evidence preserved below)
 - **Severity**: Low (harmless race between background 10-minute hold TTL expiration and `loadtest-audit.sh` `A3` snapshot query)
-- **Reproduction**: Any run lasting longer than the 10-minute (`600 s`) hold TTL with resting `RESERVED` / abandoned holds (e.g., `breakpoint-journey` at `15 min`, or `soak` at `20 min`).
-- **Observed Symptoms**:
+- **Resolution**:
+  - Replaced the point-in-time `A3` zero-count check in `scripts/loadtest-audit.sh` with a stuck-row check that polls `outbox_events` across all three databases (`inventory_db`, `order_db`, `payment_db`) every 1 second for up to 60 seconds.
+  - `A3` now **PASSES** if and only if (1) zero unpublished rows are observed on at least one poll within 60 s AND (2) no unpublished row older than 30 seconds (`EXTRACT(EPOCH FROM (NOW() - created_at)) > 30`) is ever observed on any poll; otherwise it **FAILS** and prints every offending `(database, event_type, age)`.
+  - Verified with new self-test cases in `scripts/test-loadtest-audit.sh`: all published -> PASS; fresh row published after 5 s -> PASS; row > 30 s old never published -> FAIL printing the offending `(database, event_type, age)`.
+- **Original Evidence (`20261122T145334Z`)**:
+  - Reproduction: Any run lasting longer than the 10-minute (`600 s`) hold TTL with resting `RESERVED` / abandoned holds (e.g., `breakpoint-journey` at `15 min`, or `soak` at `20 min`).
   - In `20261122T145334Z`, `loadtest-audit.sh` quiescence **PASSED** in `7 s` (`outbox unpublished: 0/0/0, kafka lag: 0`), and `A1`, `A2` (`10317==10317==10317`), `A4` (`total_lag=0`), `A5` (`0` DLT), `A6`, `A7`, `A8` (`C=11508, U=6, R=11511`), and `A9` all **PASSED**.
   - Seconds later during the `A3` SQL query, `inventory_db` reported `unpublished=1` because `ExpirySweeper` expired a 10-minute-old abandoned hold from early in the 15-minute run and inserted a new `inventory.seat.released` outbox row right before the `A3` poll (published on the next 200 ms outbox tick).
-- **Root Cause**:
-  - `A3` takes a single point-in-time `SELECT count(*) FROM outbox_events WHERE published_at IS NULL` after the quiescence loop exits; on runs exceeding the 10-minute hold TTL, background `ExpirySweeper` activity continues legitimately expiring abandoned holds and writing new outbox rows for 10 minutes after the run ends.
