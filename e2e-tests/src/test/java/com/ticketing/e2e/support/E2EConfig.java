@@ -3,6 +3,7 @@ package com.ticketing.e2e.support;
 import java.io.IOException;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.time.Duration;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
@@ -142,5 +143,35 @@ public final class E2EConfig {
 
     public String jwtSecret() {
         return get("JWT_SECRET", "dev-only-hs256-secret-key-minimum-32-bytes-long!");
+    }
+
+    public enum BackendType {
+        COMPOSE,
+        K8S
+    }
+
+    public BackendType backend() {
+        String val = get("E2E_BACKEND", "compose").trim().toLowerCase();
+        if ("k8s".equals(val) || "kubernetes".equals(val)) {
+            return BackendType.K8S;
+        }
+        return BackendType.COMPOSE;
+    }
+
+    public String k8sNamespace() {
+        return get("E2E_K8S_NAMESPACE", "ticketing");
+    }
+
+    public String k8sContext() {
+        return get("E2E_K8S_CONTEXT", "");
+    }
+
+    public Duration failoverBudget() {
+        String val = get("E2E_FAILOVER_BUDGET_SECONDS", "60").trim();
+        try {
+            return Duration.ofSeconds(Long.parseLong(val));
+        } catch (NumberFormatException e) {
+            return Duration.ofSeconds(60);
+        }
     }
 }

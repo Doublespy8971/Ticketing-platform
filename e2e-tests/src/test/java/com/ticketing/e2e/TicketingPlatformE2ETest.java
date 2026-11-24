@@ -72,7 +72,7 @@ class TicketingPlatformE2ETest {
             "CANCELLED_PAYMENT_FAILED",
             "CANCELLED_REFUNDED");
 
-    public static final Duration FAILOVER_BUDGET = Duration.ofSeconds(60);
+    public static final Duration FAILOVER_BUDGET = E2EConfig.load().failoverBudget();
 
     private static E2EConfig config;
     private static Stack stack;

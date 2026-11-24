@@ -9,7 +9,7 @@ CAFFEINATE := $(shell command -v caffeinate >/dev/null 2>&1 && echo "caffeinate 
 .PHONY: infra-up infra-down infra-reset infra-topics infra-psql-inventory infra-psql-order infra-psql-payment infra-redis-cli \
         smoke-inventory smoke-order smoke-payment smoke-gateway run-gateway smoke-notification run-notification \
         stack-build stack-up stack-down stack-reset stack-logs stack-ps smoke-all smoke-selftest \
-        e2e e2e-fast e2e-chaos e2e-full \
+        e2e e2e-fast e2e-chaos e2e-full e2e-k8s e2e-k8s-fast e2e-k8s-chaos \
         obs-up obs-down obs-reset obs-urls obs-rules-check obs-targets-check metrics-check \
         dashboards-gen dashboards-check traffic traffic-long \
         load-flash load-journey load-all load-fresh load-report load-audit jvm-check \
@@ -177,6 +177,23 @@ e2e-full:
 	$(MAKE) e2e
 	@echo "E2E report written to: $$(pwd)/e2e-tests/target/e2e-report.md"
 
+e2e-k8s-fast:
+	@k3d cluster list 2>/dev/null | grep -q "^ticketing[[:space:]]" || { echo "[ERROR] k3d cluster 'ticketing' does not exist. Run 'make k8s-up' first." >&2; exit 1; }
+	@test -f /tmp/ticketing-k8s-forward/pids || { echo "[ERROR] Kubernetes port-forwards are not running. Run 'make k8s-forward' first." >&2; exit 1; }
+	E2E_BACKEND=k8s E2E_FAILOVER_BUDGET_SECONDS=180 mvn -pl e2e-tests -Pe2e -Dgroups=fast verify
+
+e2e-k8s-chaos:
+	@k3d cluster list 2>/dev/null | grep -q "^ticketing[[:space:]]" || { echo "[ERROR] k3d cluster 'ticketing' does not exist. Run 'make k8s-up' first." >&2; exit 1; }
+	@test -f /tmp/ticketing-k8s-forward/pids || { echo "[ERROR] Kubernetes port-forwards are not running. Run 'make k8s-forward' first." >&2; exit 1; }
+	E2E_BACKEND=k8s E2E_FAILOVER_BUDGET_SECONDS=180 mvn -pl e2e-tests -Pe2e -Dgroups=chaos verify
+
+e2e-k8s:
+	$(MAKE) e2e-k8s-fast
+	$(MAKE) k8s-down
+	$(MAKE) k8s-up
+	$(MAKE) k8s-forward
+	$(MAKE) e2e-k8s-chaos
+
 obs-up:
 	@test -f infra/.env || cp infra/.env.example infra/.env
 	$(COMPOSE_OBS) up -d --wait
@@ -282,7 +299,7 @@ k8s-status:
 	bash scripts/k8s-status.sh
 
 k8s-forward:
-	bash scripts/k8s-forward.sh start
+	K8S_FORWARD_MAX_RETRIES=$${K8S_FORWARD_MAX_RETRIES:-120} bash scripts/k8s-forward.sh start
 
 k8s-forward-stop:
 	bash scripts/k8s-forward.sh stop
@@ -292,6 +309,7 @@ k8s-logs:
 	kubectl -n ticketing logs -l app.kubernetes.io/name=$(SERVICE) --all-containers=true --tail=200 -f
 
 k8s-down:
+	-kubectl -n ticketing delete deployment,statefulset,job,ingress,pvc --all --grace-period=0 --force >/dev/null 2>&1
 	bash scripts/k8s-down.sh
 
 k8s-destroy:

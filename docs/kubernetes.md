@@ -206,9 +206,35 @@ This k3d deployment is production-like in container security and probe design, *
 
 ---
 
-## 11. Known Issues
+## 11. Kubernetes End-to-End Test Suite (E2E Mode)
 
-- **Unchanged `make e2e-fast` `@AfterAll` Docker Compose teardown check**: When running the unchanged `e2e-tests` module against k3d over `make k8s-forward`, `PreflightExtension.beforeAll` passes (Docker CLI is present and all 10 forwarded ports respond) and all **9/9 fast E2E scenarios** (`S1`, `S2`, `S3`, `S5`, `S6`, `S9`, `S10`, `S12`, `S13` with invariants `I1–I8`), **13/13 `InvariantAuditorTest`**, and **5/5 `ApiRetryDecisionTest`** pass cleanly. However, `TicketingPlatformE2ETest.afterAll()` (`e2e-tests/src/test/java/com/ticketing/e2e/TicketingPlatformE2ETest.java:153`) unconditionally invokes `stack.restoreAndWaitAllHealthy(Duration.ofSeconds(60))` (`e2e-tests/src/test/java/com/ticketing/e2e/support/Stack.java:236-282`), which calls `docker inspect` and `docker start` on all 10 Docker Compose container names (`kafka`, `redis`, `postgres-inventory`, `postgres-order`, `postgres-payment`, `inventory-service`, `order-service`, `payment-service`, `notification-service`, `gateway-service`). Because those Compose containers do not exist on Kubernetes, `@AfterAll` fails with `IllegalStateException: Stack restore failed with 20 error(s): Failed to restore/start <container>: No such container: <container>` after all scenarios finish (~10 minutes of 10 x 60s `waitUntilHealthy` timeouts). Per the hard rule, `e2e-tests` was not modified.
+The platform E2E harness (`e2e-tests`) supports execution against both Docker Compose (default) and Kubernetes via the `PlatformBackend` abstraction (`ComposeBackend` vs `K8sBackend`), toggled via `E2E_BACKEND=compose|k8s`.
+
+### Running E2E on Kubernetes
+```bash
+# 1. Run fast functional scenarios against k3d
+make e2e-k8s-fast
+
+# 2. Run chaos and fault-injection scenarios against k3d
+make e2e-k8s-chaos
+
+# 3. Full workflow: fast suite -> cluster reset -> chaos suite
+make e2e-k8s
+```
+
+### K8sBackend Architecture & Mechanics
+- **Workload Mapping & Dynamic Discovery**: `gateway-service`, `inventory-service`, `order-service`, `payment-service`, and `notification-service` are managed as `Deployments`; `kafka`, `redis`, and `postgres-*` are managed as `StatefulSets`. Workload kind and label selectors (`spec.selector.matchLabels`) are dynamically queried from the cluster (`kubectl get deployment,statefulset`) rather than hardcoding static labels.
+- **Hard Crash (`kill`)**: Forcefully deletes all pods matching the workload selector (`kubectl delete pod -l <selector> --grace-period=0 --force`). This simulates an abrupt SIGKILL while the Kubernetes controller automatically creates replacement pods.
+- **Service Stop (`stop`)**: Remembers desired replicas in memory and persists them to `e2e-tests/target/k8s-replicas.json` (preventing overwrite on repeated stops), scales the workload to `0` (`kubectl scale <kind> <name> --replicas=0`), and awaits full pod termination.
+- **Service Start (`start`)**: Restores the remembered replica count (or manifest default), scales back up, and waits until the workload is fully ready.
+- **Pause / Unpause Semantics**: Kubernetes does not expose a native pause primitive without direct cgroup freezer access. `pause` is intentionally implemented as `stop` (scale to 0) and `unpause` as `start` (scale to desired replicas). This maintains semantic equivalence for test scenarios where the consumer must be absent while events are produced.
+- **Readiness Verification (`waitUntilHealthy`)**: Verifies rollout completion (`kubectl rollout status`), verifies Kafka consumer group stability (`ConsumerGroupState.STABLE` with active members via `KafkaProbe`), and for infrastructure restarts (`kafka`, `redis`, `postgres-*`), awaits local TCP port reachability on the supervised `k8s-forward` tunnels.
+- **Failover Budget Trade-Off (`180s`)**: `E2E_FAILOVER_BUDGET_SECONDS` defaults to `60s` on Compose and is configured to `180s` for Kubernetes in `Makefile`. A pod failover on Kubernetes entails container scheduling, initContainer dependency checks (`wait-for-deps`), JVM cold start, Spring Boot readiness probe intervals (`failureThreshold=30, period=5s`), and Kafka consumer group rejoining. As a result, recovery numbers on Kubernetes are not directly comparable to Docker Compose container restarts.
+
+---
+
+## 12. Known Issues
+
 - **Transient `/actuator/health` 503 on `gateway-service` immediately after cold boot**: Because `gateway-service` has no blocking Redis initContainer (deliberate fail-open design), its aggregate `/actuator/health` endpoint (checked by `PreflightExtension.beforeAll`) may briefly report `503 DOWN` for a few seconds right after `make k8s-up` if Lettuce's initial Redis connection check runs while `redis-0` is finishing boot, even though `/actuator/health/readiness` is `200 UP`. Waiting a few seconds resolves it cleanly.
 - **Initial cold boot time**: On a brand-new cluster without cached infra images, `make k8s-up` imports local images and initializes Kafka KRaft + 15 topics + Flyway migrations across 3 databases, taking ~3–6 minutes depending on host CPU load. Subsequent resets (`make k8s-down && K8S_SKIP_BUILD=1 make k8s-up`) are faster because k3d retains imported images.
 - **Docker VM limit overcommit warning on 8 GiB laptops**: The sum of local overlay container memory limits (`6,400 MiB`) exceeds `75%` of a `7,937 MiB` Docker VM, producing a preflight warning in `scripts/k8s-cluster.sh`. Actual measured idle usage is ~`2.1 GiB` for the `ticketing` namespace (~`3.8 GiB` total across all 3 k3d nodes).

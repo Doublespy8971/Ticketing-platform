@@ -1,9 +1,13 @@
 package com.ticketing.e2e.support;
 
+import com.fasterxml.jackson.databind.JsonNode;
+import com.fasterxml.jackson.databind.ObjectMapper;
+
 import java.io.IOException;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.time.Duration;
 import java.time.Instant;
 import java.time.ZoneOffset;
 import java.time.format.DateTimeFormatter;
@@ -156,8 +160,25 @@ public final class ScenarioReportRecorder {
         }
     }
 
+    private final E2EConfig config;
+    private final ProcessRunner processRunner;
+    private final ObjectMapper objectMapper;
     private final Map<String, ScenarioRecord> recordsById = new LinkedHashMap<>();
     private final Instant suiteStartedAt = Instant.now();
+
+    public ScenarioReportRecorder() {
+        this(E2EConfig.load(), new SystemProcessRunner());
+    }
+
+    public ScenarioReportRecorder(E2EConfig config) {
+        this(config, new SystemProcessRunner());
+    }
+
+    public ScenarioReportRecorder(E2EConfig config, ProcessRunner processRunner) {
+        this.config = config != null ? config : E2EConfig.load();
+        this.processRunner = processRunner != null ? processRunner : new SystemProcessRunner();
+        this.objectMapper = new ObjectMapper();
+    }
 
     public synchronized void record(ScenarioRecord record) {
         recordsById.put(record.id(), record);
@@ -411,8 +432,10 @@ public final class ScenarioReportRecorder {
         md.append("- **Generated At (UTC)**: `").append(timestamp).append("`\n");
         md.append("- **Total Suite Duration**: `").append(String.format("%.2f s", totalDurationMs / 1000.0))
                 .append("`\n");
+        md.append("- **Backend**: `").append(resolveBackendDescription()).append("`\n");
+        md.append("- **Failover Budget**: `").append(resolveFailoverBudget()).append("`\n");
         md.append(
-                "- **Target Stack**: Real 10-container Docker Compose topology (`gateway-service`, `inventory-service`, `order-service`, `payment-service`, `notification-service`, `kafka`, `redis`, `postgres-inventory`, `postgres-order`, `postgres-payment`)\n\n");
+                "- **Target Stack**: Real 10-container topology (`gateway-service`, `inventory-service`, `order-service`, `payment-service`, `notification-service`, `kafka`, `redis`, `postgres-inventory`, `postgres-order`, `postgres-payment`)\n\n");
 
         md.append("## 1. Per-Scenario Execution Matrix\n\n");
         md.append(
@@ -675,5 +698,58 @@ public final class ScenarioReportRecorder {
                 parts.add(k + "=" + v);
         });
         return parts.isEmpty() ? "0" : String.join(", ", parts);
+    }
+
+    public String resolveBackendDescription() {
+        if (config == null || config.backend() == E2EConfig.BackendType.COMPOSE) {
+            return "compose";
+        }
+        try {
+            List<String> cmd = new ArrayList<>();
+            cmd.add("kubectl");
+            if (!config.k8sContext().isBlank()) {
+                cmd.add("--context");
+                cmd.add(config.k8sContext().trim());
+            }
+            cmd.addAll(List.of("version", "-o", "json"));
+            CommandResult vRes = processRunner.exec(Duration.ofSeconds(5), cmd);
+            String k8sVersion = "k8s";
+            if (vRes.exitCode() == 0 && !vRes.stdout().isBlank()) {
+                JsonNode vJson = objectMapper.readTree(vRes.stdout());
+                String gitVer = vJson.path("serverVersion").path("gitVersion").asText("");
+                if (!gitVer.isBlank()) {
+                    k8sVersion = gitVer;
+                }
+            }
+            List<String> nodeCmd = new ArrayList<>();
+            nodeCmd.add("kubectl");
+            if (!config.k8sContext().isBlank()) {
+                nodeCmd.add("--context");
+                nodeCmd.add(config.k8sContext().trim());
+            }
+            nodeCmd.addAll(List.of("get", "nodes", "--no-headers"));
+            CommandResult nodesRes = processRunner.exec(Duration.ofSeconds(5), nodeCmd);
+            int nodeCount = 0;
+            if (nodesRes.exitCode() == 0 && !nodesRes.stdout().isBlank()) {
+                for (String line : nodesRes.stdout().split("\n")) {
+                    if (!line.trim().isEmpty()) {
+                        nodeCount++;
+                    }
+                }
+            }
+            if (nodeCount > 0) {
+                return "k8s (" + k8sVersion + ", " + nodeCount + " nodes)";
+            }
+            return "k8s (" + k8sVersion + ")";
+        } catch (Exception e) {
+            return "k8s";
+        }
+    }
+
+    public String resolveFailoverBudget() {
+        if (config == null) {
+            return "60s";
+        }
+        return config.failoverBudget().toSeconds() + "s";
     }
 }

@@ -29,8 +29,12 @@ public final class PreflightExtension implements BeforeAllCallback {
         E2EConfig config = new E2EConfig();
         Stack stack = new Stack(config);
 
-        // 1. Docker CLI check
-        stack.verifyDockerCliAvailable();
+        // 1. Backend-specific preflight checks (Docker CLI vs kubectl, cluster, namespace, workloads)
+        stack.getBackend().verifyPreflight();
+
+        String hint = config.backend() == E2EConfig.BackendType.K8S
+                ? "Check 'make k8s-forward' and 'make k8s-up'."
+                : "Run 'make stack-up' first.";
 
         // 2. HTTP services check (gateway + 4 downstream services)
         HttpClient client = HttpClient.newBuilder()
@@ -45,7 +49,7 @@ public final class PreflightExtension implements BeforeAllCallback {
         endpoints.put("notification-service (:8084)", config.notificationBaseUrl() + "/health/readiness");
 
         for (Map.Entry<String, String> entry : endpoints.entrySet()) {
-            checkHttpService(client, entry.getKey(), entry.getValue());
+            checkHttpService(client, entry.getKey(), entry.getValue(), hint);
         }
 
         // 3. Three PostgreSQL databases check
@@ -53,7 +57,7 @@ public final class PreflightExtension implements BeforeAllCallback {
         db.checkConnectivity();
 
         // 4. Redis check on host port
-        checkRedis(config.redisHost(), config.redisPort());
+        checkRedis(config.redisHost(), config.redisPort(), hint);
 
         // 5. Kafka check on host port
         try (KafkaProbe kafka = new KafkaProbe(config)) {
@@ -61,7 +65,7 @@ public final class PreflightExtension implements BeforeAllCallback {
         }
     }
 
-    private static void checkHttpService(HttpClient client, String name, String url) {
+    private static void checkHttpService(HttpClient client, String name, String url, String hint) {
         try {
             HttpRequest req = HttpRequest.newBuilder(URI.create(url))
                     .timeout(Duration.ofSeconds(4))
@@ -69,19 +73,19 @@ public final class PreflightExtension implements BeforeAllCallback {
                     .build();
             HttpResponse<String> resp = client.send(req, HttpResponse.BodyHandlers.ofString(StandardCharsets.UTF_8));
             if (resp.statusCode() != 200 || resp.body() == null || !resp.body().contains("\"UP\"")) {
-                throw new AssertionError("Preflight FAILED: " + name + " at " + url
+                throw new AssertionError("Preflight FAILED: HTTP service check - " + name + " at " + url
                         + " returned HTTP " + resp.statusCode() + " body=" + resp.body()
-                        + ". Run 'make stack-up' first.");
+                        + ". " + hint);
             }
         } catch (AssertionError e) {
             throw e;
         } catch (Exception e) {
-            throw new AssertionError("Preflight FAILED: " + name + " is unreachable at " + url
-                    + " (" + e.getMessage() + "). Run 'make stack-up' first.", e);
+            throw new AssertionError("Preflight FAILED: HTTP service check - " + name + " is unreachable at " + url
+                    + " (" + e.getMessage() + "). " + hint, e);
         }
     }
 
-    private static void checkRedis(String host, int port) {
+    private static void checkRedis(String host, int port, String hint) {
         try (Socket socket = new Socket()) {
             socket.connect(new InetSocketAddress(host, port), 3000);
             socket.setSoTimeout(3000);
@@ -92,14 +96,14 @@ public final class PreflightExtension implements BeforeAllCallback {
                     new InputStreamReader(socket.getInputStream(), StandardCharsets.UTF_8));
             String line = reader.readLine();
             if (line == null || !line.startsWith("+PONG")) {
-                throw new AssertionError("Preflight FAILED: Redis at " + host + ":" + port
-                        + " did not respond with +PONG (got: " + line + "). Run 'make stack-up' first.");
+                throw new AssertionError("Preflight FAILED: Redis check - Redis at " + host + ":" + port
+                        + " did not respond with +PONG (got: " + line + "). " + hint);
             }
         } catch (AssertionError e) {
             throw e;
         } catch (Exception e) {
-            throw new AssertionError("Preflight FAILED: Redis is unreachable at " + host + ":" + port
-                    + " (" + e.getMessage() + "). Run 'make stack-up' first.", e);
+            throw new AssertionError("Preflight FAILED: Redis check - Redis is unreachable at " + host + ":" + port
+                    + " (" + e.getMessage() + "). " + hint, e);
         }
     }
 }

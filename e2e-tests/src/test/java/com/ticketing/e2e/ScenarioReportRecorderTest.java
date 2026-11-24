@@ -1,5 +1,8 @@
 package com.ticketing.e2e;
 
+import com.ticketing.e2e.support.CommandResult;
+import com.ticketing.e2e.support.E2EConfig;
+import com.ticketing.e2e.support.ProcessRunner;
 import com.ticketing.e2e.support.ScenarioReportRecorder;
 import org.junit.jupiter.api.AfterAll;
 import org.junit.jupiter.api.BeforeAll;
@@ -24,7 +27,8 @@ class ScenarioReportRecorderTest {
     private static final List<String> TEST_METHODS = List.of(
             "failingScenarioRendersFailAndNeverContainsVerified",
             "unrunScenariosRenderNotRunOnRowsAndPartialOnGuaranteesAndZeroRunRendersNotRun",
-            "fullyPassingSuiteRendersVerifiedPublishesDocsAndReconcilesAllTotalsAndDeadLetters"
+            "fullyPassingSuiteRendersVerifiedPublishesDocsAndReconcilesAllTotalsAndDeadLetters",
+            "reportHeaderIncludesBackendAndFailoverBudget"
     );
 
     @BeforeAll
@@ -292,5 +296,48 @@ class ScenarioReportRecorderTest {
                         + totalNotifConfirmed + " / " + totalNotifCancelled + " |")
                 .contains("| Dead-Letter Messages (`Actual / Expected / Unexpected`) | "
                         + totalDlt + " / " + totalExpectedDlt + " / " + (totalDlt - totalExpectedDlt) + " |");
+    }
+
+    @Test
+    void reportHeaderIncludesBackendAndFailoverBudget(@TempDir Path tempDir) throws Exception {
+        // Compose default
+        ScenarioReportRecorder composeRecorder = new ScenarioReportRecorder();
+        composeRecorder.writeReports(tempDir);
+        Path reportFile = tempDir.resolve("e2e-tests/target/e2e-report.md");
+        String composeMd = Files.readString(reportFile, StandardCharsets.UTF_8);
+        assertThat(composeMd)
+                .contains("- **Backend**: `compose`")
+                .contains("- **Failover Budget**: `60s`");
+
+        // Custom process runner for K8s
+        ProcessRunner fakeK8sRunner = (timeout, command) -> {
+            String cmdStr = String.join(" ", command);
+            if (cmdStr.contains("version -o json")) {
+                return new CommandResult(0, "{\"serverVersion\":{\"gitVersion\":\"v1.35.5+k3s1\"}}", "");
+            }
+            if (cmdStr.contains("get nodes --no-headers")) {
+                return new CommandResult(0, "node-1 Ready\nnode-2 Ready\nnode-3 Ready\n", "");
+            }
+            return new CommandResult(0, "", "");
+        };
+
+        String prevBackend = System.getProperty("E2E_BACKEND");
+        String prevBudget = System.getProperty("E2E_FAILOVER_BUDGET_SECONDS");
+        System.setProperty("E2E_BACKEND", "k8s");
+        System.setProperty("E2E_FAILOVER_BUDGET_SECONDS", "180");
+        try {
+            E2EConfig k8sConfig = E2EConfig.load();
+            ScenarioReportRecorder k8sRecorder = new ScenarioReportRecorder(k8sConfig, fakeK8sRunner);
+            k8sRecorder.writeReports(tempDir);
+            String k8sMd = Files.readString(reportFile, StandardCharsets.UTF_8);
+            assertThat(k8sMd)
+                    .contains("- **Backend**: `k8s (v1.35.5+k3s1, 3 nodes)`")
+                    .contains("- **Failover Budget**: `180s`");
+        } finally {
+            if (prevBackend == null) System.clearProperty("E2E_BACKEND");
+            else System.setProperty("E2E_BACKEND", prevBackend);
+            if (prevBudget == null) System.clearProperty("E2E_FAILOVER_BUDGET_SECONDS");
+            else System.setProperty("E2E_FAILOVER_BUDGET_SECONDS", prevBudget);
+        }
     }
 }
