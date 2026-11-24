@@ -1,0 +1,21 @@
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: gateway-ingress
+  namespace: ticketing
+  labels:
+    app.kubernetes.io/name: gateway-service
+    app.kubernetes.io/part-of: ticketing-platform
+spec:
+  ingressClassName: traefik
+  rules:
+    - host: ticketing.localtest.me
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: gateway-service
+                port:
+                  name: http

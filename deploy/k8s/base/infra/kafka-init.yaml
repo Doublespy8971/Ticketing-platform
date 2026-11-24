@@ -1,0 +1,106 @@
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: kafka-init
+  namespace: ticketing
+  labels:
+    app.kubernetes.io/name: kafka-init
+    app.kubernetes.io/part-of: ticketing-platform
+spec:
+  backoffLimit: 6
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: kafka-init
+        app.kubernetes.io/part-of: ticketing-platform
+    spec:
+      serviceAccountName: kafka-init
+      automountServiceAccountToken: false
+      restartPolicy: OnFailure
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1000
+        runAsGroup: 1000
+        fsGroup: 1000
+        seccompProfile:
+          type: RuntimeDefault
+      initContainers:
+        - name: wait-for-kafka
+          image: apache/kafka:3.8.0
+          imagePullPolicy: IfNotPresent
+          command:
+            - /bin/bash
+            - -c
+            - |
+              set -euo pipefail
+              deadline=$((SECONDS + 180))
+              echo "[kafka-init] Waiting up to 180s for Kafka broker kafka.ticketing.svc.cluster.local:9092..."
+              while ! /opt/kafka/bin/kafka-topics.sh --bootstrap-server kafka.ticketing.svc.cluster.local:9092 --list >/dev/null 2>&1; do
+                if [ "$SECONDS" -ge "$deadline" ]; then
+                  echo "[kafka-init] ERROR: Timed out after 180s waiting for missing dependency: kafka.ticketing.svc.cluster.local:9092" >&2
+                  exit 1
+                fi
+                sleep 3
+              done
+              echo "[kafka-init] Kafka broker is ready."
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop:
+                - ALL
+          resources:
+            requests:
+              cpu: 200m
+              memory: 256Mi
+            limits:
+              cpu: 1000m
+              memory: 512Mi
+          volumeMounts:
+            - name: tmp
+              mountPath: /tmp
+            - name: kafka-logs
+              mountPath: /opt/kafka/logs
+      containers:
+        - name: create-topics
+          image: apache/kafka:3.8.0
+          imagePullPolicy: IfNotPresent
+          command:
+            - /bin/bash
+            - /scripts/create-topics.sh
+          env:
+            - name: KAFKA_BOOTSTRAP_SERVERS
+              valueFrom:
+                configMapKeyRef:
+                  name: ticketing-config
+                  key: KAFKA_BOOTSTRAP_SERVERS
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop:
+                - ALL
+          resources:
+            requests:
+              cpu: 200m
+              memory: 256Mi
+            limits:
+              cpu: 1000m
+              memory: 512Mi
+          volumeMounts:
+            - name: scripts
+              mountPath: /scripts
+              readOnly: true
+            - name: tmp
+              mountPath: /tmp
+            - name: kafka-logs
+              mountPath: /opt/kafka/logs
+      volumes:
+        - name: scripts
+          configMap:
+            name: kafka-init-script
+            defaultMode: 0555
+        - name: tmp
+          emptyDir: {}
+        - name: kafka-logs
+          emptyDir: {}

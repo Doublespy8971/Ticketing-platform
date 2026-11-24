@@ -1,0 +1,54 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+resources:
+  - ../../base
+
+# Local overlay replica counts:
+# - inventory-service (2) and payment-service (2) exercise outbox leader election and Kafka consumer groups
+# - gateway-service (1), order-service (1), notification-service (1) keep laptop Docker VM RAM bounded
+replicas:
+  - name: gateway-service
+    count: 1
+  - name: inventory-service
+    count: 2
+  - name: order-service
+    count: 1
+  - name: payment-service
+    count: 2
+  - name: notification-service
+    count: 1
+
+images:
+  - name: ticketing/gateway-service
+    newName: ticketing/gateway-service
+    newTag: dev
+  - name: ticketing/inventory-service
+    newName: ticketing/inventory-service
+    newTag: dev
+  - name: ticketing/order-service
+    newName: ticketing/order-service
+    newTag: dev
+  - name: ticketing/payment-service
+    newName: ticketing/payment-service
+    newTag: dev
+  - name: ticketing/notification-service
+    newName: ticketing/notification-service
+    newTag: dev
+
+configMapGenerator:
+  - name: gateway-local-config
+    namespace: ticketing
+    literals:
+      - TICKETING_GATEWAY_ALLOW_INSECURE_DEV_SECRET=true
+      - TICKETING_GATEWAY_DEV_TOKEN_ENABLED=true
+      - TICKETING_GATEWAY_DEV_TOKEN_ALLOW_ADMIN=true
+
+patches:
+  - path: patches/gateway-local.yaml
+  - target:
+      kind: Deployment
+    patch: |-
+      - op: add
+        path: /spec/template/spec/containers/0/imagePullPolicy
+        value: IfNotPresent

@@ -1,0 +1,138 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: gateway-service
+  namespace: ticketing
+  labels:
+    app.kubernetes.io/name: gateway-service
+    app.kubernetes.io/part-of: ticketing-platform
+spec:
+  type: ClusterIP
+  selector:
+    app.kubernetes.io/name: gateway-service
+  ports:
+    # Management port 8085 is intentionally NOT exposed on this Service.
+    - name: http
+      port: 8080
+      targetPort: http
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: gateway-service
+  namespace: ticketing
+  labels:
+    app.kubernetes.io/name: gateway-service
+    app.kubernetes.io/part-of: ticketing-platform
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: gateway-service
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: gateway-service
+        app.kubernetes.io/part-of: ticketing-platform
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/path: "/actuator/prometheus"
+        prometheus.io/port: "8085"
+    spec:
+      serviceAccountName: gateway-service
+      automountServiceAccountToken: false
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
+        runAsGroup: 10001
+        fsGroup: 10001
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: gateway-service
+          image: ticketing/gateway-service:dev
+          ports:
+            - name: http
+              containerPort: 8080
+            - name: management
+              containerPort: 8085
+          env:
+            - name: SERVER_PORT
+              value: "8080"
+            - name: SPRING_PROFILES_ACTIVE
+              value: "prod"
+            - name: REDIS_HOST
+              valueFrom:
+                configMapKeyRef:
+                  name: ticketing-config
+                  key: REDIS_HOST
+            - name: REDIS_PORT
+              valueFrom:
+                configMapKeyRef:
+                  name: ticketing-config
+                  key: REDIS_PORT
+            - name: INVENTORY_SERVICE_URL
+              valueFrom:
+                configMapKeyRef:
+                  name: ticketing-config
+                  key: INVENTORY_SERVICE_URL
+            - name: ORDER_SERVICE_URL
+              valueFrom:
+                configMapKeyRef:
+                  name: ticketing-config
+                  key: ORDER_SERVICE_URL
+            - name: PAYMENT_SERVICE_URL
+              valueFrom:
+                configMapKeyRef:
+                  name: ticketing-config
+                  key: PAYMENT_SERVICE_URL
+            - name: JAVA_OPTS_EXTRA
+              valueFrom:
+                configMapKeyRef:
+                  name: ticketing-config
+                  key: JAVA_OPTS_EXTRA
+            - name: JWT_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: ticketing-secrets
+                  key: JWT_SECRET
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop:
+                - ALL
+          resources:
+            requests:
+              cpu: 250m
+              memory: 512Mi
+            limits:
+              cpu: 1500m
+              memory: 768Mi
+          startupProbe:
+            httpGet:
+              path: /actuator/health/readiness
+              port: management
+            periodSeconds: 5
+            timeoutSeconds: 3
+            failureThreshold: 30
+          livenessProbe:
+            httpGet:
+              path: /actuator/health/liveness
+              port: management
+            periodSeconds: 10
+            timeoutSeconds: 3
+            failureThreshold: 3
+          readinessProbe:
+            httpGet:
+              path: /actuator/health/readiness
+              port: management
+            periodSeconds: 5
+            timeoutSeconds: 3
+            failureThreshold: 2
+          volumeMounts:
+            - name: tmp
+              mountPath: /tmp
+      volumes:
+        - name: tmp
+          emptyDir: {}

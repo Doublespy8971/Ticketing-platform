@@ -1,0 +1,45 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: gateway-service
+  namespace: ticketing
+spec:
+  template:
+    metadata:
+      annotations:
+        # In the local profile, Spring Boot serves Actuator on main port 8080 instead of management port 8085.
+        prometheus.io/port: "8080"
+    spec:
+      containers:
+        - name: gateway-service
+          env:
+            # Local profile enables /api/v1/auth/token needed by the E2E suite and keeps actuator on port 8080.
+            - name: SPRING_PROFILES_ACTIVE
+              value: "local"
+            - name: TICKETING_GATEWAY_ALLOW_INSECURE_DEV_SECRET
+              valueFrom:
+                configMapKeyRef:
+                  name: gateway-local-config
+                  key: TICKETING_GATEWAY_ALLOW_INSECURE_DEV_SECRET
+            - name: TICKETING_GATEWAY_DEV_TOKEN_ENABLED
+              valueFrom:
+                configMapKeyRef:
+                  name: gateway-local-config
+                  key: TICKETING_GATEWAY_DEV_TOKEN_ENABLED
+            - name: TICKETING_GATEWAY_DEV_TOKEN_ALLOW_ADMIN
+              valueFrom:
+                configMapKeyRef:
+                  name: gateway-local-config
+                  key: TICKETING_GATEWAY_DEV_TOKEN_ALLOW_ADMIN
+          startupProbe:
+            httpGet:
+              path: /actuator/health/readiness
+              port: http
+          livenessProbe:
+            httpGet:
+              path: /actuator/health/liveness
+              port: http
+          readinessProbe:
+            httpGet:
+              path: /actuator/health/readiness
+              port: http

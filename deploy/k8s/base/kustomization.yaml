@@ -1,0 +1,47 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+namespace: ticketing
+
+resources:
+  - namespace.yaml
+  - serviceaccounts.yaml
+  - configmap.yaml
+  - infra/kafka.yaml
+  - infra/kafka-init.yaml
+  - infra/postgres-inventory.yaml
+  - infra/postgres-order.yaml
+  - infra/postgres-payment.yaml
+  - infra/redis.yaml
+  - apps/gateway-service.yaml
+  - apps/inventory-service.yaml
+  - apps/order-service.yaml
+  - apps/payment-service.yaml
+  - apps/notification-service.yaml
+  - ingress.yaml
+
+configMapGenerator:
+  - name: kafka-init-script
+    namespace: ticketing
+    files:
+      - create-topics.sh=../../../infra/kafka/create-topics.sh
+
+generatorOptions:
+  disableNameSuffixHash: true
+
+images:
+  - name: ticketing/gateway-service
+    newName: ticketing/gateway-service
+    newTag: dev
+  - name: ticketing/inventory-service
+    newName: ticketing/inventory-service
+    newTag: dev
+  - name: ticketing/order-service
+    newName: ticketing/order-service
+    newTag: dev
+  - name: ticketing/payment-service
+    newName: ticketing/payment-service
+    newTag: dev
+  - name: ticketing/notification-service
+    newName: ticketing/notification-service
+    newTag: dev

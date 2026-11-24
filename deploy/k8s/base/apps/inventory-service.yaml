@@ -1,0 +1,186 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: inventory-service
+  namespace: ticketing
+  labels:
+    app.kubernetes.io/name: inventory-service
+    app.kubernetes.io/part-of: ticketing-platform
+spec:
+  type: ClusterIP
+  selector:
+    app.kubernetes.io/name: inventory-service
+  ports:
+    - name: http
+      port: 8081
+      targetPort: http
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: inventory-service
+  namespace: ticketing
+  labels:
+    app.kubernetes.io/name: inventory-service
+    app.kubernetes.io/part-of: ticketing-platform
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: inventory-service
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: inventory-service
+        app.kubernetes.io/part-of: ticketing-platform
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/path: "/actuator/prometheus"
+        prometheus.io/port: "8081"
+    spec:
+      serviceAccountName: inventory-service
+      automountServiceAccountToken: false
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
+        runAsGroup: 10001
+        fsGroup: 10001
+        seccompProfile:
+          type: RuntimeDefault
+      initContainers:
+        - name: wait-for-deps
+          image: busybox:1.36.1
+          imagePullPolicy: IfNotPresent
+          command:
+            - sh
+            - -c
+            - |
+              set -eu
+              wait_tcp() {
+                host="$1"; port="$2"; label="$3"; deadline=$(( $(date +%s) + 180 ))
+                echo "[init] Waiting up to 180s for ${label} (${host}:${port})..."
+                while ! nc -z -w 2 "$host" "$port" >/dev/null 2>&1; do
+                  if [ "$(date +%s)" -ge "$deadline" ]; then
+                    echo "[init] ERROR: Timed out after 180s waiting for missing dependency: ${label} (${host}:${port})" >&2
+                    exit 1
+                  fi
+                  sleep 2
+                done
+                echo "[init] Dependency ready: ${label}"
+              }
+              wait_tcp postgres-inventory.ticketing.svc.cluster.local 5432 postgres-inventory
+              wait_tcp redis.ticketing.svc.cluster.local 6379 redis
+              wait_tcp kafka.ticketing.svc.cluster.local 9092 kafka
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop:
+                - ALL
+          resources:
+            requests:
+              cpu: 10m
+              memory: 16Mi
+            limits:
+              cpu: 100m
+              memory: 32Mi
+      containers:
+        - name: inventory-service
+          image: ticketing/inventory-service:dev
+          ports:
+            - name: http
+              containerPort: 8081
+          env:
+            - name: SERVER_PORT
+              value: "8081"
+            - name: POSTGRES_URL
+              value: "jdbc:postgresql://postgres-inventory.ticketing.svc.cluster.local:5432/inventory_db"
+            - name: POSTGRES_USER
+              valueFrom:
+                secretKeyRef:
+                  name: ticketing-secrets
+                  key: POSTGRES_USER
+            - name: POSTGRES_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: ticketing-secrets
+                  key: POSTGRES_PASSWORD
+            - name: REDIS_HOST
+              valueFrom:
+                configMapKeyRef:
+                  name: ticketing-config
+                  key: REDIS_HOST
+            - name: REDIS_PORT
+              valueFrom:
+                configMapKeyRef:
+                  name: ticketing-config
+                  key: REDIS_PORT
+            - name: KAFKA_BOOTSTRAP_SERVERS
+              valueFrom:
+                configMapKeyRef:
+                  name: ticketing-config
+                  key: KAFKA_BOOTSTRAP_SERVERS
+            - name: OUTBOX_ENABLED
+              valueFrom:
+                configMapKeyRef:
+                  name: ticketing-config
+                  key: OUTBOX_ENABLED
+            - name: KAFKA_CONSUMER_CONCURRENCY
+              value: "3"
+            - name: HIKARI_MAX_POOL_SIZE
+              value: "20"
+            - name: TICKETING_CONSUMER_SESSION_TIMEOUT_MS
+              valueFrom:
+                configMapKeyRef:
+                  name: ticketing-config
+                  key: TICKETING_CONSUMER_SESSION_TIMEOUT_MS
+            - name: TICKETING_CONSUMER_HEARTBEAT_INTERVAL_MS
+              valueFrom:
+                configMapKeyRef:
+                  name: ticketing-config
+                  key: TICKETING_CONSUMER_HEARTBEAT_INTERVAL_MS
+            - name: JAVA_OPTS_EXTRA
+              valueFrom:
+                configMapKeyRef:
+                  name: ticketing-config
+                  key: JAVA_OPTS_EXTRA
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop:
+                - ALL
+          resources:
+            requests:
+              cpu: 250m
+              memory: 512Mi
+            limits:
+              cpu: 1500m
+              memory: 768Mi
+          startupProbe:
+            httpGet:
+              path: /actuator/health/readiness
+              port: http
+            periodSeconds: 5
+            timeoutSeconds: 3
+            failureThreshold: 30
+          livenessProbe:
+            httpGet:
+              path: /actuator/health/liveness
+              port: http
+            periodSeconds: 10
+            timeoutSeconds: 3
+            failureThreshold: 3
+          readinessProbe:
+            httpGet:
+              path: /actuator/health/readiness
+              port: http
+            periodSeconds: 5
+            timeoutSeconds: 3
+            failureThreshold: 2
+          volumeMounts:
+            - name: tmp
+              mountPath: /tmp
+      volumes:
+        - name: tmp
+          emptyDir: {}

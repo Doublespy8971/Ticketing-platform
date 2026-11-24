@@ -14,7 +14,8 @@ CAFFEINATE := $(shell command -v caffeinate >/dev/null 2>&1 && echo "caffeinate 
         dashboards-gen dashboards-check traffic traffic-long \
         load-flash load-journey load-all load-fresh load-report load-audit jvm-check \
         load-preflight load-breakpoint-hold load-breakpoint-journey load-breakpoint \
-        load-steady load-sustained load-sustained-x3 load-soak
+        load-steady load-sustained load-sustained-x3 load-soak \
+        k8s-lint k8s-images k8s-secrets k8s-up k8s-status k8s-forward k8s-forward-stop k8s-logs k8s-down k8s-destroy k8s-redeploy
 
 infra-up:
 	@test -f infra/.env || cp infra/.env.example infra/.env
@@ -261,6 +262,44 @@ load-audit:
 
 jvm-check:
 	bash scripts/check-jvm-flags.sh
+
+# -----------------------------------------------------------------------------
+# Kubernetes (k3d + Kustomize) targets
+# -----------------------------------------------------------------------------
+k8s-lint:
+	bash scripts/k8s-lint.sh
+
+k8s-images:
+	bash scripts/k8s-images.sh
+
+k8s-secrets:
+	bash scripts/k8s-secrets.sh
+
+k8s-up:
+	bash scripts/k8s-up.sh
+
+k8s-status:
+	bash scripts/k8s-status.sh
+
+k8s-forward:
+	bash scripts/k8s-forward.sh start
+
+k8s-forward-stop:
+	bash scripts/k8s-forward.sh stop
+
+k8s-logs:
+	@test -n "$(SERVICE)" || (echo "Usage: make k8s-logs SERVICE=<service-name>" >&2; exit 1)
+	kubectl -n ticketing logs -l app.kubernetes.io/name=$(SERVICE) --all-containers=true --tail=200 -f
+
+k8s-down:
+	bash scripts/k8s-down.sh
+
+k8s-destroy:
+	bash scripts/k8s-cluster.sh destroy
+
+k8s-redeploy:
+	@test -n "$(SERVICE)" || (echo "Usage: make k8s-redeploy SERVICE=<service-name>" >&2; exit 1)
+	bash scripts/k8s-redeploy.sh "$(SERVICE)"
 
 
 

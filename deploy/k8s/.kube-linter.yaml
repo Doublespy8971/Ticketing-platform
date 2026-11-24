@@ -1,0 +1,14 @@
+checks:
+  doNotAutoAddDefaults: false
+  include:
+    - "run-as-non-root"
+    - "no-read-only-root-fs"
+    - "unset-cpu-requirements"
+    - "unset-memory-requirements"
+    - "latest-tag"
+    - "privilege-escalation-container"
+  exclude:
+    # Default check requires >=3 replicas per Deployment; base uses 2 replicas for Java services and 1 for notification-service (local overlay uses 1-2 to fit laptop RAM).
+    - "minimum-three-replicas"
+    # Default check requires inter-pod anti-affinity on multi-replica Deployments; small 3-node k3d topology schedules replicas without hard anti-affinity constraints.
+    - "no-anti-affinity"
