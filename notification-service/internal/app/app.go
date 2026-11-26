@@ -9,10 +9,10 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
-	"net"
 	"net/http"
 	"os"
 	"os/signal"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -198,41 +198,53 @@ func RunWithOptions(args []string, stdout, stderr io.Writer, opts Options) int {
 
 	// Kafka Reader
 	reader := opts.Reader
+	var partitionsAssigned atomic.Bool
+	var c *consumer.Consumer
+
 	if reader == nil {
+		trackingLogger := consumer.NewPartitionTrackingLogger(func(assigned bool) {
+			partitionsAssigned.Store(assigned)
+			if c != nil {
+				c.SetAssignedPartitions(assigned)
+			}
+		}, logger, cfg.KafkaTopic)
+
 		reader = kafka.NewReader(kafka.ReaderConfig{
-			Brokers:           cfg.KafkaBootstrapServers,
-			GroupID:           cfg.KafkaGroupID,
-			Topic:             cfg.KafkaTopic,
-			MinBytes:          10e3,
-			MaxBytes:          10e6,
-			MaxWait:           500 * time.Millisecond,
-			StartOffset:       kafka.FirstOffset,
-			IsolationLevel:    kafka.ReadCommitted,
-			SessionTimeout:    cfg.KafkaSessionTimeout,
-			HeartbeatInterval: cfg.KafkaHeartbeatInterval,
+			Brokers:                cfg.KafkaBootstrapServers,
+			GroupID:                cfg.KafkaGroupID,
+			Topic:                  cfg.KafkaTopic,
+			MinBytes:               10e3,
+			MaxBytes:               10e6,
+			MaxWait:                500 * time.Millisecond,
+			StartOffset:            kafka.FirstOffset,
+			IsolationLevel:         kafka.ReadCommitted,
+			SessionTimeout:         cfg.KafkaSessionTimeout,
+			HeartbeatInterval:      cfg.KafkaHeartbeatInterval,
+			WatchPartitionChanges:  true,
+			PartitionWatchInterval: cfg.KafkaPartitionWatchInterval,
+			Logger:                 trackingLogger,
 		})
 	}
 
 	// Consumer
-	c := consumer.NewConsumer(reader, deduplicator, sender, m, consumer.Options{
+	c = consumer.NewConsumer(reader, deduplicator, sender, m, consumer.Options{
 		MaxAttempts:     cfg.SenderMaxAttempts,
 		InitialBackoff:  cfg.SenderInitialBackoff,
 		MaxBackoff:      cfg.SenderMaxBackoff,
 		MaxPollInterval: cfg.RedisMaxPollInterval,
 		Logger:          logger,
 	})
+	if partitionsAssigned.Load() {
+		c.SetAssignedPartitions(true)
+	}
 
 	// Health handler
-	checkKafka := func(ctx context.Context) error {
-		for _, broker := range cfg.KafkaBootstrapServers {
-			conn, err := (&net.Dialer{}).DialContext(ctx, "tcp", broker)
-			if err == nil {
-				_ = conn.Close()
-				return nil
-			}
+	checkKafka := health.NewKafkaReadinessCheck(cfg.KafkaBootstrapServers, func() bool {
+		if c != nil && c.HasAssignedPartitions() {
+			return true
 		}
-		return errors.New("cannot connect to any Kafka broker")
-	}
+		return partitionsAssigned.Load()
+	})
 
 	checkRedis := func(ctx context.Context) error {
 		return rdb.Ping(ctx).Err()

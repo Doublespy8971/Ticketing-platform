@@ -30,6 +30,7 @@ type Config struct {
 	RedisMaxPollInterval  time.Duration
 	KafkaSessionTimeout   time.Duration
 	KafkaHeartbeatInterval time.Duration
+	KafkaPartitionWatchInterval time.Duration
 }
 
 func (c *Config) ServerAddr() string {
@@ -153,6 +154,12 @@ func LoadConfig() (*Config, error) {
 		return nil, fmt.Errorf("invalid KAFKA_HEARTBEAT_INTERVAL_MS %q: must be positive integer and at most one third of session timeout (%d ms)", heartbeatIntervalMsStr, sessionTimeoutMs/3)
 	}
 
+	partitionWatchIntervalMsStr := getEnv("KAFKA_PARTITION_WATCH_INTERVAL_MS", "5000")
+	partitionWatchIntervalMs, err := strconv.Atoi(partitionWatchIntervalMsStr)
+	if err != nil || partitionWatchIntervalMs < 1000 || partitionWatchIntervalMs > 60000 {
+		return nil, fmt.Errorf("invalid KAFKA_PARTITION_WATCH_INTERVAL_MS %q: must be integer between 1000 and 60000", partitionWatchIntervalMsStr)
+	}
+
 	// Validate that claim TTL exceeds worst-case send time (attempts * timeout + backoff sum)
 	var backoffSum time.Duration
 	curBackoff := time.Duration(initialBackoffMs) * time.Millisecond
@@ -189,6 +196,7 @@ func LoadConfig() (*Config, error) {
 		RedisMaxPollInterval:  time.Duration(maxPollIntervalMs) * time.Millisecond,
 		KafkaSessionTimeout:   time.Duration(sessionTimeoutMs) * time.Millisecond,
 		KafkaHeartbeatInterval: time.Duration(heartbeatIntervalMs) * time.Millisecond,
+		KafkaPartitionWatchInterval: time.Duration(partitionWatchIntervalMs) * time.Millisecond,
 	}, nil
 }
 

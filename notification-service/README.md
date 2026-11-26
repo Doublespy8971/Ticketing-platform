@@ -12,6 +12,7 @@
   - Consumer group: `notification-service-order-cg`.
   - Isolation level: `read_committed` (`kafka.ReadCommitted`), guaranteeing only committed transactional events are processed.
   - Manual offset commit per message with up to 5 retries.
+  - **Partition Watching & Late Topic Tolerance**: Reader is configured with `WatchPartitionChanges: true` and `PartitionWatchInterval: KAFKA_PARTITION_WATCH_INTERVAL_MS` (default 5s). When starting before `order.events` exists, fetch errors are handled without permanent failure, crashing, or non-zero exit; missing-topic warnings are rate-limited to at most once per 30s while continuing interruptible exponential backoff; partition discovery is logged at `INFO`; and consumption resumes automatically as soon as partitions are assigned.
   - **No Retry / Dead-Letter Topics**: In accordance with `docs/arch/03-kafka.md`, the notification consumer does not produce to `-retry-0`, `-retry-1`, or `-dlt` topics.
 - **Two-Phase Deduplication with Ownership**:
   - Every consumer process generates a unique random `workerId` (UUIDv4) at startup.
@@ -144,9 +145,9 @@ Exposed at `GET /metrics` in Prometheus exposition format:
 - **Liveness**: `GET /health` and `GET /health/liveness`
   - Returns HTTP 200 `{"status":"UP"}`.
 - **Readiness**: `GET /ready` and `GET /health/readiness`
-  - Probes live Kafka and Redis connectivity.
-  - Returns HTTP 200 `{"status":"UP"}` when both respond and not shutting down.
-  - Returns HTTP 503 `{"status":"DOWN"}` during shutdown or when either dependency fails.
+  - Probes live Kafka and Redis connectivity, topic existence, and partition assignment.
+  - Returns HTTP 503 `{"status":"DOWN"}` (without leaking internal broker addresses or hostnames) while the subscribed topic does not exist or partitions are not assigned, or when either dependency fails or during graceful shutdown.
+  - Returns HTTP 200 `{"status":"UP"}` as soon as partitions are assigned and Redis responds, provided the service is not shutting down.
 
 ---
 
@@ -174,6 +175,7 @@ All configuration is provided via environment variables with defaults for local 
 | `REDIS_MAX_POLL_INTERVAL_MS` | `300000` | Maximum polling duration when Redis is unavailable (5 minutes). |
 | `KAFKA_SESSION_TIMEOUT_MS` | `15000` | Kafka consumer session timeout in ms (between 6,000 and 60,000 ms, default 15s). |
 | `KAFKA_HEARTBEAT_INTERVAL_MS` | `3000` | Kafka consumer heartbeat interval in ms (positive, at most 1/3 of session timeout, default 3s). |
+| `KAFKA_PARTITION_WATCH_INTERVAL_MS` | `5000` | Interval in ms between partition checks to discover dynamically created topics/partitions (between 1000 and 60000 ms, default 5s). |
 
 ---
 

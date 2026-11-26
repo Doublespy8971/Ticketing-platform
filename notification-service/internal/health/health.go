@@ -3,10 +3,31 @@ package health
 import (
 	"context"
 	"encoding/json"
+	"errors"
+	"net"
 	"net/http"
 	"sync/atomic"
 	"time"
 )
+
+// NewKafkaReadinessCheck returns a Pinger that reports error if partitions are not assigned
+// or if connection to Kafka brokers cannot be established. It guarantees error messages do not
+// leak broker addresses or hostnames.
+func NewKafkaReadinessCheck(brokers []string, hasPartitions func() bool) Pinger {
+	return func(ctx context.Context) error {
+		if hasPartitions != nil && !hasPartitions() {
+			return errors.New("kafka topic does not exist or partitions not assigned")
+		}
+		for _, broker := range brokers {
+			conn, err := (&net.Dialer{}).DialContext(ctx, "tcp", broker)
+			if err == nil {
+				_ = conn.Close()
+				return nil
+			}
+		}
+		return errors.New("cannot connect to any Kafka broker")
+	}
+}
 
 type Pinger func(ctx context.Context) error
 

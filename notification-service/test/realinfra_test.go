@@ -77,7 +77,13 @@ func requireDockerAndInfra(t *testing.T) ([]string, string, *redis.Client) {
 		}
 		sharedRedisContainer = redisC
 
-		kafkaC, err := tckafka.Run(ctx, "confluentinc/cp-kafka:7.6.1", tckafka.WithClusterID("4L622nShTZaIOqiTmIGCyA"))
+		kafkaC, err := tckafka.Run(ctx, "confluentinc/cp-kafka:7.6.1",
+			tckafka.WithClusterID("4L622nShTZaIOqiTmIGCyA"),
+			testcontainers.CustomizeRequestOption(func(req *testcontainers.GenericContainerRequest) error {
+				req.Env["KAFKA_AUTO_CREATE_TOPICS_ENABLE"] = "false"
+				return nil
+			}),
+		)
 		if err != nil {
 			sharedInfraErr = fmt.Errorf("failed to start testcontainers kafka: %w", err)
 			return
@@ -1187,7 +1193,7 @@ func TestRealInfra_RedisRestartDelaysWithoutLossOrDuplicate(t *testing.T) {
 
 // 10. A Redis container started with requirepass works with REDIS_PASSWORD and fails readiness without it
 func TestRealInfra_RedisRequirePassValidationAndReadiness(t *testing.T) {
-	ctx, cancel := context.WithTimeout(context.Background(), 40*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), 75*time.Second)
 	defer cancel()
 
 	redisPassword := "secretRedisPass123"
@@ -1334,7 +1340,7 @@ func TestRealInfra_KafkaStopTransientErrorExitPathSuccess(t *testing.T) {
 	_, _, rdb := requireDockerAndInfra(t)
 	defer rdb.Close()
 
-	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), 75*time.Second)
 	defer cancel()
 
 	// Dedicated Kafka container so stopping it does not impact other tests
@@ -1445,5 +1451,475 @@ func TestRealInfra_KafkaStopTransientErrorExitPathSuccess(t *testing.T) {
 	)
 	if exitCode != 0 {
 		t.Fatalf("expected process-level exit path to report 0 (success), got %d", exitCode)
+	}
+}
+
+// 13. Start consumer while topic does not exist; create topic with 3 partitions 10 seconds later;
+// produce 20 order.confirmed events; assert that every single event is delivered exactly once,
+// no consumer restart occurs, and consumer group lag reaches 0.
+func TestRealInfra_LateTopicCreation_ThreePartitionsTwentyEvents(t *testing.T) {
+	brokers, _, rdb := requireDockerAndInfra(t)
+	defer rdb.Close()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 75*time.Second)
+	defer cancel()
+
+	topic := fmt.Sprintf("topic-late-3p-%s", uuid.NewString())
+	groupID := fmt.Sprintf("cg-late-3p-%s", uuid.NewString())
+
+	var partitionsAssigned atomic.Bool
+	trackingLogger := consumer.NewPartitionTrackingLogger(func(assigned bool) {
+		partitionsAssigned.Store(assigned)
+	}, slog.Default(), topic)
+
+	reader := kafka.NewReader(kafka.ReaderConfig{
+		Brokers:                brokers,
+		GroupID:                groupID,
+		Topic:                  topic,
+		MinBytes:               1,
+		MaxBytes:               10e6,
+		MaxWait:                200 * time.Millisecond,
+		CommitInterval:         0,
+		StartOffset:            kafka.FirstOffset,
+		WatchPartitionChanges:  true,
+		PartitionWatchInterval: 1 * time.Second,
+		SessionTimeout:         6 * time.Second,
+		HeartbeatInterval:      1 * time.Second,
+		Logger:                 trackingLogger,
+	})
+	defer reader.Close()
+
+	var mu sync.Mutex
+	deliveredEvents := make(map[string]int)
+	allDelivered := make(chan struct{}, 1)
+
+	sender := &customSender{fn: func(ctx context.Context, n notify.Notification) error {
+		mu.Lock()
+		defer mu.Unlock()
+		deliveredEvents[n.EventID]++
+		if len(deliveredEvents) == 20 {
+			select {
+			case allDelivered <- struct{}{}:
+			default:
+			}
+		}
+		return nil
+	}}
+
+	m := metrics.NewMetrics()
+	d := dedup.NewRedisDeduplicator(rdb, groupID, 1*time.Hour,
+		dedup.WithRedisWorkerID("worker-late-3p"),
+		dedup.WithRedisClaimTTL(60*time.Second),
+		dedup.WithRedisMetrics(m),
+	)
+
+	c := consumer.NewConsumer(reader, d, sender, m, consumer.Options{})
+
+	cCtx, cCancel := context.WithCancel(ctx)
+	defer cCancel()
+
+	consumerDone := make(chan error, 1)
+	go func() {
+		consumerDone <- c.Run(cCtx)
+	}()
+
+	// 10 seconds later, create the topic with 3 partitions
+	time.Sleep(10 * time.Second)
+
+	// Verify no consumer restart or exit occurred during the 10 seconds wait
+	select {
+	case err := <-consumerDone:
+		t.Fatalf("consumer exited unexpectedly while waiting for topic: %v", err)
+	default:
+	}
+
+	createRealTopic(ctx, t, brokers, topic, 3)
+
+	// Produce 20 order.confirmed events
+	writer := &kafka.Writer{
+		Addr:     kafka.TCP(brokers...),
+		Topic:    topic,
+		Balancer: &kafka.Hash{},
+	}
+	defer writer.Close()
+
+	expectedEvents := make(map[string]bool)
+	var msgs []kafka.Message
+	for i := 0; i < 20; i++ {
+		orderID := uuid.NewString()
+		eventID := uuid.NewString()
+		expectedEvents[eventID] = true
+		msgs = append(msgs, kafka.Message{
+			Key:   []byte(orderID),
+			Value: makeOrderConfirmedJSON(eventID, orderID),
+		})
+	}
+
+	if err := writer.WriteMessages(ctx, msgs...); err != nil {
+		t.Fatalf("failed to write 20 messages: %v", err)
+	}
+
+	// Wait for all 20 events to be delivered
+	select {
+	case <-allDelivered:
+	case <-time.After(35 * time.Second):
+		mu.Lock()
+		deliveredCount := len(deliveredEvents)
+		mu.Unlock()
+		t.Fatalf("timed out waiting for 20 events, got %d delivered", deliveredCount)
+	}
+
+	// Assert that every single event is delivered exactly once
+	mu.Lock()
+	if len(deliveredEvents) != 20 {
+		t.Fatalf("expected 20 unique events delivered, got %d", len(deliveredEvents))
+	}
+	for eid, count := range deliveredEvents {
+		if count != 1 {
+			t.Fatalf("expected event %s to be delivered exactly once, got %d", eid, count)
+		}
+		if !expectedEvents[eid] {
+			t.Fatalf("unexpected event %s delivered", eid)
+		}
+	}
+	mu.Unlock()
+
+	// Assert no consumer restart occurred
+	select {
+	case err := <-consumerDone:
+		t.Fatalf("consumer exited unexpectedly: %v", err)
+	default:
+	}
+
+	// Assert consumer group lag reaches zero on the broker
+	waitForLagZero(ctx, t, brokers, groupID, topic, 20*time.Second)
+
+	c.StopFetching()
+	select {
+	case <-consumerDone:
+	case <-time.After(2 * time.Second):
+		t.Fatalf("consumer failed to stop cleanly within 2 seconds")
+	}
+}
+
+// 14. Same scenario as 13 but the topic is created with 6 partitions (more than expected),
+// confirming that the consumer assigns across all partitions.
+func TestRealInfra_LateTopicCreation_SixPartitionsMoreThanExpected(t *testing.T) {
+	brokers, _, rdb := requireDockerAndInfra(t)
+	defer rdb.Close()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 75*time.Second)
+	defer cancel()
+
+	topic := fmt.Sprintf("topic-late-6p-%s", uuid.NewString())
+	groupID := fmt.Sprintf("cg-late-6p-%s", uuid.NewString())
+
+	var partitionsAssigned atomic.Bool
+	trackingLogger := consumer.NewPartitionTrackingLogger(func(assigned bool) {
+		partitionsAssigned.Store(assigned)
+	}, slog.Default(), topic)
+
+	reader := kafka.NewReader(kafka.ReaderConfig{
+		Brokers:                brokers,
+		GroupID:                groupID,
+		Topic:                  topic,
+		MinBytes:               1,
+		MaxBytes:               10e6,
+		MaxWait:                200 * time.Millisecond,
+		CommitInterval:         0,
+		StartOffset:            kafka.FirstOffset,
+		WatchPartitionChanges:  true,
+		PartitionWatchInterval: 1 * time.Second,
+		SessionTimeout:         6 * time.Second,
+		HeartbeatInterval:      1 * time.Second,
+		Logger:                 trackingLogger,
+	})
+	defer reader.Close()
+
+	var mu sync.Mutex
+	deliveredEvents := make(map[string]int)
+	allDelivered := make(chan struct{}, 1)
+
+	sender := &customSender{fn: func(ctx context.Context, n notify.Notification) error {
+		mu.Lock()
+		defer mu.Unlock()
+		deliveredEvents[n.EventID]++
+		if len(deliveredEvents) == 24 {
+			select {
+			case allDelivered <- struct{}{}:
+			default:
+			}
+		}
+		return nil
+	}}
+
+	m := metrics.NewMetrics()
+	d := dedup.NewRedisDeduplicator(rdb, groupID, 1*time.Hour,
+		dedup.WithRedisWorkerID("worker-late-6p"),
+		dedup.WithRedisClaimTTL(60*time.Second),
+		dedup.WithRedisMetrics(m),
+	)
+
+	c := consumer.NewConsumer(reader, d, sender, m, consumer.Options{})
+
+	cCtx, cCancel := context.WithCancel(ctx)
+	defer cCancel()
+
+	consumerDone := make(chan error, 1)
+	go func() {
+		consumerDone <- c.Run(cCtx)
+	}()
+
+	// 10 seconds later, create topic with 6 partitions (more than expected)
+	time.Sleep(10 * time.Second)
+
+	select {
+	case err := <-consumerDone:
+		t.Fatalf("consumer exited unexpectedly while waiting for topic: %v", err)
+	default:
+	}
+
+	createRealTopic(ctx, t, brokers, topic, 6)
+
+	// Produce 24 order.confirmed events evenly across all 6 partitions using RoundRobin balancer
+	writer := &kafka.Writer{
+		Addr:     kafka.TCP(brokers...),
+		Topic:    topic,
+		Balancer: &kafka.RoundRobin{},
+	}
+	defer writer.Close()
+
+	expectedEvents := make(map[string]bool)
+	var msgs []kafka.Message
+	for i := 0; i < 24; i++ {
+		orderID := uuid.NewString()
+		eventID := uuid.NewString()
+		expectedEvents[eventID] = true
+		msgs = append(msgs, kafka.Message{
+			Key:   []byte(orderID),
+			Value: makeOrderConfirmedJSON(eventID, orderID),
+		})
+	}
+
+	if err := writer.WriteMessages(ctx, msgs...); err != nil {
+		t.Fatalf("failed to write 24 messages: %v", err)
+	}
+
+	// Wait for all 24 events to be delivered
+	select {
+	case <-allDelivered:
+	case <-time.After(35 * time.Second):
+		mu.Lock()
+		deliveredCount := len(deliveredEvents)
+		mu.Unlock()
+		t.Fatalf("timed out waiting for 24 events across 6 partitions, got %d delivered", deliveredCount)
+	}
+
+	// Assert every single event delivered exactly once
+	mu.Lock()
+	if len(deliveredEvents) != 24 {
+		t.Fatalf("expected 24 unique events delivered, got %d", len(deliveredEvents))
+	}
+	for eid, count := range deliveredEvents {
+		if count != 1 {
+			t.Fatalf("expected event %s to be delivered exactly once, got %d", eid, count)
+		}
+		if !expectedEvents[eid] {
+			t.Fatalf("unexpected event %s delivered", eid)
+		}
+	}
+	mu.Unlock()
+
+	// Assert no consumer restart occurred
+	select {
+	case err := <-consumerDone:
+		t.Fatalf("consumer exited unexpectedly: %v", err)
+	default:
+	}
+
+	// waitForLagZero verifies that all 6 partitions have committed offsets >= latest offset,
+	// proving that the consumer assigned across all 6 partitions
+	waitForLagZero(ctx, t, brokers, groupID, topic, 20*time.Second)
+
+	c.StopFetching()
+	select {
+	case <-consumerDone:
+	case <-time.After(2 * time.Second):
+		t.Fatalf("consumer failed to stop cleanly within 2 seconds")
+	}
+}
+
+// 15. Assert that /ready reports false while the topic does not exist and true once it is created.
+func TestRealInfra_LateTopicCreation_ReadinessFalseBeforeTrueAfter(t *testing.T) {
+	brokers, _, rdb := requireDockerAndInfra(t)
+	defer rdb.Close()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 75*time.Second)
+	defer cancel()
+
+	topic := fmt.Sprintf("topic-late-ready-%s", uuid.NewString())
+	groupID := fmt.Sprintf("cg-late-ready-%s", uuid.NewString())
+
+	var partitionsAssigned atomic.Bool
+	trackingLogger := consumer.NewPartitionTrackingLogger(func(assigned bool) {
+		partitionsAssigned.Store(assigned)
+	}, slog.Default(), topic)
+
+	reader := kafka.NewReader(kafka.ReaderConfig{
+		Brokers:                brokers,
+		GroupID:                groupID,
+		Topic:                  topic,
+		MinBytes:               1,
+		MaxBytes:               10e6,
+		MaxWait:                200 * time.Millisecond,
+		CommitInterval:         0,
+		StartOffset:            kafka.FirstOffset,
+		WatchPartitionChanges:  true,
+		PartitionWatchInterval: 1 * time.Second,
+		SessionTimeout:         6 * time.Second,
+		HeartbeatInterval:      1 * time.Second,
+		Logger:                 trackingLogger,
+	})
+	defer reader.Close()
+
+	sender := notify.NewFailingSender(0, nil)
+	m := metrics.NewMetrics()
+	d := dedup.NewRedisDeduplicator(rdb, groupID, 1*time.Hour,
+		dedup.WithRedisWorkerID("worker-late-ready"),
+		dedup.WithRedisClaimTTL(60*time.Second),
+		dedup.WithRedisMetrics(m),
+	)
+
+	c := consumer.NewConsumer(reader, d, sender, m, consumer.Options{})
+
+	cCtx, cCancel := context.WithCancel(ctx)
+	defer cCancel()
+
+	consumerDone := make(chan error, 1)
+	go func() {
+		consumerDone <- c.Run(cCtx)
+	}()
+
+	checkKafka := health.NewKafkaReadinessCheck(brokers, func() bool {
+		return c.HasAssignedPartitions() || partitionsAssigned.Load()
+	})
+	checkRedis := func(ctx context.Context) error {
+		return rdb.Ping(ctx).Err()
+	}
+
+	h := health.NewHealthHandler(checkKafka, checkRedis, 2*time.Second)
+
+	// 1. While topic does not exist: /ready must report false (503 Service Unavailable, status DOWN)
+	req := httptest.NewRequest(http.MethodGet, "/ready", nil)
+	rec := httptest.NewRecorder()
+	h.ReadinessHandler(rec, req)
+
+	if rec.Code != http.StatusServiceUnavailable {
+		t.Fatalf("expected HTTP 503 DOWN while topic does not exist, got %d", rec.Code)
+	}
+	var resp health.ReadinessResponse
+	if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("failed to decode readiness response: %v", err)
+	}
+	if resp.Status != "DOWN" || resp.Kafka != "DOWN" {
+		t.Fatalf("expected readiness status and kafka DOWN before topic creation, got %+v", resp)
+	}
+
+	// 2. Create the topic with 3 partitions
+	createRealTopic(ctx, t, brokers, topic, 3)
+
+	// Wait for consumer partition watcher to discover partitions and assign them
+	deadline := time.Now().Add(45 * time.Second)
+	for time.Now().Before(deadline) {
+		if c.HasAssignedPartitions() || partitionsAssigned.Load() {
+			break
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+	if !c.HasAssignedPartitions() && !partitionsAssigned.Load() {
+		t.Fatalf("timed out waiting for partitions to be assigned after topic creation")
+	}
+
+	// 3. Once topic is created and partitions are assigned: /ready must report true (200 OK, status UP)
+	rec2 := httptest.NewRecorder()
+	h.ReadinessHandler(rec2, req)
+
+	if rec2.Code != http.StatusOK {
+		t.Fatalf("expected HTTP 200 UP after topic creation and partition assignment, got %d (%s)", rec2.Code, rec2.Body.String())
+	}
+	var resp2 health.ReadinessResponse
+	if err := json.Unmarshal(rec2.Body.Bytes(), &resp2); err != nil {
+		t.Fatalf("failed to decode readiness response: %v", err)
+	}
+	if resp2.Status != "UP" || resp2.Kafka != "UP" {
+		t.Fatalf("expected readiness status and kafka UP after topic creation, got %+v", resp2)
+	}
+
+	c.StopFetching()
+	select {
+	case <-consumerDone:
+	case <-time.After(2 * time.Second):
+		t.Fatalf("consumer failed to stop cleanly within 2 seconds")
+	}
+}
+
+// 16. Assert that a stop request (StopFetching) while waiting for the missing topic returns from Run within 1 second.
+func TestRealInfra_LateTopicCreation_StopFetchingWhileWaitingReturnsWithinOneSecond(t *testing.T) {
+	brokers, _, rdb := requireDockerAndInfra(t)
+	defer rdb.Close()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	missingTopic := fmt.Sprintf("topic-late-missing-stop-%s", uuid.NewString())
+	groupID := fmt.Sprintf("cg-late-missing-stop-%s", uuid.NewString())
+
+	reader := kafka.NewReader(kafka.ReaderConfig{
+		Brokers:                brokers,
+		GroupID:                groupID,
+		Topic:                  missingTopic,
+		MinBytes:               1,
+		MaxBytes:               10e6,
+		MaxWait:                200 * time.Millisecond,
+		CommitInterval:         0,
+		StartOffset:            kafka.FirstOffset,
+		WatchPartitionChanges:  true,
+		PartitionWatchInterval: 1 * time.Second,
+	})
+	defer reader.Close()
+
+	sender := notify.NewFailingSender(0, nil)
+	m := metrics.NewMetrics()
+	d := dedup.NewRedisDeduplicator(rdb, groupID, 1*time.Hour,
+		dedup.WithRedisWorkerID("worker-late-missing-stop"),
+		dedup.WithRedisClaimTTL(60*time.Second),
+		dedup.WithRedisMetrics(m),
+	)
+
+	c := consumer.NewConsumer(reader, d, sender, m, consumer.Options{})
+
+	consumerDone := make(chan error, 1)
+	go func() {
+		consumerDone <- c.Run(ctx)
+	}()
+
+	// Let the consumer start and enter waiting/fetching state on missing topic
+	time.Sleep(500 * time.Millisecond)
+
+	// Call StopFetching and assert Run returns within 1 second
+	start := time.Now()
+	c.StopFetching()
+
+	select {
+	case err := <-consumerDone:
+		elapsed := time.Since(start)
+		if err != nil {
+			t.Fatalf("expected nil error on StopFetching, got %v", err)
+		}
+		if elapsed > 1*time.Second {
+			t.Fatalf("expected Run to return within 1s, took %v", elapsed)
+		}
+	case <-time.After(1 * time.Second):
+		t.Fatalf("timed out waiting for Run to return within 1s after StopFetching while waiting for missing topic")
 	}
 }

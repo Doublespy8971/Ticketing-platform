@@ -70,6 +70,9 @@ func TestLoadConfigDefaults(t *testing.T) {
 	if cfg.KafkaHeartbeatInterval != 3*time.Second {
 		t.Errorf("expected default KafkaHeartbeatInterval 3s, got %v", cfg.KafkaHeartbeatInterval)
 	}
+	if cfg.KafkaPartitionWatchInterval != 5*time.Second {
+		t.Errorf("expected default KafkaPartitionWatchInterval 5s, got %v", cfg.KafkaPartitionWatchInterval)
+	}
 }
 
 func TestLoadConfigInvalidEnv(t *testing.T) {
@@ -109,6 +112,9 @@ func TestLoadConfigInvalidEnv(t *testing.T) {
 			"KAFKA_HEARTBEAT_INTERVAL_MS": "6000",
 		}},
 		{"kafka heartbeat non-positive", map[string]string{"KAFKA_HEARTBEAT_INTERVAL_MS": "0"}},
+		{"kafka partition watch interval invalid string", map[string]string{"KAFKA_PARTITION_WATCH_INTERVAL_MS": "abc"}},
+		{"kafka partition watch interval too low", map[string]string{"KAFKA_PARTITION_WATCH_INTERVAL_MS": "999"}},
+		{"kafka partition watch interval too high", map[string]string{"KAFKA_PARTITION_WATCH_INTERVAL_MS": "60001"}},
 	}
 
 	for _, tc := range testCases {
@@ -159,6 +165,7 @@ func TestLoadConfigKafkaTimeoutOverrides(t *testing.T) {
 	os.Clearenv()
 	_ = os.Setenv("KAFKA_SESSION_TIMEOUT_MS", "24000")
 	_ = os.Setenv("KAFKA_HEARTBEAT_INTERVAL_MS", "6000")
+	_ = os.Setenv("KAFKA_PARTITION_WATCH_INTERVAL_MS", "10000")
 
 	cfg, err := LoadConfig()
 	if err != nil {
@@ -170,5 +177,8 @@ func TestLoadConfigKafkaTimeoutOverrides(t *testing.T) {
 	}
 	if cfg.KafkaHeartbeatInterval != 6*time.Second {
 		t.Errorf("expected KafkaHeartbeatInterval 6s, got %v", cfg.KafkaHeartbeatInterval)
+	}
+	if cfg.KafkaPartitionWatchInterval != 10*time.Second {
+		t.Errorf("expected KafkaPartitionWatchInterval 10s, got %v", cfg.KafkaPartitionWatchInterval)
 	}
 }

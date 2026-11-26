@@ -5,6 +5,8 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"strings"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -34,6 +36,10 @@ type Consumer struct {
 
 	stopping      atomic.Bool
 	stopFetchChan chan struct{}
+
+	partitionsAssigned   atomic.Bool
+	warnMu               sync.Mutex
+	lastMissingTopicWarn time.Time
 }
 
 type Options struct {
@@ -92,6 +98,14 @@ func (c *Consumer) StopFetching() {
 	}
 }
 
+func (c *Consumer) HasAssignedPartitions() bool {
+	return c.partitionsAssigned.Load()
+}
+
+func (c *Consumer) SetAssignedPartitions(assigned bool) {
+	c.partitionsAssigned.Store(assigned)
+}
+
 func (c *Consumer) Run(ctx context.Context) error {
 	fetchBackoff := 500 * time.Millisecond
 	maxFetchBackoff := 10 * time.Second
@@ -126,10 +140,29 @@ func (c *Consumer) Run(ctx context.Context) error {
 			if errors.Is(err, context.Canceled) || ctx.Err() != nil || c.stopping.Load() {
 				return nil
 			}
-			c.logger.Warn("Transient Kafka fetch error, backing off",
-				slog.String("error", err.Error()),
-				slog.Duration("backoff", fetchBackoff),
-			)
+
+			if isMissingTopicError(err) {
+				c.partitionsAssigned.Store(false)
+				c.warnMu.Lock()
+				shouldLog := c.lastMissingTopicWarn.IsZero() || time.Since(c.lastMissingTopicWarn) >= 30*time.Second
+				if shouldLog {
+					c.lastMissingTopicWarn = time.Now()
+				}
+				c.warnMu.Unlock()
+
+				if shouldLog {
+					c.logger.Warn("Kafka topic does not exist yet, backing off",
+						slog.String("error", err.Error()),
+						slog.Duration("backoff", fetchBackoff),
+					)
+				}
+			} else {
+				c.logger.Warn("Transient Kafka fetch error, backing off",
+					slog.String("error", err.Error()),
+					slog.Duration("backoff", fetchBackoff),
+				)
+			}
+
 			timer := time.NewTimer(fetchBackoff)
 			select {
 			case <-timer.C:
@@ -144,7 +177,8 @@ func (c *Consumer) Run(ctx context.Context) error {
 			}
 		}
 
-		// Reset fetch backoff on successful fetch
+		// Reset fetch backoff and mark partitions assigned on successful fetch
+		c.partitionsAssigned.Store(true)
 		fetchBackoff = 500 * time.Millisecond
 
 		if err := c.ProcessMessage(ctx, msg); err != nil {
@@ -446,4 +480,66 @@ func min(a, b time.Duration) time.Duration {
 		return a
 	}
 	return b
+}
+
+func isMissingTopicError(err error) bool {
+	if err == nil {
+		return false
+	}
+	if errors.Is(err, kafka.UnknownTopicOrPartition) {
+		return true
+	}
+	s := strings.ToLower(err.Error())
+	return strings.Contains(s, "unknown topic or partition") ||
+		strings.Contains(s, "unknown topic") ||
+		strings.Contains(s, "does not exist")
+}
+
+// PartitionAssignmentListener is invoked when Kafka partition assignment changes.
+type PartitionAssignmentListener func(assigned bool)
+
+// PartitionTrackingLogger wraps kafka.Logger and detects partition assignment and discovery events.
+type PartitionTrackingLogger struct {
+	onAssignment PartitionAssignmentListener
+	logger       *slog.Logger
+	topic        string
+}
+
+func NewPartitionTrackingLogger(onAssignment PartitionAssignmentListener, logger *slog.Logger, topic string) *PartitionTrackingLogger {
+	if logger == nil {
+		logger = slog.Default()
+	}
+	return &PartitionTrackingLogger{
+		onAssignment: onAssignment,
+		logger:       logger,
+		topic:        topic,
+	}
+}
+
+func (l *PartitionTrackingLogger) Printf(format string, args ...interface{}) {
+	msg := fmt.Sprintf(format, args...)
+	if strings.Contains(msg, "subscribed to topics and partitions:") {
+		if strings.Contains(msg, "map[]") {
+			if l.onAssignment != nil {
+				l.onAssignment(false)
+			}
+		} else {
+			if l.onAssignment != nil {
+				l.onAssignment(true)
+			}
+			l.logger.Info("Discovered and assigned partitions for Kafka topic",
+				slog.String("topic", l.topic),
+				slog.String("assignment", msg),
+			)
+		}
+	} else if strings.Contains(msg, "unsubscribed from topics and partitions") {
+		if l.onAssignment != nil {
+			l.onAssignment(false)
+		}
+	} else if strings.Contains(msg, "Partition changes found") {
+		l.logger.Info("Discovered Kafka partition changes, triggering rebalance",
+			slog.String("topic", l.topic),
+			slog.String("details", msg),
+		)
+	}
 }
